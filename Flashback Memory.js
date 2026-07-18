@@ -1,7 +1,7 @@
 //@name flashback_memory
 //@display-name ⚡ FLASHBACK Memory
 //@api 3.0
-//@version 0.8.2
+//@version 0.8.3
 //@allowed-ipc libra_world_manager
 //@allowed-ipc hayaku_locator_continuity
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
@@ -31,7 +31,7 @@
 //@arg auto_open_gui string true|false; blank uses false (legacy compatibility only)
 //@arg debug_log string true|false; blank uses false
 //@arg operation_log_enabled string true|false; blank uses false
-//@arg persist_embedding_key string true|false; blank uses false
+//@arg persist_embedding_key string true|false; blank uses true
 //@arg heuristic_recall string true|false; blank uses true
 //@arg candidate_limit string Vector candidates to rerank before MMR; blank uses 80
 //@arg evidence_gate string true|false; blank uses true
@@ -72,7 +72,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.8.2
+ * ⚡ FLASHBACK Memory v0.8.3
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -307,7 +307,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.8.2';
+  const PLUGIN_VERSION = '0.8.3';
   const LIBRA_HAYAKU_PROTOCOL = 'libra-hayaku-v1';
   const LIBRA_MEMORY_INTEROP_PROTOCOL = 'libra-memory-interop-v1';
   const LIBRA_SUITE_IPC_CHANNEL = 'libra-suite-interop-v1';
@@ -337,7 +337,7 @@
   });
   const EXTERNAL_RETIREMENT_VERSION = 1;
   const HOOK_RECALL_TIMEOUT_POLICY_VERSION = 1;
-  const SETTINGS_POLICY_VERSION = 2;
+  const SETTINGS_POLICY_VERSION = 3;
   const TURN_WORLDLINE_VERSION = 'flashback_turn_worldline_v1';
   const TURN_WORLDLINE_MAX_NODES = 256;
   const TURN_WORLDLINE_MAX_RETIRED_RECORDS = 192;
@@ -415,7 +415,7 @@
     autoOpenGui: false,
     debugLog: false,
     operationLogEnabled: false,
-    persistEmbeddingKey: false,
+    persistEmbeddingKey: true,
     heuristicRecall: true,
     candidateLimit: 80,
     evidenceGate: true,
@@ -1888,7 +1888,7 @@
           const value = await reader(key);
           if (value === undefined || value === null || (typeof value === 'string' && !value.trim())) continue;
           // Old `int` declarations return numeric 0 when the field is blank.
-          // v0.8.2 declares numeric inputs as strings, so an intentional zero is
+          // v0.8.2+ declares numeric inputs as strings, so an intentional zero is
           // the distinguishable string "0" and remains a valid override.
           if (numeric && typeof value === 'number' && value === 0) {
             legacyZeroSeen = true;
