@@ -4,6 +4,7 @@
 //@version 0.8.0
 //@allowed-ipc libra_world_manager
 //@allowed-ipc hayaku_locator_continuity
+//@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal
 //@arg interop_profile string auto|on|off — auto is recommended; on/off force the compatibility request
 //@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom
