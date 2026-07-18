@@ -1,78 +1,78 @@
 //@name flashback_memory
 //@display-name ⚡ FLASHBACK Memory
 //@api 3.0
-//@version 0.8.0
+//@version 0.8.2
 //@allowed-ipc libra_world_manager
 //@allowed-ipc hayaku_locator_continuity
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
-//@arg mode string off|normal
-//@arg interop_profile string auto|on|off — auto is recommended; on/off force the compatibility request
-//@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom
-//@arg embedding_url string Embedding endpoint/base URL. Provider defaults are used when empty.
-//@arg embedding_model string Embedding model name. Examples: text-embedding-3-small, nomic-embed-text, gemini-embedding-001.
-//@arg embedding_key string Optional API key. Local Ollama normally leaves this empty.
-//@arg embedding_timeout_ms int Embedding request timeout in milliseconds
-//@arg hook_recall_timeout_ms int Maximum total recall time inside beforeRequest
-//@arg embedding_batch_size int Number of chunks embedded per request when endpoint supports batching
-//@arg fallback_hash_embedding string true|false — use local hashed embedding if the configured embedding endpoint fails
-//@arg hash_dimensions int Local hash embedding dimensions when embedding_provider=hash or fallback is used
-//@arg top_k int Number of vector records injected per request
-//@arg min_score string Minimum cosine score for recall
-//@arg lexical_weight string Small lexical overlap boost added to cosine score
-//@arg max_injection_chars int Maximum characters injected into beforeRequest
-//@arg injection_position string before_current_input|last_system|before_last_user
-//@arg chunk_chars int Maximum source chunk characters before embedding
-//@arg chunk_overlap int Overlap characters between chunks
-//@arg max_response_items int Maximum captured response records retained per chat scope
-//@arg capture_after_request string true|false — capture finalized user/assistant turns from the live chat
-//@arg min_capture_chars int Minimum assistant response chars for chat capture
-//@arg include_scores string true|false — show recall scores in injected context
-//@arg enable_gui string true|false
-//@arg auto_open_gui string true|false — legacy compatibility only; GUI no longer opens automatically on load
-//@arg debug_log string true|false
-//@arg operation_log_enabled string true|false — persist recent operation diagnostics in synced pluginStorage
-//@arg persist_embedding_key string true|false — persist the embedding key in shared local plugin storage
-//@arg heuristic_recall string true|false — enable embedding+heuristic reranking pipeline
-//@arg candidate_limit int Vector candidates to rerank before MMR
-//@arg evidence_gate string true|false — require minimum exact/anchor evidence unless cosine is very high
-//@arg mmr_enabled string true|false — diversify final selected records
-//@arg mmr_lambda string 0.0-1.0, higher means relevance over diversity
-//@arg recency_half_life_days int Half-life used for response recency boost
-//@arg recency_half_life_turns int Half-life in story turns used for response recency when turnIndex exists
-//@arg continuation_recent_items int Number of recent response records boosted for continuation prompts
-//@arg episode_index_enabled string true|false — build centroid episode indexes from response vectors without LLM
-//@arg episode_boundary_similarity string Cosine threshold for response-to-response episode boundary detection
-//@arg current_scene_tail_enabled string true|false — force recent scene tail candidates into recall
-//@arg current_scene_tail_turns int Recent response turns considered current scene tail
-//@arg current_scene_tail_limit int Maximum current scene tail candidates
-//@arg current_scene_tail_min_keep int Minimum current scene tail records kept after MMR
-//@arg entity_focused_recall_enabled string true|false — force current-input entity candidates into recall
-//@arg entity_focused_per_anchor int Per-anchor entity-focused candidates
-//@arg entity_focused_max_total int Maximum total entity-focused candidates
-//@arg max_recall_per_source_hash int Hard cap for final recall records sharing sourceHash
-//@arg max_recall_per_turn int Hard cap for final recall records sharing sourceType+turnIndex
-//@arg latest_turn_boost string Additional score boost for the latest captured response turn
-//@arg continuation_tail_messages int Recent conversation messages appended to continuation recall queries
-//@arg gate_high_cosine string Cosine threshold that can pass the evidence gate directly
-//@arg gate_exact_anchor string Exact-anchor evidence threshold
-//@arg gate_keyword_overlap string Keyword-overlap evidence threshold
-//@arg gate_name_overlap string Name-overlap evidence threshold
-//@arg raw_excerpt_mode string sentence_window|record
-//@arg raw_sentence_window int Sentences retained around the best matching sentence
-//@arg cold_start_scope string current|all
-//@arg cold_start_history_limit int Maximum chat history items synchronized into response turns; 0 means unlimited
-//@arg episode_min_records int Minimum response records per episode
-//@arg episode_max_records int Maximum response records per episode
-//@arg episode_recall_count int Episode centroids considered during recall
-//@arg episode_child_limit int Maximum child records expanded from matching episodes
-//@arg structured_state_enabled string true|false — build an evidence-grounded property state ledger without a generative LLM
-//@arg recall_shard_limit int Maximum indexed storage shards loaded for one recall; older manifests safely fall back to full scan
-//@arg recall_full_scan_threshold int Full-scan scopes at or below this shard count
-//@arg episode_hierarchy_enabled string true|false — build extractive scene/session hierarchy without a generative LLM
-//@arg episode_parent_size int Scene episodes grouped into one higher-level session index
+//@arg mode string off|normal; blank uses normal
+//@arg interop_profile string auto|on|off; blank uses auto (recommended)
+//@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
+//@arg embedding_url string Embedding endpoint/base URL; blank uses the selected provider default
+//@arg embedding_model string Embedding model name; blank uses the selected provider default (hash: nomic-embed-text)
+//@arg embedding_key string Optional API key; blank means no arg-level key
+//@arg embedding_timeout_ms string Embedding request timeout in milliseconds; blank uses 30000
+//@arg hook_recall_timeout_ms string Maximum total recall time inside beforeRequest; blank uses 20000
+//@arg embedding_batch_size string Number of chunks embedded per request when endpoint supports batching; blank uses 8
+//@arg fallback_hash_embedding string true|false; blank uses true
+//@arg hash_dimensions string Local hash embedding dimensions when embedding_provider=hash or fallback is used; blank uses 384
+//@arg top_k string Number of vector records injected per request; blank uses 12
+//@arg min_score string Minimum cosine score for recall; blank uses 0.12
+//@arg lexical_weight string Small lexical overlap boost added to cosine score; blank uses 0.08
+//@arg max_injection_chars string Maximum characters injected into beforeRequest; blank uses 4000
+//@arg injection_position string before_current_input|last_system|before_last_user; blank uses before_current_input
+//@arg chunk_chars string Maximum source chunk characters before embedding; blank uses 1200
+//@arg chunk_overlap string Overlap characters between chunks; blank uses 160
+//@arg max_response_items string Maximum captured response records retained per chat scope; blank uses 1200
+//@arg capture_after_request string true|false; blank uses true
+//@arg min_capture_chars string Minimum assistant response chars for chat capture; blank uses 40
+//@arg include_scores string true|false; blank uses true
+//@arg enable_gui string true|false; blank uses true
+//@arg auto_open_gui string true|false; blank uses false (legacy compatibility only)
+//@arg debug_log string true|false; blank uses false
+//@arg operation_log_enabled string true|false; blank uses false
+//@arg persist_embedding_key string true|false; blank uses false
+//@arg heuristic_recall string true|false; blank uses true
+//@arg candidate_limit string Vector candidates to rerank before MMR; blank uses 80
+//@arg evidence_gate string true|false; blank uses true
+//@arg mmr_enabled string true|false; blank uses true
+//@arg mmr_lambda string 0.0-1.0, higher means relevance over diversity; blank uses 0.72
+//@arg recency_half_life_days string Half-life used for response recency boost; blank uses 14
+//@arg recency_half_life_turns string Half-life in story turns used for response recency when turnIndex exists; blank uses 6
+//@arg continuation_recent_items string Number of recent response records boosted for continuation prompts; blank uses 5
+//@arg episode_index_enabled string true|false; blank uses true
+//@arg episode_boundary_similarity string Cosine threshold for response-to-response episode boundary detection; blank uses 0.35
+//@arg current_scene_tail_enabled string true|false; blank uses true
+//@arg current_scene_tail_turns string Recent response turns considered current scene tail; blank uses 2
+//@arg current_scene_tail_limit string Maximum current scene tail candidates; blank uses 4
+//@arg current_scene_tail_min_keep string Minimum current scene tail records kept after MMR; blank uses 1
+//@arg entity_focused_recall_enabled string true|false; blank uses true
+//@arg entity_focused_per_anchor string Per-anchor entity-focused candidates; blank uses 1
+//@arg entity_focused_max_total string Maximum total entity-focused candidates; blank uses 3
+//@arg max_recall_per_source_hash string Hard cap for final recall records sharing sourceHash; blank uses 2
+//@arg max_recall_per_turn string Hard cap for final recall records sharing sourceType+turnIndex; blank uses 3
+//@arg latest_turn_boost string Additional score boost for the latest captured response turn; blank uses 0.12
+//@arg continuation_tail_messages string Recent conversation messages appended to continuation recall queries; blank uses 4
+//@arg gate_high_cosine string Cosine threshold that can pass the evidence gate directly; blank uses 0.42
+//@arg gate_exact_anchor string Exact-anchor evidence threshold; blank uses 0.14
+//@arg gate_keyword_overlap string Keyword-overlap evidence threshold; blank uses 0.12
+//@arg gate_name_overlap string Name-overlap evidence threshold; blank uses 0.18
+//@arg raw_excerpt_mode string sentence_window|record; blank uses sentence_window
+//@arg raw_sentence_window string Sentences retained around the best matching sentence; blank uses 1
+//@arg cold_start_scope string current|all; blank uses current
+//@arg cold_start_history_limit string Maximum chat history items synchronized into response turns; blank uses 0 (unlimited)
+//@arg episode_min_records string Minimum response records per episode; blank uses 2
+//@arg episode_max_records string Maximum response records per episode; blank uses 12
+//@arg episode_recall_count string Episode centroids considered during recall; blank uses 3
+//@arg episode_child_limit string Maximum child records expanded from matching episodes; blank uses 24
+//@arg structured_state_enabled string true|false; blank uses true
+//@arg recall_shard_limit string Maximum indexed storage shards loaded for one recall; blank uses 12
+//@arg recall_full_scan_threshold string Full-scan scopes at or below this shard count; blank uses 8
+//@arg episode_hierarchy_enabled string true|false; blank uses true
+//@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.8.0
+ * ⚡ FLASHBACK Memory v0.8.2
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -307,7 +307,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.8.0';
+  const PLUGIN_VERSION = '0.8.2';
   const LIBRA_HAYAKU_PROTOCOL = 'libra-hayaku-v1';
   const LIBRA_MEMORY_INTEROP_PROTOCOL = 'libra-memory-interop-v1';
   const LIBRA_SUITE_IPC_CHANNEL = 'libra-suite-interop-v1';
@@ -337,6 +337,7 @@
   });
   const EXTERNAL_RETIREMENT_VERSION = 1;
   const HOOK_RECALL_TIMEOUT_POLICY_VERSION = 1;
+  const SETTINGS_POLICY_VERSION = 2;
   const TURN_WORLDLINE_VERSION = 'flashback_turn_worldline_v1';
   const TURN_WORLDLINE_MAX_NODES = 256;
   const TURN_WORLDLINE_MAX_RETIRED_RECORDS = 192;
@@ -395,6 +396,7 @@
     embeddingTimeoutMs: 30000,
     hookRecallTimeoutMs: 20000,
     hookRecallTimeoutPolicyVersion: HOOK_RECALL_TIMEOUT_POLICY_VERSION,
+    settingsPolicyVersion: SETTINGS_POLICY_VERSION,
     embeddingBatchSize: 8,
     fallbackHashEmbedding: true,
     hashDimensions: 384,
@@ -492,11 +494,25 @@
     lastExternalRetirement: null,
     lastEpisodeIndex: null,
     lastStorageAction: null,
+    settingsMigration: null,
+    argumentAudit: null,
+    argumentOverrides: Object.freeze({}),
+    storedSettingsOverrides: Object.freeze({}),
     operationLogSeq: 0,
     operationLogWrite: null,
     operationLogCache: null,
     lastOperationLogError: '',
     sessionEmbeddingKey: '',
+    embeddingKeyPersistence: Object.freeze({
+      requested: false,
+      backend: 'unknown',
+      available: false,
+      keyPresent: false,
+      saveSucceeded: false,
+      verified: false,
+      source: 'none',
+      reason: 'not_checked'
+    }),
     warnings: [],
     registered: { before: null, after: null, setting: null, button: null, hamburgerButton: null, chatButton: null },
     replacersRegistered: { before: false, after: false },
@@ -1312,6 +1328,88 @@
     return choices.includes(raw) ? raw : fallback;
   };
 
+  // Some RisuAI builds return numeric 0 for an unset `int` plugin argument.
+  // Older Flashback versions clamped those zeroes to each field's minimum and
+  // then persisted the whole normalized object.  The distinctive cluster below
+  // repairs both the raw all-zero form and that already-persisted minimum form.
+  const ZERO_ARG_REPAIR_FIELDS = Object.freeze([
+    ['embeddingTimeoutMs', 'embedding_timeout_ms', [0, 3000]],
+    ['hookRecallTimeoutMs', 'hook_recall_timeout_ms', [0, 1000]],
+    ['embeddingBatchSize', 'embedding_batch_size', [0, 1]],
+    ['hashDimensions', 'hash_dimensions', [0, 64]],
+    ['topK', 'top_k', [0, 1]],
+    ['maxInjectionChars', 'max_injection_chars', [0, 800]],
+    ['chunkChars', 'chunk_chars', [0, 240]],
+    ['chunkOverlap', 'chunk_overlap', [0]],
+    ['minCaptureChars', 'min_capture_chars', [0]],
+    ['candidateLimit', 'candidate_limit', [0, 8]],
+    ['recencyHalfLifeDays', 'recency_half_life_days', [0, 1]],
+    ['recencyHalfLifeTurns', 'recency_half_life_turns', [0, 2]],
+    ['continuationRecentItems', 'continuation_recent_items', [0]],
+    ['continuationTailMessages', 'continuation_tail_messages', [0, 1]],
+    ['rawSentenceWindow', 'raw_sentence_window', [0]],
+    ['episodeMinRecords', 'episode_min_records', [0, 1]],
+    ['episodeMaxRecords', 'episode_max_records', [0, 2]],
+    ['episodeRecallCount', 'episode_recall_count', [0]],
+    ['episodeChildLimit', 'episode_child_limit', [0]],
+    ['recallShardLimit', 'recall_shard_limit', [0, 2]],
+    ['recallFullScanThreshold', 'recall_full_scan_threshold', [0, 1]],
+    ['episodeParentSize', 'episode_parent_size', [0, 2]],
+    ['currentSceneTailTurns', 'current_scene_tail_turns', [0, 1]],
+    ['currentSceneTailLimit', 'current_scene_tail_limit', [0]],
+    ['currentSceneTailMinKeep', 'current_scene_tail_min_keep', [0]],
+    ['entityFocusedPerAnchor', 'entity_focused_per_anchor', [0]],
+    ['entityFocusedMaxTotal', 'entity_focused_max_total', [0]],
+    ['maxRecallPerSourceHash', 'max_recall_per_source_hash', [0, 1]],
+    ['maxRecallPerTurn', 'max_recall_per_turn', [0, 1]]
+  ]);
+
+  const ownSettingValue = (source, canonical, legacy) => {
+    if (Object.prototype.hasOwnProperty.call(source, canonical)) return source[canonical];
+    if (Object.prototype.hasOwnProperty.call(source, legacy)) return source[legacy];
+    return undefined;
+  };
+
+  const repairZeroInitializedSettings = (input = {}) => {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+    const source = { ...input };
+    const maxResponseValue = ownSettingValue(source, 'maxResponseItems', 'max_response_items');
+    const unsafeRetention = Number(maxResponseValue) === 0;
+    const fingerprintMatches = ZERO_ARG_REPAIR_FIELDS.reduce((count, [canonical, legacy, poisoned]) => {
+      const value = ownSettingValue(source, canonical, legacy);
+      return count + (value !== undefined && poisoned.includes(Number(value)) ? 1 : 0);
+    }, 0);
+    const repairCluster = unsafeRetention && fingerprintMatches >= 6;
+    const repairedFields = [];
+
+    if (unsafeRetention) {
+      source.maxResponseItems = DEFAULTS.maxResponseItems;
+      delete source.max_response_items;
+      delete source.maxChatItems;
+      delete source.max_chat_items;
+      repairedFields.push('maxResponseItems');
+    }
+    if (repairCluster) {
+      for (const [canonical, legacy, poisoned] of ZERO_ARG_REPAIR_FIELDS) {
+        const value = ownSettingValue(source, canonical, legacy);
+        if (value === undefined || !poisoned.includes(Number(value))) continue;
+        source[canonical] = DEFAULTS[canonical];
+        delete source[legacy];
+        repairedFields.push(canonical);
+      }
+    }
+    source.settingsPolicyVersion = SETTINGS_POLICY_VERSION;
+    if (repairedFields.length) {
+      Runtime.settingsMigration = Object.freeze({
+        at: Date.now(),
+        reason: repairCluster ? 'unset_integer_argument_cluster' : 'unsafe_zero_retention_limit',
+        fingerprintMatches,
+        repairedFields: [...new Set(repairedFields)]
+      });
+    }
+    return source;
+  };
+
   const fnv1a = (value) => {
     let hash = 0x811c9dc5;
     const source = text(value);
@@ -1656,8 +1754,24 @@
 
     const localRemoveItem = async (key) => {
       const holder = await getLocalStore();
-      if (!holder.store?.removeItem) return false;
-      try { await holder.store.removeItem(key); return true; } catch (_) { return false; }
+      if (!holder.store) return false;
+      try {
+        if (holder.store.removeItem) await holder.store.removeItem(key);
+        else if (holder.store.setItem) await holder.store.setItem(key, holder.structured ? null : 'null');
+        else return false;
+        return true;
+      } catch (_) { return false; }
+    };
+
+    const localStorageStatus = async () => {
+      const holder = await getLocalStore();
+      return Object.freeze({
+        backend: text(holder?.kind || 'unavailable'),
+        available: !!holder?.store,
+        readable: typeof holder?.store?.getItem === 'function',
+        writable: typeof holder?.store?.setItem === 'function',
+        removable: typeof holder?.store?.removeItem === 'function' || typeof holder?.store?.setItem === 'function'
+      });
     };
 
     const nativeFetch = async (url, init = {}, timeoutMs = DEFAULTS.embeddingTimeoutMs) => {
@@ -1682,7 +1796,7 @@
       }
     };
 
-    return Object.freeze({ getItem, setItem, removeItem, keys, localGetItem, localSetItem, localRemoveItem, nativeFetch });
+    return Object.freeze({ getItem, setItem, removeItem, keys, localGetItem, localSetItem, localRemoveItem, localStorageStatus, nativeFetch });
   })();
 
   const requireStorageWrite = async (key, value, label = 'pluginStorage write') => {
@@ -1725,6 +1839,75 @@
     return fallback;
   };
 
+  const NUMERIC_ARGUMENT_NAMES = Object.freeze(new Set([
+    'embedding_timeout_ms', 'hook_recall_timeout_ms', 'embedding_batch_size', 'hash_dimensions',
+    'top_k', 'max_injection_chars', 'chunk_chars', 'chunk_overlap', 'max_response_items',
+    'min_capture_chars', 'candidate_limit', 'recency_half_life_days', 'recency_half_life_turns',
+    'continuation_recent_items', 'current_scene_tail_turns', 'current_scene_tail_limit',
+    'current_scene_tail_min_keep', 'entity_focused_per_anchor', 'entity_focused_max_total',
+    'max_recall_per_source_hash', 'max_recall_per_turn', 'continuation_tail_messages',
+    'raw_sentence_window', 'cold_start_history_limit', 'episode_min_records', 'episode_max_records',
+    'episode_recall_count', 'episode_child_limit', 'recall_shard_limit',
+    'recall_full_scan_threshold', 'episode_parent_size'
+  ]));
+
+  const SETTING_ARGUMENT_NAMES = Object.freeze([
+    'mode', 'interop_profile', 'embedding_provider', 'embedding_url', 'embedding_model',
+    'embedding_timeout_ms', 'hook_recall_timeout_ms', 'embedding_batch_size',
+    'fallback_hash_embedding', 'hash_dimensions', 'top_k', 'min_score', 'lexical_weight',
+    'max_injection_chars', 'injection_position', 'chunk_chars', 'chunk_overlap',
+    'max_response_items', 'capture_after_request', 'min_capture_chars', 'include_scores',
+    'enable_gui', 'auto_open_gui', 'debug_log', 'operation_log_enabled',
+    'persist_embedding_key', 'heuristic_recall', 'candidate_limit', 'evidence_gate',
+    'mmr_enabled', 'mmr_lambda', 'recency_half_life_days', 'recency_half_life_turns',
+    'continuation_recent_items', 'episode_index_enabled', 'episode_boundary_similarity',
+    'current_scene_tail_enabled', 'current_scene_tail_turns', 'current_scene_tail_limit',
+    'current_scene_tail_min_keep', 'entity_focused_recall_enabled', 'entity_focused_per_anchor',
+    'entity_focused_max_total', 'max_recall_per_source_hash', 'max_recall_per_turn',
+    'latest_turn_boost', 'continuation_tail_messages', 'gate_high_cosine', 'gate_exact_anchor',
+    'gate_keyword_overlap', 'gate_name_overlap', 'raw_excerpt_mode', 'raw_sentence_window',
+    'cold_start_scope', 'cold_start_history_limit', 'episode_min_records', 'episode_max_records',
+    'episode_recall_count', 'episode_child_limit', 'structured_state_enabled',
+    'recall_shard_limit', 'recall_full_scan_threshold', 'episode_hierarchy_enabled',
+    'episode_parent_size'
+  ]);
+
+  const argumentNameToSettingKey = name => text(name).replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+
+  const readArgumentEntry = async (name) => {
+    const names = [name, `${PLUGIN_SLUG}::${name}`, `${PLUGIN_STORAGE_ID}::${name}`];
+    const numeric = NUMERIC_ARGUMENT_NAMES.has(name);
+    let legacyZeroSeen = false;
+    for (const key of names) {
+      const argApi = getLiveApi(['getArgument']) || getLiveApi(['getArg']) || getLiveApi();
+      const readers = [];
+      if (typeof argApi?.getArgument === 'function') readers.push(argApi.getArgument.bind(argApi));
+      if (typeof argApi?.getArg === 'function' && argApi.getArg !== argApi.getArgument) readers.push(argApi.getArg.bind(argApi));
+      for (const reader of readers) {
+        try {
+          const value = await reader(key);
+          if (value === undefined || value === null || (typeof value === 'string' && !value.trim())) continue;
+          // Old `int` declarations return numeric 0 when the field is blank.
+          // v0.8.2 declares numeric inputs as strings, so an intentional zero is
+          // the distinguishable string "0" and remains a valid override.
+          if (numeric && typeof value === 'number' && value === 0) {
+            legacyZeroSeen = true;
+            continue;
+          }
+          return { name, settingKey: argumentNameToSettingKey(name), explicit: true, value, sourceKey: key, reason: 'explicit_value' };
+        } catch (_) {}
+      }
+    }
+    return {
+      name,
+      settingKey: argumentNameToSettingKey(name),
+      explicit: false,
+      value: undefined,
+      sourceKey: '',
+      reason: legacyZeroSeen ? 'legacy_numeric_zero_sentinel' : 'blank_or_missing'
+    };
+  };
+
   const normalizeInteropProfileMode = value => {
     const normalized = text(value).trim().toLowerCase();
     if (['off', 'false', '0', 'no', 'disabled'].includes(normalized)) return 'off';
@@ -1743,7 +1926,10 @@
     return 'custom';
   };
   const normalizeSettings = (raw = {}) => {
+    raw = repairZeroInitializedSettings(raw);
     const provider = normalizeProvider(raw.embeddingProvider ?? raw.embedding_provider ?? DEFAULTS.embeddingProvider);
+    const requestedEmbeddingUrl = text(raw.embeddingUrl ?? raw.embedding_url ?? '').trim();
+    const requestedEmbeddingModel = text(raw.embeddingModel ?? raw.embedding_model ?? '').trim();
     const recallQualityValues = {
       topK: clampInt(raw.topK ?? raw.top_k, 1, 80, DEFAULTS.topK),
       minScore: clampNumber(raw.minScore ?? raw.min_score, -1, 1, DEFAULTS.minScore),
@@ -1759,11 +1945,12 @@
       interopProfile: normalizeInteropProfileMode(raw.interopProfile ?? raw.interop_profile ?? DEFAULTS.interopProfile),
       recallQualityPreset,
       embeddingProvider: provider,
-      embeddingUrl: compact(raw.embeddingUrl ?? raw.embedding_url ?? defaultUrlForProvider(provider), 1400),
-      embeddingModel: compact(raw.embeddingModel ?? raw.embedding_model ?? defaultModelForProvider(provider), 240),
+      embeddingUrl: compact(requestedEmbeddingUrl || defaultUrlForProvider(provider), 1400),
+      embeddingModel: compact(requestedEmbeddingModel || defaultModelForProvider(provider), 240),
       embeddingTimeoutMs: clampInt(raw.embeddingTimeoutMs ?? raw.embedding_timeout_ms, 3000, 180000, DEFAULTS.embeddingTimeoutMs),
       hookRecallTimeoutMs: clampInt(raw.hookRecallTimeoutMs ?? raw.hook_recall_timeout_ms, 1000, 20000, DEFAULTS.hookRecallTimeoutMs),
       hookRecallTimeoutPolicyVersion: clampInt(raw.hookRecallTimeoutPolicyVersion, 0, HOOK_RECALL_TIMEOUT_POLICY_VERSION, DEFAULTS.hookRecallTimeoutPolicyVersion),
+      settingsPolicyVersion: SETTINGS_POLICY_VERSION,
       embeddingBatchSize: clampInt(raw.embeddingBatchSize ?? raw.embedding_batch_size, 1, 128, DEFAULTS.embeddingBatchSize),
       fallbackHashEmbedding: asBool(raw.fallbackHashEmbedding ?? raw.fallback_hash_embedding, DEFAULTS.fallbackHashEmbedding),
       hashDimensions: clampInt(raw.hashDimensions ?? raw.hash_dimensions, 64, 4096, DEFAULTS.hashDimensions),
@@ -1774,7 +1961,7 @@
       injectionPosition: normalizeChoice(raw.injectionPosition ?? raw.injection_position, ['before_current_input', 'last_system', 'before_last_user'], DEFAULTS.injectionPosition),
       chunkChars: clampInt(raw.chunkChars ?? raw.chunk_chars, 240, 12000, DEFAULTS.chunkChars),
       chunkOverlap: clampInt(raw.chunkOverlap ?? raw.chunk_overlap, 0, 3000, DEFAULTS.chunkOverlap),
-      maxResponseItems: clampInt(raw.maxResponseItems ?? raw.max_response_items ?? raw.maxChatItems ?? raw.max_chat_items, 0, 50000, DEFAULTS.maxResponseItems),
+      maxResponseItems: clampInt(raw.maxResponseItems ?? raw.max_response_items ?? raw.maxChatItems ?? raw.max_chat_items, 1, 50000, DEFAULTS.maxResponseItems),
       captureAfterRequest: asBool(raw.captureAfterRequest ?? raw.capture_after_request, DEFAULTS.captureAfterRequest),
       minCaptureChars: clampInt(raw.minCaptureChars ?? raw.min_capture_chars, 0, 4000, DEFAULTS.minCaptureChars),
       includeScores: asBool(raw.includeScores ?? raw.include_scores, DEFAULTS.includeScores),
@@ -2085,134 +2272,304 @@
     return true;
   };
 
-  const readArgumentSettings = async () => {
-    const pending = {
-      mode: getArgument('mode', DEFAULTS.mode),
-      interop_profile: getArgument('interop_profile', DEFAULTS.interopProfile),
-      embedding_provider: getArgument('embedding_provider', DEFAULTS.embeddingProvider),
-      embedding_url: getArgument('embedding_url', ''),
-      embedding_model: getArgument('embedding_model', ''),
-      embedding_timeout_ms: getArgument('embedding_timeout_ms', DEFAULTS.embeddingTimeoutMs),
-      hook_recall_timeout_ms: getArgument('hook_recall_timeout_ms', DEFAULTS.hookRecallTimeoutMs),
-      embedding_batch_size: getArgument('embedding_batch_size', DEFAULTS.embeddingBatchSize),
-      fallback_hash_embedding: getArgument('fallback_hash_embedding', String(DEFAULTS.fallbackHashEmbedding)),
-      hash_dimensions: getArgument('hash_dimensions', DEFAULTS.hashDimensions),
-      top_k: getArgument('top_k', DEFAULTS.topK),
-      min_score: getArgument('min_score', DEFAULTS.minScore),
-      lexical_weight: getArgument('lexical_weight', DEFAULTS.lexicalWeight),
-      max_injection_chars: getArgument('max_injection_chars', DEFAULTS.maxInjectionChars),
-      injection_position: getArgument('injection_position', DEFAULTS.injectionPosition),
-      chunk_chars: getArgument('chunk_chars', DEFAULTS.chunkChars),
-      chunk_overlap: getArgument('chunk_overlap', DEFAULTS.chunkOverlap),
-      max_response_items: getArgument('max_response_items', DEFAULTS.maxResponseItems),
-      capture_after_request: getArgument('capture_after_request', String(DEFAULTS.captureAfterRequest)),
-      min_capture_chars: getArgument('min_capture_chars', DEFAULTS.minCaptureChars),
-      include_scores: getArgument('include_scores', String(DEFAULTS.includeScores)),
-      enable_gui: getArgument('enable_gui', String(DEFAULTS.enableGui)),
-      auto_open_gui: getArgument('auto_open_gui', String(DEFAULTS.autoOpenGui)),
-      debug_log: getArgument('debug_log', String(DEFAULTS.debugLog)),
-      operation_log_enabled: getArgument('operation_log_enabled', String(DEFAULTS.operationLogEnabled)),
-      persist_embedding_key: getArgument('persist_embedding_key', String(DEFAULTS.persistEmbeddingKey)),
-      heuristic_recall: getArgument('heuristic_recall', String(DEFAULTS.heuristicRecall)),
-      candidate_limit: getArgument('candidate_limit', DEFAULTS.candidateLimit),
-      evidence_gate: getArgument('evidence_gate', String(DEFAULTS.evidenceGate)),
-      mmr_enabled: getArgument('mmr_enabled', String(DEFAULTS.mmrEnabled)),
-      mmr_lambda: getArgument('mmr_lambda', DEFAULTS.mmrLambda),
-      recency_half_life_days: getArgument('recency_half_life_days', DEFAULTS.recencyHalfLifeDays),
-      recency_half_life_turns: getArgument('recency_half_life_turns', DEFAULTS.recencyHalfLifeTurns),
-      latest_turn_boost: getArgument('latest_turn_boost', DEFAULTS.latestTurnBoost),
-      continuation_recent_items: getArgument('continuation_recent_items', DEFAULTS.continuationRecentItems),
-      continuation_tail_messages: getArgument('continuation_tail_messages', DEFAULTS.continuationTailMessages),
-      gate_high_cosine: getArgument('gate_high_cosine', DEFAULTS.gateHighCosine),
-      gate_exact_anchor: getArgument('gate_exact_anchor', DEFAULTS.gateExactAnchor),
-      gate_keyword_overlap: getArgument('gate_keyword_overlap', DEFAULTS.gateKeywordOverlap),
-      gate_name_overlap: getArgument('gate_name_overlap', DEFAULTS.gateNameOverlap),
-      raw_excerpt_mode: getArgument('raw_excerpt_mode', DEFAULTS.rawExcerptMode),
-      raw_sentence_window: getArgument('raw_sentence_window', DEFAULTS.rawSentenceWindow),
-      cold_start_scope: getArgument('cold_start_scope', DEFAULTS.coldStartScope),
-      cold_start_history_limit: getArgument('cold_start_history_limit', DEFAULTS.coldStartHistoryLimit),
-      episode_index_enabled: getArgument('episode_index_enabled', String(DEFAULTS.episodeIndexEnabled)),
-      episode_boundary_similarity: getArgument('episode_boundary_similarity', DEFAULTS.episodeBoundarySimilarity),
-      episode_min_records: getArgument('episode_min_records', DEFAULTS.episodeMinRecords),
-      episode_max_records: getArgument('episode_max_records', DEFAULTS.episodeMaxRecords),
-      episode_recall_count: getArgument('episode_recall_count', DEFAULTS.episodeRecallCount),
-      episode_child_limit: getArgument('episode_child_limit', DEFAULTS.episodeChildLimit),
-      structured_state_enabled: getArgument('structured_state_enabled', String(DEFAULTS.structuredStateEnabled)),
-      recall_shard_limit: getArgument('recall_shard_limit', DEFAULTS.recallShardLimit),
-      recall_full_scan_threshold: getArgument('recall_full_scan_threshold', DEFAULTS.recallFullScanThreshold),
-      episode_hierarchy_enabled: getArgument('episode_hierarchy_enabled', String(DEFAULTS.episodeHierarchyEnabled)),
-      episode_parent_size: getArgument('episode_parent_size', DEFAULTS.episodeParentSize),
-      current_scene_tail_enabled: getArgument('current_scene_tail_enabled', String(DEFAULTS.currentSceneTailEnabled)),
-      current_scene_tail_turns: getArgument('current_scene_tail_turns', DEFAULTS.currentSceneTailTurns),
-      current_scene_tail_limit: getArgument('current_scene_tail_limit', DEFAULTS.currentSceneTailLimit),
-      current_scene_tail_min_keep: getArgument('current_scene_tail_min_keep', DEFAULTS.currentSceneTailMinKeep),
-      entity_focused_recall_enabled: getArgument('entity_focused_recall_enabled', String(DEFAULTS.entityFocusedRecallEnabled)),
-      entity_focused_per_anchor: getArgument('entity_focused_per_anchor', DEFAULTS.entityFocusedPerAnchor),
-      entity_focused_max_total: getArgument('entity_focused_max_total', DEFAULTS.entityFocusedMaxTotal),
-      max_recall_per_source_hash: getArgument('max_recall_per_source_hash', DEFAULTS.maxRecallPerSourceHash),
-      max_recall_per_turn: getArgument('max_recall_per_turn', DEFAULTS.maxRecallPerTurn)
+  const settingsOverrideDiff = (settings = {}) => {
+    const baseline = normalizeSettings(DEFAULTS);
+    const normalized = normalizeSettings(settings);
+    const ignored = new Set(['hookRecallTimeoutPolicyVersion', 'settingsPolicyVersion', 'shardSize']);
+    const overrides = {};
+    for (const [key, value] of Object.entries(normalized)) {
+      if (ignored.has(key)) continue;
+      if (value !== baseline[key]) overrides[key] = value;
+    }
+    return overrides;
+  };
+
+  const settingsEnvelope = (overrides = {}) => {
+    const settings = normalizeSettings({ ...DEFAULTS, ...(overrides || {}) });
+    return {
+      version: 4,
+      savedAt: nowIso(),
+      settingsPolicyVersion: SETTINGS_POLICY_VERSION,
+      overrides: settingsOverrideDiff(settings),
+      settings
     };
-    const resolved = await Promise.all(Object.entries(pending).map(async ([key, value]) => [key, await value]));
-    return normalizeSettings(Object.fromEntries(resolved));
+  };
+
+  const readArgumentSettings = async () => {
+    const entries = await Promise.all(SETTING_ARGUMENT_NAMES.map(readArgumentEntry));
+    const rawOverrides = Object.fromEntries(entries.filter(entry => entry.explicit).map(entry => [entry.name, entry.value]));
+    const migrationBefore = Runtime.settingsMigration;
+    repairZeroInitializedSettings(rawOverrides);
+    const migration = Runtime.settingsMigration && Runtime.settingsMigration !== migrationBefore
+      ? Runtime.settingsMigration
+      : null;
+    const repairedFields = new Set(migration?.repairedFields || []);
+    const usableEntries = entries.filter(entry => entry.explicit && !repairedFields.has(entry.settingKey));
+    const canonicalRaw = Object.fromEntries(usableEntries.map(entry => [entry.settingKey, entry.value]));
+    const normalized = normalizeSettings(canonicalRaw);
+    const overrides = Object.fromEntries(usableEntries.map(entry => [entry.settingKey, normalized[entry.settingKey]]));
+    const auditEntries = entries.map(entry => ({
+      name: entry.name,
+      settingKey: entry.settingKey,
+      explicit: entry.explicit && !repairedFields.has(entry.settingKey),
+      sourceKey: entry.sourceKey,
+      reason: repairedFields.has(entry.settingKey) ? 'legacy_zero_cluster_repaired' : entry.reason,
+      rawValue: entry.explicit ? text(entry.value) : '',
+      effectiveValue: Object.prototype.hasOwnProperty.call(overrides, entry.settingKey) ? overrides[entry.settingKey] : DEFAULTS[entry.settingKey]
+    }));
+    const audit = Object.freeze({
+      schema: 'flashback_memory.argument_audit.v1',
+      declared: SETTING_ARGUMENT_NAMES.length + 1,
+      settingArguments: SETTING_ARGUMENT_NAMES.length,
+      numericArgumentsDeclaredAsString: NUMERIC_ARGUMENT_NAMES.size,
+      explicitCount: Object.keys(overrides).length,
+      ignoredLegacyZeroCount: auditEntries.filter(entry => entry.reason === 'legacy_numeric_zero_sentinel' || entry.reason === 'legacy_zero_cluster_repaired').length,
+      overrides: auditEntries.filter(entry => entry.explicit),
+      defaultsApplied: auditEntries.filter(entry => !entry.explicit).map(entry => entry.name)
+    });
+    Runtime.argumentAudit = audit;
+    Runtime.argumentOverrides = Object.freeze({ ...overrides });
+    return { overrides, audit };
+  };
+
+  const applyArgumentOverrides = (baseSettings = DEFAULTS, argumentState = { overrides: {} }) => {
+    const overrides = argumentState?.overrides || {};
+    const combined = { ...normalizeSettings(baseSettings), ...overrides };
+    if (Object.prototype.hasOwnProperty.call(overrides, 'embeddingProvider')) {
+      if (!Object.prototype.hasOwnProperty.call(overrides, 'embeddingUrl')) combined.embeddingUrl = defaultUrlForProvider(overrides.embeddingProvider);
+      if (!Object.prototype.hasOwnProperty.call(overrides, 'embeddingModel')) combined.embeddingModel = defaultModelForProvider(overrides.embeddingProvider);
+    }
+    return normalizeSettings(combined);
   };
 
   const loadSettings = async (force = false) => {
     if (Runtime.settings && !force) return Runtime.settings;
-    const [argSettings, forcedInteropProfile, storedRaw] = await Promise.all([
+    const [argumentState, storedRaw] = await Promise.all([
       readArgumentSettings(),
-      getArgument('interop_profile', ''),
       RisuCompat.getItem(STORAGE.settings)
     ]);
-    let settings = argSettings;
+    let storedOverrides = {};
+    let migrateStoredSettings = false;
     if (storedRaw) {
       const parsed = typeof storedRaw === 'string' ? tryJsonParse(storedRaw, null) : storedRaw;
-      const source = parsed?.settings && typeof parsed.settings === 'object' ? parsed.settings : parsed;
+      const hasV4Overrides = Number(parsed?.version || 0) >= 4 && parsed?.overrides && typeof parsed.overrides === 'object';
+      let source = hasV4Overrides
+        ? { ...DEFAULTS, ...parsed.overrides }
+        : (parsed?.settings && typeof parsed.settings === 'object' ? parsed.settings : parsed);
       const upgradeRecallTimeout = Number(source?.hookRecallTimeoutPolicyVersion || 0) < HOOK_RECALL_TIMEOUT_POLICY_VERSION;
-      settings = normalizeSettings({
-        ...argSettings,
-        ...(source || {}),
-        ...(upgradeRecallTimeout ? {
+      if (upgradeRecallTimeout) {
+        source = {
+          ...(source || {}),
           hookRecallTimeoutMs: DEFAULTS.hookRecallTimeoutMs,
           hookRecallTimeoutPolicyVersion: HOOK_RECALL_TIMEOUT_POLICY_VERSION
-        } : {})
-      });
+        };
+      }
+      const normalizedStored = normalizeSettings(source || {});
+      storedOverrides = settingsOverrideDiff(normalizedStored);
+      migrateStoredSettings = !hasV4Overrides
+        || Number(parsed?.settingsPolicyVersion || parsed?.settings?.settingsPolicyVersion || 0) < SETTINGS_POLICY_VERSION;
     }
-    if (text(forcedInteropProfile).trim()) {
-      settings = { ...settings, interopProfile: normalizeInteropProfileMode(forcedInteropProfile) };
-    }
+    const baseSettings = normalizeSettings({ ...DEFAULTS, ...storedOverrides });
+    const settings = applyArgumentOverrides(baseSettings, argumentState);
+    Runtime.storedSettingsOverrides = Object.freeze({ ...storedOverrides });
     Runtime.settings = settings;
+    if (storedRaw && migrateStoredSettings) {
+      await requireStorageWrite(STORAGE.settings, safeStringify(settingsEnvelope(storedOverrides)), 'settings migration save');
+    }
     return settings;
   };
 
   const saveSettings = async (settings) => {
-    const normalized = normalizeSettings(settings || {});
-    await requireStorageWrite(STORAGE.settings, safeStringify({ version: 2, savedAt: nowIso(), settings: normalized }), 'settings save');
+    const requested = normalizeSettings(settings || {});
+    const nextOverrides = settingsOverrideDiff(requested);
+    const argumentOverrides = Runtime.argumentOverrides || {};
+    const protectedKeys = new Set(Object.keys(argumentOverrides));
+    if (protectedKeys.has('embeddingProvider')) {
+      if (!protectedKeys.has('embeddingUrl')) protectedKeys.add('embeddingUrl');
+      if (!protectedKeys.has('embeddingModel')) protectedKeys.add('embeddingModel');
+    }
+    for (const key of protectedKeys) {
+      if (Object.prototype.hasOwnProperty.call(Runtime.storedSettingsOverrides || {}, key)) nextOverrides[key] = Runtime.storedSettingsOverrides[key];
+      else delete nextOverrides[key];
+    }
+    const envelope = settingsEnvelope(nextOverrides);
+    await requireStorageWrite(STORAGE.settings, safeStringify(envelope), 'settings save');
+    Runtime.storedSettingsOverrides = Object.freeze({ ...envelope.overrides });
+    const normalized = applyArgumentOverrides(envelope.settings, { overrides: argumentOverrides });
     Runtime.settings = normalized;
     if (!normalized.persistEmbeddingKey) await RisuCompat.localRemoveItem(STORAGE.localSecret).catch(() => false);
     if (!normalized.operationLogEnabled) await clearOperationLogs().catch(() => false);
     return normalized;
   };
 
+  const storedEmbeddingKeyValue = (value) => {
+    if (value && typeof value === 'object' && value.key) return text(value.key).trim();
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    return '';
+  };
+
+  const setEmbeddingKeyPersistenceStatus = (status = {}) => {
+    Runtime.embeddingKeyPersistence = Object.freeze({
+      requested: !!status.requested,
+      backend: text(status.backend || 'unavailable'),
+      available: !!status.available,
+      keyPresent: !!status.keyPresent,
+      saveSucceeded: !!status.saveSucceeded,
+      verified: !!status.verified,
+      source: text(status.source || 'none'),
+      reason: text(status.reason || '')
+    });
+    return Runtime.embeddingKeyPersistence;
+  };
+
+  const embeddingKeyPersistenceError = (code, message, status = {}) => {
+    setEmbeddingKeyPersistenceStatus({ ...status, saveSucceeded: false, verified: false, reason: code.toLowerCase() });
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  };
+
+  const inspectEmbeddingKeyPersistence = async ({ includeArgument = false } = {}) => {
+    const settings = Runtime.settings || DEFAULTS;
+    const storage = await RisuCompat.localStorageStatus();
+    const localValue = settings.persistEmbeddingKey && storage.readable
+      ? await RisuCompat.localGetItem(STORAGE.localSecret)
+      : null;
+    const localKeyPresent = !!storedEmbeddingKeyValue(localValue);
+    const argumentKeyPresent = includeArgument
+      ? !!text(await getArgument('embedding_key', '') || '').trim()
+      : false;
+    const source = Runtime.sessionEmbeddingKey
+      ? (Runtime.embeddingKeyPersistence?.source === 'local' ? 'local' : 'session')
+      : (localKeyPresent ? 'local' : (argumentKeyPresent ? 'argument' : 'none'));
+    return setEmbeddingKeyPersistenceStatus({
+      requested: settings.persistEmbeddingKey,
+      backend: storage.backend,
+      available: storage.available,
+      keyPresent: localKeyPresent,
+      saveSucceeded: localKeyPresent && !!Runtime.embeddingKeyPersistence?.saveSucceeded,
+      verified: localKeyPresent,
+      source,
+      reason: !settings.persistEmbeddingKey
+        ? 'persistence_disabled'
+        : (!storage.available ? 'storage_unavailable' : (localKeyPresent ? 'stored_key_available' : 'stored_key_missing'))
+    });
+  };
+
   const readEmbeddingKey = async () => {
     if (Runtime.sessionEmbeddingKey) return Runtime.sessionEmbeddingKey;
     const settings = Runtime.settings || DEFAULTS;
     if (settings.persistEmbeddingKey) {
-      const local = await RisuCompat.localGetItem(STORAGE.localSecret);
-      if (local && typeof local === 'object' && local.key) return text(local.key);
-      if (typeof local === 'string' && local.trim()) return local;
+      const storage = await RisuCompat.localStorageStatus();
+      const local = storage.readable ? await RisuCompat.localGetItem(STORAGE.localSecret) : null;
+      const localKey = storedEmbeddingKeyValue(local);
+      if (localKey) {
+        Runtime.sessionEmbeddingKey = localKey;
+        setEmbeddingKeyPersistenceStatus({
+          requested: true,
+          backend: storage.backend,
+          available: storage.available,
+          keyPresent: true,
+          saveSucceeded: Runtime.embeddingKeyPersistence?.saveSucceeded,
+          verified: true,
+          source: 'local',
+          reason: 'stored_key_loaded'
+        });
+        return localKey;
+      }
+      setEmbeddingKeyPersistenceStatus({
+        requested: true,
+        backend: storage.backend,
+        available: storage.available,
+        keyPresent: false,
+        saveSucceeded: false,
+        verified: false,
+        source: 'none',
+        reason: storage.available ? 'stored_key_missing' : 'storage_unavailable'
+      });
     }
-    return text(await getArgument('embedding_key', '') || '');
+    const argumentKey = text(await getArgument('embedding_key', '') || '').trim();
+    if (argumentKey) {
+      Runtime.sessionEmbeddingKey = argumentKey;
+      setEmbeddingKeyPersistenceStatus({
+        ...Runtime.embeddingKeyPersistence,
+        requested: settings.persistEmbeddingKey,
+        source: 'argument',
+        reason: settings.persistEmbeddingKey ? 'using_argument_fallback' : 'argument_key_loaded'
+      });
+    }
+    return argumentKey;
   };
 
   const saveEmbeddingKeyLocal = async (key) => {
     const clean = text(key || '').trim();
     Runtime.sessionEmbeddingKey = clean;
     const settings = Runtime.settings || DEFAULTS;
-    if (!clean || !settings.persistEmbeddingKey) {
-      await RisuCompat.localRemoveItem(STORAGE.localSecret).catch(() => false);
-      return true;
+    const storage = await RisuCompat.localStorageStatus();
+    const baseStatus = {
+      requested: settings.persistEmbeddingKey,
+      backend: storage.backend,
+      available: storage.available,
+      keyPresent: false,
+      source: clean ? 'session' : 'none'
+    };
+
+    if (!clean) {
+      if (!storage.removable) {
+        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_UNAVAILABLE', '임베딩 키 로컬 저장소를 사용할 수 없어 삭제 여부를 확인하지 못했습니다.', baseStatus);
+      }
+      const removed = await RisuCompat.localRemoveItem(STORAGE.localSecret);
+      const remaining = storage.readable ? storedEmbeddingKeyValue(await RisuCompat.localGetItem(STORAGE.localSecret)) : '';
+      if (!removed || remaining) {
+        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_FAILED', '로컬 저장소에서 임베딩 키를 삭제하지 못했습니다.', { ...baseStatus, keyPresent: !!remaining });
+      }
+      return setEmbeddingKeyPersistenceStatus({
+        ...baseStatus,
+        saveSucceeded: true,
+        verified: storage.readable,
+        reason: 'stored_key_cleared'
+      });
     }
-    return await RisuCompat.localSetItem(STORAGE.localSecret, { savedAt: nowIso(), key: clean });
+
+    if (!settings.persistEmbeddingKey) {
+      await RisuCompat.localRemoveItem(STORAGE.localSecret).catch(() => false);
+      return setEmbeddingKeyPersistenceStatus({
+        ...baseStatus,
+        requested: false,
+        saveSucceeded: false,
+        verified: false,
+        source: 'session',
+        reason: 'session_only'
+      });
+    }
+
+    if (!storage.readable || !storage.writable) {
+      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_UNAVAILABLE', '임베딩 키를 유지할 로컬 저장소를 사용할 수 없습니다.', baseStatus);
+    }
+    const saved = await RisuCompat.localSetItem(STORAGE.localSecret, { savedAt: nowIso(), key: clean });
+    if (!saved) {
+      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_FAILED', '임베딩 키 로컬 저장에 실패했습니다.', baseStatus);
+    }
+    const verifiedKey = storedEmbeddingKeyValue(await RisuCompat.localGetItem(STORAGE.localSecret));
+    if (verifiedKey !== clean) {
+      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_VERIFY_FAILED', '임베딩 키 저장 후 재조회 검증에 실패했습니다.', baseStatus);
+    }
+    return setEmbeddingKeyPersistenceStatus({
+      ...baseStatus,
+      keyPresent: true,
+      saveSucceeded: true,
+      verified: true,
+      source: 'local',
+      reason: 'saved_and_verified'
+    });
+  };
+
+  const embeddingKeyPersistenceStatusText = () => {
+    const status = Runtime.embeddingKeyPersistence || {};
+    if (!status.requested) return '키 유지 꺼짐 · 입력한 키는 현재 세션에서만 사용됩니다.';
+    if (status.verified && status.keyPresent) return `키 유지 확인됨 · ${status.backend}`;
+    if (!status.available) return '키 유지 실패 · 사용할 수 있는 로컬 저장소가 없습니다.';
+    return '키 유지 대기 · 키를 입력하고 저장해 주세요.';
   };
 
   const normalizeVector = (vector) => {
@@ -2670,7 +3027,7 @@
     return { chat: fallback, source: fallback ? 'character.chats' : 'missing', charIndex: -1, chatIndex: fallbackChatIndex };
   };
 
-  const DB_KEYS_ALLOWED = Object.freeze(['personas', 'selectedPersona']);
+  const DB_KEYS_ALLOWED = Object.freeze(['personas', 'selectedPersona', 'maxContext', 'maxResponse']);
 
   const loadDatabaseFlexible = async () => {
     const api = getLiveApi(['getDatabase']) || getLiveApi();
@@ -3733,10 +4090,17 @@
       .filter(isRetainedMemoryRecord);
     const derivedRecords = clean.filter(isResponseDerivedIndexRecord);
     let responseRecords = clean.filter(r => (r.sourceType === 'chat_turn' ? 'response' : r.sourceType) === 'response');
-    if (cfg.maxResponseItems >= 0 && responseRecords.length > cfg.maxResponseItems) {
+    // A zero/unset host argument must never turn a successful capture into an
+    // immediate delete-all operation.  Keep this guard at the persistence edge
+    // even though settings normalization already repairs the value.
+    const requestedRetentionLimit = Number.parseInt(cfg.maxResponseItems, 10);
+    const retentionLimit = Number.isFinite(requestedRetentionLimit) && requestedRetentionLimit >= 1
+      ? clampInt(requestedRetentionLimit, 1, 50000, DEFAULTS.maxResponseItems)
+      : DEFAULTS.maxResponseItems;
+    if (responseRecords.length > retentionLimit) {
       responseRecords = responseRecords
         .sort((a, b) => text(a.createdAt).localeCompare(text(b.createdAt)))
-        .slice(Math.max(0, responseRecords.length - cfg.maxResponseItems));
+        .slice(Math.max(0, responseRecords.length - retentionLimit));
     }
     clean = [...derivedRecords, ...responseRecords]
       .map(record => ({
@@ -8115,15 +8479,44 @@
     return -1;
   };
 
+  const flashbackHostInjectionBudget = (messages = [], snapshot = {}, settings = Runtime.settings || DEFAULTS) => {
+    const configuredChars = Math.max(0, Number(settings?.maxInjectionChars || 0) || 0);
+    const maxContext = Math.max(0, Number(snapshot?.db?.maxContext || 0) || 0);
+    const maxResponse = Math.max(0, Number(snapshot?.db?.maxResponse || 0) || 0);
+    if (maxContext <= 0) {
+      return { available: false, maxContext: 0, maxResponse: 0, existingTokens: 0, allowedChars: configuredChars, reason: 'host_context_unavailable' };
+    }
+    let serialized = '';
+    try { serialized = JSON.stringify(messages); } catch (_) { serialized = (Array.isArray(messages) ? messages : []).map(message => contentToText(message?.content)).join('\n'); }
+    const existingTokens = estimateTokens(serialized);
+    const responseReserve = Math.min(Math.floor(maxContext * 0.35), Math.max(256, maxResponse, Math.floor(maxContext * 0.08)));
+    const safetyReserve = Math.min(768, Math.max(128, Math.floor(maxContext * 0.04)));
+    const remainingTokens = Math.max(0, maxContext - existingTokens - responseReserve - safetyReserve);
+    return {
+      available: true,
+      maxContext,
+      maxResponse,
+      existingTokens,
+      responseReserve,
+      safetyReserve,
+      remainingTokens,
+      allowedChars: Math.min(configuredChars, Math.max(0, Math.floor(remainingTokens * 3))),
+      reason: 'host_context_aware'
+    };
+  };
+
   const injectMessage = (messages, block, position) => {
     if (!block || !Array.isArray(messages)) return messages;
     const next = messages.map(msg => {
       const copy = { ...msg };
-      if (typeof copy.content === 'string' && copy.content.includes(INJECTION_HEADER)) {
+      const ownedInjection = text(copy?.name).trim() === PLUGIN_SLUG
+        || (typeof copy.content === 'string' && copy.content.trimStart().startsWith(INJECTION_HEADER));
+      if (ownedInjection && typeof copy.content === 'string' && copy.content.includes(INJECTION_HEADER)) {
         copy.content = copy.content.replace(VECTOR_BLOCK_RE, '').replace(/\n{3,}/g, '\n\n').trim();
       }
+      if (ownedInjection && !text(copy?.content).trim()) return null;
       return copy;
-    }).filter(msg => text(msg?.content || '').trim() || msg?.multimodals?.length);
+    }).filter(Boolean);
     const injection = { role: 'system', name: PLUGIN_SLUG, content: block };
     if (position === 'before_current_input') {
       const idx = findCurrentInputInsertionIndex(next);
@@ -8508,7 +8901,17 @@
         opLog('before_recall_deadline', Runtime.lastRecall, 'warn');
         return messages;
       }
-      const block = formatRecallBlock(recall, latestUser, settings);
+      const hostInjectionBudget = flashbackHostInjectionBudget(messages, scopeBundle.snapshot, settings);
+      const budgetedRecallSettings = {
+        ...settings,
+        maxInjectionChars: Math.min(
+          Math.max(0, Number(settings.maxInjectionChars || 0) || 0),
+          Math.max(0, Number(hostInjectionBudget.allowedChars || 0) || 0)
+        )
+      };
+      const block = budgetedRecallSettings.maxInjectionChars >= 800
+        ? formatRecallBlock(recall, latestUser, budgetedRecallSettings)
+        : '';
       Runtime.lastRecall = {
         at: Date.now(),
         scopeKey: scope.scopeKey,
@@ -8519,6 +8922,7 @@
         gateRejected: recall.gateRejected || 0,
         externalSuppressed: recall.externalSuppressed || 0,
         peerRecentSuppressed: recall.peerRecentSuppressed || 0,
+        hostInjectionBudget,
         interop: cloneInteropValue(FlashbackRuntimeContract.coexistence || {}, {}),
         queryType: recall.queryType || '',
         episodeTraversal: recall.episodeTraversal || null,
@@ -9647,6 +10051,7 @@
         </div>
         <div class="actions"><button id="saveSettingsBtn" class="btn btn-primary">저장</button><button id="clearEmbeddingKeyBtn" class="btn">키 삭제</button><button id="testEmbedBtn" class="btn">임베딩 테스트</button></div>
         <div id="embeddingTestStatus" class="embedding-test-status" role="status" aria-live="polite"></div>
+        <div class="tiny" style="margin-top:8px">${escapeHtml(embeddingKeyPersistenceStatusText())}</div>
         <div class="tiny" style="margin-top:8px">데이터 동기화·정제·재임베딩은 ‘기억 유지보수’에서 한 번에 관리합니다.</div>
       </div>
       ${renderEmbeddingCostPanel(settings, stats)}
@@ -10804,11 +11209,14 @@
     getGuiNode('saveSettingsBtn')?.addEventListener('click', async () => {
       setBusy(true, '설정 저장');
       try {
-        const settings = readSettingsFromUi();
-        await saveSettings(settings);
+        const settings = await saveSettings(readSettingsFromUi());
         const key = getGuiNode('embeddingKey')?.value || '';
-        if (key.trim()) await saveEmbeddingKeyLocal(key);
-        Runtime.lastStorageAction = { at: Date.now(), savedSettings: true };
+        const keyPersistence = key.trim()
+          ? await saveEmbeddingKeyLocal(key)
+          : (settings.persistEmbeddingKey && Runtime.sessionEmbeddingKey
+            ? await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey)
+            : await inspectEmbeddingKeyPersistence());
+        Runtime.lastStorageAction = { at: Date.now(), savedSettings: true, embeddingKeyPersistence: keyPersistence };
         await refreshUi('provider');
       } catch (error) { await guiError('설정 저장 실패', error); }
       finally { setBusy(false); }
@@ -10817,10 +11225,13 @@
       setBusy(true, '고급 설정 저장');
       try {
         const settings = await saveSettings(readSettingsFromUi());
-        if (settings.persistEmbeddingKey && Runtime.sessionEmbeddingKey) await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey);
+        const keyPersistence = settings.persistEmbeddingKey && Runtime.sessionEmbeddingKey
+          ? await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey)
+          : await inspectEmbeddingKeyPersistence();
         Runtime.lastStorageAction = {
           at: Date.now(),
-          savedAdvancedSettings: true
+          savedAdvancedSettings: true,
+          embeddingKeyPersistence: keyPersistence
         };
         syncMountedSettingsUi(settings);
         await refreshUi('advanced');
@@ -10843,8 +11254,8 @@
       if (!await guiConfirm('로컬에 저장된 API 키 또는 액세스 토큰을 삭제할까요?')) return;
       setBusy(true, '임베딩 키 삭제');
       try {
-        await saveEmbeddingKeyLocal('');
-        Runtime.lastStorageAction = { at: Date.now(), embeddingKeyCleared: true };
+        const keyPersistence = await saveEmbeddingKeyLocal('');
+        Runtime.lastStorageAction = { at: Date.now(), embeddingKeyCleared: true, embeddingKeyPersistence: keyPersistence };
         await guiAlert('저장된 임베딩 키를 삭제했습니다.');
       } catch (error) { await guiError('임베딩 키 삭제 실패', error); }
       finally { setBusy(false); }
@@ -10863,7 +11274,11 @@
       try {
         const settings = await saveSettings(readSettingsFromUi());
         const key = getGuiNode('embeddingKey')?.value || '';
-        if (key.trim()) await saveEmbeddingKeyLocal(key);
+        const keyPersistence = key.trim()
+          ? await saveEmbeddingKeyLocal(key)
+          : (settings.persistEmbeddingKey && Runtime.sessionEmbeddingKey
+            ? await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey)
+            : await inspectEmbeddingKeyPersistence());
         const [v] = await embedTexts(['캐릭터는 중요한 장소에서 상대와 대화했다.'], settings, { taskType: 'query' });
         const provider = normalizeProvider(settings.embeddingProvider);
         if (provider !== 'hash' && Runtime.lastEmbedUsedFallback) {
@@ -10873,7 +11288,7 @@
         }
         if (!Array.isArray(v) || !v.length) throw new Error('임베딩 벡터가 비어 있습니다.');
         const model = provider === 'hash' ? `hash-${settings.hashDimensions}` : settings.embeddingModel;
-        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider, model, dim: v.length, preview: v.slice(0, 8) };
+        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider, model, dim: v.length, preview: v.slice(0, 8), embeddingKeyPersistence: keyPersistence };
         setEmbeddingTestStatus('success', `호출 성공 · ${provider} / ${model} · ${formatNumber(v.length)}차원`);
         await refreshUi('provider');
       } catch (error) {
@@ -11067,6 +11482,7 @@
     syncFlashbackRuntimeContract(settings, effectiveSettings, scope);
     const snapshot = await debugScopeStatsSnapshot(scope);
     const operationLogs = await flushOperationLogs();
+    const embeddingKeyPersistence = await inspectEmbeddingKeyPersistence({ includeArgument: true });
     return {
       plugin: { name: PLUGIN_NAME, id: PLUGIN_STORAGE_ID, version: PLUGIN_VERSION },
       settings,
@@ -11082,6 +11498,11 @@
       lastClone: Runtime.lastClone,
       lastExternalRetirement: Runtime.lastExternalRetirement,
       lastEpisodeIndex: Runtime.lastEpisodeIndex,
+      settingsMigration: Runtime.settingsMigration,
+      argumentAudit: Runtime.argumentAudit,
+      argumentOverrides: { ...Runtime.argumentOverrides },
+      storedSettingsOverrides: { ...Runtime.storedSettingsOverrides },
+      embeddingKeyPersistence,
       gui: {
         visible: guiVisible,
         mounted: guiMounted,
@@ -11153,7 +11574,7 @@
     exportDebugLogFile,
     exportOperationLogs: flushOperationLogs,
     clearOperationLogs,
-    _test: { hashEmbedding, splitTextIntoChunks, lexicalOverlap, extractLatestUserInput, isLikelyMetaUserMessage, stripSourceArtifacts, formatRecallBlock, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, applyFlashbackInteropProfile, resolveFlashbackInteropState, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, classifyRequestType, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { hashEmbedding, splitTextIntoChunks, lexicalOverlap, extractLatestUserInput, isLikelyMetaUserMessage, stripSourceArtifacts, formatRecallBlock, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, applyFlashbackInteropProfile, resolveFlashbackInteropState, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, classifyRequestType, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
@@ -11167,6 +11588,8 @@
     await finalizeFlashbackInteropConvergence(Runtime.settings);
     await registerFlashbackIpcInterop().catch(error => warn('plugin IPC registration failed', error));
     if (!Runtime.settings.persistEmbeddingKey) await RisuCompat.localRemoveItem(STORAGE.localSecret).catch(() => false);
+    else await readEmbeddingKey().catch(error => warn('embedding key persistence load failed', error));
+    await inspectEmbeddingKeyPersistence({ includeArgument: true }).catch(error => warn('embedding key persistence inspection failed', error));
     if (!Runtime.settings.operationLogEnabled) {
       Runtime.operationLogCache = null;
       await RisuCompat.removeItem(STORAGE.operationLog).catch(() => false);
