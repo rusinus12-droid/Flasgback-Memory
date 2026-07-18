@@ -20,7 +20,6 @@
 //@arg min_score string Minimum cosine score for recall
 //@arg lexical_weight string Small lexical overlap boost added to cosine score
 //@arg max_injection_chars int Maximum characters injected into beforeRequest
-//@arg allow_large_injection string true|false — allow recall blocks over the 6000-character safety cap
 //@arg injection_position string before_current_input|last_system|before_last_user
 //@arg chunk_chars int Maximum source chunk characters before embedding
 //@arg chunk_overlap int Overlap characters between chunks
@@ -337,6 +336,7 @@
     legacyMigration: `${PLUGIN_STORAGE_ID}:legacy_migration:v2`
   });
   const EXTERNAL_RETIREMENT_VERSION = 1;
+  const HOOK_RECALL_TIMEOUT_POLICY_VERSION = 1;
   const TURN_WORLDLINE_VERSION = 'flashback_turn_worldline_v1';
   const TURN_WORLDLINE_MAX_NODES = 256;
   const TURN_WORLDLINE_MAX_RETIRED_RECORDS = 192;
@@ -362,6 +362,18 @@
   const MANUAL_EDITOR_PAGE_SIZE = 80;
   const MANUAL_EDITOR_MAX_VISIBLE = 400;
 
+  const RECALL_QUALITY_PRESETS = Object.freeze({
+    light: Object.freeze({ topK: 6, minScore: 0.18, candidateLimit: 40, gateHighCosine: 0.50 }),
+    balanced: Object.freeze({ topK: 12, minScore: 0.12, candidateLimit: 80, gateHighCosine: 0.42 }),
+    heavy: Object.freeze({ topK: 20, minScore: 0.08, candidateLimit: 160, gateHighCosine: 0.35 })
+  });
+  const RECALL_QUALITY_PRESET_LABELS = Object.freeze({
+    light: '가벼운',
+    balanced: '적당한',
+    heavy: '무거운',
+    custom: 'Custom'
+  });
+
   const VOYAGE_TEXT_EMBEDDING_PRICING = Object.freeze({
     'voyage-4-large': Object.freeze({ pricePerMillion: 0.12, freeTokens: 200000000 }),
     'voyage-4': Object.freeze({ pricePerMillion: 0.06, freeTokens: 200000000 }),
@@ -376,11 +388,13 @@
   const DEFAULTS = Object.freeze({
     mode: 'normal',
     interopProfile: 'auto',
+    recallQualityPreset: 'balanced',
     embeddingProvider: 'hash',
     embeddingUrl: '',
     embeddingModel: 'nomic-embed-text',
     embeddingTimeoutMs: 30000,
-    hookRecallTimeoutMs: 3000,
+    hookRecallTimeoutMs: 20000,
+    hookRecallTimeoutPolicyVersion: HOOK_RECALL_TIMEOUT_POLICY_VERSION,
     embeddingBatchSize: 8,
     fallbackHashEmbedding: true,
     hashDimensions: 384,
@@ -388,7 +402,6 @@
     minScore: 0.12,
     lexicalWeight: 0.08,
     maxInjectionChars: 4000,
-    allowLargeInjection: false,
     injectionPosition: 'before_current_input',
     chunkChars: 1200,
     chunkOverlap: 160,
@@ -453,7 +466,6 @@
   const MAX_RUNTIME_SCOPE_CACHE = 80;
   const MAX_DRIFT_DISMISSALS = 240;
   const COMPUTE_WORKER_TIMEOUT_MS = 45000;
-  const SAFE_INJECTION_HARD_CAP = 6000;
   const EPISODE_REBUILD_MIN_NEW_TURNS = 3;
   const FINALIZED_CAPTURE_POLL_MS = 900;
   const FINALIZED_CAPTURE_IDLE_POLL_MS = 2200;
@@ -489,6 +501,7 @@
     registered: { before: null, after: null, setting: null, button: null, hamburgerButton: null, chatButton: null },
     replacersRegistered: { before: false, after: false },
     lastEmbedUsedFallback: false,
+    lastEmbedError: '',
     externalRetirementInFlight: new Map(),
     legacyMigrationInFlight: null,
     episodeIndexInFlight: new Set(),
@@ -1718,24 +1731,46 @@
     if (['on', 'true', '1', 'yes', 'enabled'].includes(normalized)) return 'on';
     return 'auto';
   };
+  const recallQualityPresetForValues = (settings = {}) => {
+    for (const [id, preset] of Object.entries(RECALL_QUALITY_PRESETS)) {
+      if (
+        Number(settings.topK) === preset.topK
+        && Math.abs(Number(settings.minScore) - preset.minScore) < 0.000001
+        && Number(settings.candidateLimit) === preset.candidateLimit
+        && Math.abs(Number(settings.gateHighCosine) - preset.gateHighCosine) < 0.000001
+      ) return id;
+    }
+    return 'custom';
+  };
   const normalizeSettings = (raw = {}) => {
     const provider = normalizeProvider(raw.embeddingProvider ?? raw.embedding_provider ?? DEFAULTS.embeddingProvider);
+    const recallQualityValues = {
+      topK: clampInt(raw.topK ?? raw.top_k, 1, 80, DEFAULTS.topK),
+      minScore: clampNumber(raw.minScore ?? raw.min_score, -1, 1, DEFAULTS.minScore),
+      candidateLimit: clampInt(raw.candidateLimit ?? raw.candidate_limit, 8, 400, DEFAULTS.candidateLimit),
+      gateHighCosine: clampNumber(raw.gateHighCosine ?? raw.gate_high_cosine, 0, 1, DEFAULTS.gateHighCosine)
+    };
+    const requestedRecallQualityPreset = text(raw.recallQualityPreset ?? raw.recall_quality_preset).trim().toLowerCase();
+    const recallQualityPreset = [...Object.keys(RECALL_QUALITY_PRESETS), 'custom'].includes(requestedRecallQualityPreset)
+      ? requestedRecallQualityPreset
+      : recallQualityPresetForValues(recallQualityValues);
     return {
       mode: normalizeChoice(raw.mode, ['off', 'normal'], DEFAULTS.mode),
       interopProfile: normalizeInteropProfileMode(raw.interopProfile ?? raw.interop_profile ?? DEFAULTS.interopProfile),
+      recallQualityPreset,
       embeddingProvider: provider,
       embeddingUrl: compact(raw.embeddingUrl ?? raw.embedding_url ?? defaultUrlForProvider(provider), 1400),
       embeddingModel: compact(raw.embeddingModel ?? raw.embedding_model ?? defaultModelForProvider(provider), 240),
       embeddingTimeoutMs: clampInt(raw.embeddingTimeoutMs ?? raw.embedding_timeout_ms, 3000, 180000, DEFAULTS.embeddingTimeoutMs),
-      hookRecallTimeoutMs: clampInt(raw.hookRecallTimeoutMs ?? raw.hook_recall_timeout_ms, 1000, 15000, DEFAULTS.hookRecallTimeoutMs),
+      hookRecallTimeoutMs: clampInt(raw.hookRecallTimeoutMs ?? raw.hook_recall_timeout_ms, 1000, 20000, DEFAULTS.hookRecallTimeoutMs),
+      hookRecallTimeoutPolicyVersion: clampInt(raw.hookRecallTimeoutPolicyVersion, 0, HOOK_RECALL_TIMEOUT_POLICY_VERSION, DEFAULTS.hookRecallTimeoutPolicyVersion),
       embeddingBatchSize: clampInt(raw.embeddingBatchSize ?? raw.embedding_batch_size, 1, 128, DEFAULTS.embeddingBatchSize),
       fallbackHashEmbedding: asBool(raw.fallbackHashEmbedding ?? raw.fallback_hash_embedding, DEFAULTS.fallbackHashEmbedding),
       hashDimensions: clampInt(raw.hashDimensions ?? raw.hash_dimensions, 64, 4096, DEFAULTS.hashDimensions),
-      topK: clampInt(raw.topK ?? raw.top_k, 1, 80, DEFAULTS.topK),
-      minScore: clampNumber(raw.minScore ?? raw.min_score, -1, 1, DEFAULTS.minScore),
+      topK: recallQualityValues.topK,
+      minScore: recallQualityValues.minScore,
       lexicalWeight: clampNumber(raw.lexicalWeight ?? raw.lexical_weight, 0, 0.5, DEFAULTS.lexicalWeight),
-      maxInjectionChars: clampInt(raw.maxInjectionChars ?? raw.max_injection_chars, 800, 80000, DEFAULTS.maxInjectionChars),
-      allowLargeInjection: asBool(raw.allowLargeInjection ?? raw.allow_large_injection, DEFAULTS.allowLargeInjection),
+      maxInjectionChars: clampInt(raw.maxInjectionChars ?? raw.max_injection_chars, 800, 8000, DEFAULTS.maxInjectionChars),
       injectionPosition: normalizeChoice(raw.injectionPosition ?? raw.injection_position, ['before_current_input', 'last_system', 'before_last_user'], DEFAULTS.injectionPosition),
       chunkChars: clampInt(raw.chunkChars ?? raw.chunk_chars, 240, 12000, DEFAULTS.chunkChars),
       chunkOverlap: clampInt(raw.chunkOverlap ?? raw.chunk_overlap, 0, 3000, DEFAULTS.chunkOverlap),
@@ -1749,7 +1784,7 @@
       operationLogEnabled: asBool(raw.operationLogEnabled ?? raw.operation_log_enabled, DEFAULTS.operationLogEnabled),
       persistEmbeddingKey: asBool(raw.persistEmbeddingKey ?? raw.persist_embedding_key, DEFAULTS.persistEmbeddingKey),
       heuristicRecall: asBool(raw.heuristicRecall ?? raw.heuristic_recall, DEFAULTS.heuristicRecall),
-      candidateLimit: clampInt(raw.candidateLimit ?? raw.candidate_limit, 8, 400, DEFAULTS.candidateLimit),
+      candidateLimit: recallQualityValues.candidateLimit,
       evidenceGate: asBool(raw.evidenceGate ?? raw.evidence_gate, DEFAULTS.evidenceGate),
       mmrEnabled: asBool(raw.mmrEnabled ?? raw.mmr_enabled, DEFAULTS.mmrEnabled),
       mmrLambda: clampNumber(raw.mmrLambda ?? raw.mmr_lambda, 0.05, 0.98, DEFAULTS.mmrLambda),
@@ -1758,7 +1793,7 @@
       latestTurnBoost: clampNumber(raw.latestTurnBoost ?? raw.latest_turn_boost, 0, 0.4, DEFAULTS.latestTurnBoost),
       continuationRecentItems: clampInt(raw.continuationRecentItems ?? raw.continuation_recent_items, 0, 50, DEFAULTS.continuationRecentItems),
       continuationTailMessages: clampInt(raw.continuationTailMessages ?? raw.continuation_tail_messages, 1, 20, DEFAULTS.continuationTailMessages),
-      gateHighCosine: clampNumber(raw.gateHighCosine ?? raw.gate_high_cosine, 0, 1, DEFAULTS.gateHighCosine),
+      gateHighCosine: recallQualityValues.gateHighCosine,
       gateExactAnchor: clampNumber(raw.gateExactAnchor ?? raw.gate_exact_anchor, 0, 1, DEFAULTS.gateExactAnchor),
       gateKeywordOverlap: clampNumber(raw.gateKeywordOverlap ?? raw.gate_keyword_overlap, 0, 1, DEFAULTS.gateKeywordOverlap),
       gateNameOverlap: clampNumber(raw.gateNameOverlap ?? raw.gate_name_overlap, 0, 1, DEFAULTS.gateNameOverlap),
@@ -1874,7 +1909,7 @@
       interopRecentTurnExclusion: 0
     };
     const libraBudget = getLibraRuntimeContract()?.memoryInterop?.promptBudget || {};
-    const maxInjectionChars = clampInt(Number(libraBudget.flashbackMaxInjectionChars || 2400), 800, 6000, 2400);
+    const maxInjectionChars = clampInt(Number(libraBudget.flashbackMaxInjectionChars || 2400), 800, 8000, 2400);
     const topK = clampInt(Number(libraBudget.flashbackTopK || 6), 1, 80, 6);
     const recentTurnExclusion = Math.max(1, Number(libraBudget.flashbackRecentTurnExclusion || 2));
     return {
@@ -1885,7 +1920,6 @@
       interopMainOwner: interop.mainOwner,
       topK,
       maxInjectionChars,
-      allowLargeInjection: false,
       injectionPosition: 'before_current_input',
       includeScores: false,
       currentSceneTailEnabled: false,
@@ -2067,7 +2101,6 @@
       min_score: getArgument('min_score', DEFAULTS.minScore),
       lexical_weight: getArgument('lexical_weight', DEFAULTS.lexicalWeight),
       max_injection_chars: getArgument('max_injection_chars', DEFAULTS.maxInjectionChars),
-      allow_large_injection: getArgument('allow_large_injection', String(DEFAULTS.allowLargeInjection)),
       injection_position: getArgument('injection_position', DEFAULTS.injectionPosition),
       chunk_chars: getArgument('chunk_chars', DEFAULTS.chunkChars),
       chunk_overlap: getArgument('chunk_overlap', DEFAULTS.chunkOverlap),
@@ -2134,7 +2167,15 @@
     if (storedRaw) {
       const parsed = typeof storedRaw === 'string' ? tryJsonParse(storedRaw, null) : storedRaw;
       const source = parsed?.settings && typeof parsed.settings === 'object' ? parsed.settings : parsed;
-      settings = normalizeSettings({ ...argSettings, ...(source || {}) });
+      const upgradeRecallTimeout = Number(source?.hookRecallTimeoutPolicyVersion || 0) < HOOK_RECALL_TIMEOUT_POLICY_VERSION;
+      settings = normalizeSettings({
+        ...argSettings,
+        ...(source || {}),
+        ...(upgradeRecallTimeout ? {
+          hookRecallTimeoutMs: DEFAULTS.hookRecallTimeoutMs,
+          hookRecallTimeoutPolicyVersion: HOOK_RECALL_TIMEOUT_POLICY_VERSION
+        } : {})
+      });
     }
     if (text(forcedInteropProfile).trim()) {
       settings = { ...settings, interopProfile: normalizeInteropProfileMode(forcedInteropProfile) };
@@ -2545,10 +2586,11 @@
     const cfg = settings || await loadSettings();
     const list = (texts || []).map(item => compact(item, 20000));
     if (!list.length) return [];
+    Runtime.lastEmbedUsedFallback = false;
+    Runtime.lastEmbedError = '';
     if (cfg.embeddingProvider === 'hash') return await hashEmbeddingBatch(list, cfg.hashDimensions);
     const chunks = [];
     const batchSize = clampInt(cfg.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
-    Runtime.lastEmbedUsedFallback = false;
     try {
       for (let i = 0; i < list.length; i += batchSize) {
         const batch = list.slice(i, i + batchSize);
@@ -2565,6 +2607,7 @@
       if (!cfg.fallbackHashEmbedding) throw error;
       warn('embedding endpoint failed; using hash fallback for all texts (dimension drift guard)', error);
       Runtime.lastEmbedUsedFallback = true;
+      Runtime.lastEmbedError = compact(error?.message || error || '알 수 없는 오류', 800);
       return await hashEmbeddingBatch(list, cfg.hashDimensions);
     }
   };
@@ -6186,14 +6229,11 @@
     if (qlen >= 1500) add(0.14, 'very_long_input');
     const score = clampNumber(need, 0, 1, 0);
     const baseTopK = clampInt(settings.topK, 1, 80, DEFAULTS.topK);
-    const baseMaxChars = clampInt(settings.maxInjectionChars, 800, 80000, DEFAULTS.maxInjectionChars);
+    const baseMaxChars = clampInt(settings.maxInjectionChars, 800, 8000, DEFAULTS.maxInjectionChars);
     const interopActive = settings.interopActive === true;
     const topKMultiplier = interopActive ? 1 : clampNumber(1 + score * 0.55, 1, 1.65, 1);
-    const maxInjectionMultiplier = interopActive ? 1 : clampNumber(1 + score * 0.9, 1, 1.9, 1);
+    const maxInjectionMultiplier = 1;
     const itemBudgetMultiplier = clampNumber(1 + score * 0.42, 1, 1.42, 1);
-    const maxCharsCap = interopActive
-      ? baseMaxChars
-      : Math.min(80000, Math.max(baseMaxChars, 24000, Math.ceil(baseMaxChars * 2.2)));
     return {
       enabled: score > 0.01,
       score,
@@ -6202,7 +6242,7 @@
       topKMultiplier,
       maxInjectionMultiplier,
       itemBudgetMultiplier,
-      maxInjectionChars: clampInt(Math.ceil(baseMaxChars * maxInjectionMultiplier), baseMaxChars, maxCharsCap, baseMaxChars)
+      maxInjectionChars: baseMaxChars
     };
   };
 
@@ -7471,8 +7511,7 @@
     const stateFacts = Array.isArray(recall?.currentStateFacts) ? recall.currentStateFacts : [];
     if (!items.length && !stateFacts.length) return '';
     const adaptive = recall?.adaptiveRecall || null;
-    const configuredMax = clampInt(adaptive?.maxInjectionChars ?? settings.maxInjectionChars, 800, 80000, settings.maxInjectionChars);
-    const max = settings.allowLargeInjection ? configuredMax : Math.min(configuredMax, SAFE_INJECTION_HARD_CAP);
+    const max = clampInt(settings.maxInjectionChars, 800, 8000, DEFAULTS.maxInjectionChars);
     const itemBudgetMultiplier = clampNumber(adaptive?.itemBudgetMultiplier, 1, 1.42, 1);
     const queryAnchors = extractRecallAnchors(recall?.queryText || latestUser || '');
     const interopMode = String(settings.interopMode || 'standalone');
@@ -9607,6 +9646,7 @@
           <div class="field"><label>API Key / Access Token</label><input id="embeddingKey" type="password" placeholder="기본값: 이 세션에서만 사용" /></div>
         </div>
         <div class="actions"><button id="saveSettingsBtn" class="btn btn-primary">저장</button><button id="clearEmbeddingKeyBtn" class="btn">키 삭제</button><button id="testEmbedBtn" class="btn">임베딩 테스트</button></div>
+        <div id="embeddingTestStatus" class="embedding-test-status" role="status" aria-live="polite"></div>
         <div class="tiny" style="margin-top:8px">데이터 동기화·정제·재임베딩은 ‘기억 유지보수’에서 한 번에 관리합니다.</div>
       </div>
       ${renderEmbeddingCostPanel(settings, stats)}
@@ -9634,6 +9674,8 @@
 
   const buildAdvancedTab = (settings = Runtime.settings || DEFAULTS) => {
     const checked = value => value ? 'checked' : '';
+    const recallQualityPreset = settings.recallQualityPreset || recallQualityPresetForValues(settings);
+    const recallPresetButtons = Object.keys(RECALL_QUALITY_PRESETS).map(id => `<button class="recall-preset-btn ${recallQualityPreset === id ? 'active' : ''}" type="button" data-recall-quality-preset="${id}" aria-pressed="${recallQualityPreset === id ? 'true' : 'false'}">${escapeHtml(RECALL_QUALITY_PRESET_LABELS[id])}</button>`).join('');
     return `<section class="panel" data-panel="advanced">
       <div class="card">
         <div class="card-title">기억 경로</div>
@@ -9644,13 +9686,18 @@
       </div>
       <div class="card">
         <div class="card-title">리콜 품질</div>
+        <div class="recall-preset-row">
+          <div><strong>성능 프리셋</strong><span>4개 리콜 품질 값을 한 번에 조절합니다.</span></div>
+          <div class="recall-preset-actions">${recallPresetButtons}<span id="recallQualityPresetStatus" class="recall-preset-status ${recallQualityPreset === 'custom' ? 'active' : ''}">${escapeHtml(RECALL_QUALITY_PRESET_LABELS[recallQualityPreset] || RECALL_QUALITY_PRESET_LABELS.custom)}</span></div>
+          <input id="recallQualityPreset" type="hidden" value="${escapeHtml(recallQualityPreset)}" />
+        </div>
         <div class="grid2">
-          <div class="field"><label>Top K</label><input id="topK" type="number" min="1" max="80" value="${escapeHtml(settings.topK)}" /></div>
-          <div class="field"><label>최소 점수</label><input id="minScore" type="number" min="0" max="1" step="0.01" value="${escapeHtml(settings.minScore)}" /></div>
-          <div class="field"><label>후보 수</label><input id="candidateLimit" type="number" min="8" max="400" value="${escapeHtml(settings.candidateLimit)}" /></div>
-          <div class="field"><label>고유사도 기준</label><input id="gateHighCosine" type="number" min="0" max="1" step="0.01" value="${escapeHtml(settings.gateHighCosine)}" /></div>
-          <div class="field"><label>최대 주입 글자</label><input id="maxInjectionChars" type="number" min="800" max="80000" step="100" value="${escapeHtml(settings.maxInjectionChars)}" /></div>
-          <div class="field"><label>요청 훅 리콜 제한시간(ms)</label><input id="hookRecallTimeoutMs" type="number" min="1000" max="15000" step="250" value="${escapeHtml(settings.hookRecallTimeoutMs)}" /></div>
+          <div class="field"><label>Top K</label><input id="topK" type="number" min="1" max="80" value="${escapeHtml(settings.topK)}" /><span class="field-note">최종 선택할 기억의 최대 개수입니다.</span></div>
+          <div class="field"><label>최소 점수</label><input id="minScore" type="number" min="0" max="1" step="0.01" value="${escapeHtml(settings.minScore)}" /><span class="field-note">이 점수보다 낮은 기억은 제외합니다.</span></div>
+          <div class="field"><label>후보 수</label><input id="candidateLimit" type="number" min="8" max="400" value="${escapeHtml(settings.candidateLimit)}" /><span class="field-note">정밀 선별 전에 검토할 기억의 최대 개수입니다.</span></div>
+          <div class="field"><label>고유사도 기준</label><input id="gateHighCosine" type="number" min="0" max="1" step="0.01" value="${escapeHtml(settings.gateHighCosine)}" /><span class="field-note">이 코사인 유사도 이상이면 강한 관련 기억으로 봅니다.</span></div>
+          <div class="field"><label>최대 주입 글자</label><input id="maxInjectionChars" type="number" min="800" max="8000" step="100" value="${escapeHtml(settings.maxInjectionChars)}" /><span class="field-note">리콜 기억에 주입할 최대 글자 수며 8,000자를 넘을 수 없습니다.</span></div>
+          <div class="field"><label>요청 훅 리콜 제한시간(ms)</label><input id="hookRecallTimeoutMs" type="number" min="1000" max="20000" step="250" value="${escapeHtml(settings.hookRecallTimeoutMs)}" /><span class="field-note">네트워크 임베딩을 기다리는 최대 시간이며 기본값은 20초입니다.</span></div>
         </div>
         <div class="toggle-list advanced-toggles">
           <label class="toggle-row"><input id="evidenceGate" type="checkbox" ${checked(settings.evidenceGate)} /><span>증거 게이트</span></label>
@@ -9664,7 +9711,6 @@
         <div class="toggle-list">
           <label class="toggle-row"><input id="persistEmbeddingKey" type="checkbox" ${checked(settings.persistEmbeddingKey)} /><span>임베딩 키를 로컬 저장소에 유지</span></label>
           <label class="toggle-row"><input id="operationLogEnabled" type="checkbox" ${checked(settings.operationLogEnabled)} /><span>작동 로그 저장 및 디버그 내보내기 포함</span></label>
-          <label class="toggle-row"><input id="allowLargeInjection" type="checkbox" ${checked(settings.allowLargeInjection)} /><span>6,000자를 넘는 대용량 기억 주입 허용</span></label>
         </div>
         <div class="actions"><button id="saveAdvancedSettingsBtn" class="btn btn-primary">고급 설정 저장</button></div>
       </div>
@@ -9780,6 +9826,23 @@
   .field input:focus,.field select:focus,.field textarea:focus{border-color:var(--accent)}
   .field select option{background:var(--surface2)}
   .field input::placeholder,.field textarea::placeholder{color:var(--text3)}
+  .field-note{font-size:10px;color:var(--text3);line-height:1.35}
+  .embedding-test-status{display:none;margin-top:8px;padding:7px 9px;border:1px solid var(--border);border-radius:var(--r);font-size:11px;font-weight:700;line-height:1.4}
+  .embedding-test-status.active{display:block}
+  .embedding-test-status.testing{background:var(--accent-dim);border-color:var(--accent-glow);color:var(--accent)}
+  .embedding-test-status.success{background:var(--success-dim);border-color:rgba(53,194,135,.35);color:var(--success)}
+  .embedding-test-status.failure{background:var(--danger-dim);border-color:rgba(224,82,82,.35);color:var(--danger)}
+  .recall-preset-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 10px;margin-bottom:10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--r)}
+  .recall-preset-row>div:first-child{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .recall-preset-row strong{font-size:11px;color:var(--text)}
+  .recall-preset-row>div:first-child span{font-size:10px;color:var(--text3)}
+  .recall-preset-actions{display:flex;align-items:center;gap:4px;flex-shrink:0}
+  .recall-preset-btn,.recall-preset-status{border:1px solid var(--border);background:var(--surface);color:var(--text2);border-radius:999px;padding:4px 9px;font:inherit;font-size:10px;font-weight:700;white-space:nowrap}
+  .recall-preset-btn{cursor:pointer}
+  .recall-preset-btn:hover{border-color:var(--border2);color:var(--text)}
+  .recall-preset-btn.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}
+  .recall-preset-status{display:none;border-color:var(--purple);background:var(--purple-dim);color:var(--purple)}
+  .recall-preset-status.active{display:inline-flex}
   .toggle-list{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
   .toggle-row{display:flex;align-items:center;gap:8px;min-height:34px;padding:7px 9px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface2);color:var(--text2);font-size:12px;font-weight:600;cursor:pointer}
   .toggle-row input[type="checkbox"]{width:16px;height:16px;flex:0 0 auto;accent-color:var(--accent)}
@@ -9893,6 +9956,8 @@
     .status-bar{padding:6px 8px;gap:6px;min-height:32px}
     .panel{padding:10px}
     .grid2,.recall-card-list,.toggle-list{grid-template-columns:1fr}
+    .recall-preset-row{align-items:flex-start;flex-direction:column}
+    .recall-preset-actions{width:100%;flex-wrap:wrap}
     .manual-editor-grid{grid-template-columns:1fr}
     .manual-editor-types{border-right:0;border-bottom:1px solid var(--border);display:flex;gap:4px;overflow-x:auto;overflow-y:hidden}
     .manual-editor-side-title{display:none}
@@ -10054,6 +10119,43 @@
   const getGuiNode = (id) => guiRoot?.querySelector?.(`#${id}`) || (typeof document !== 'undefined' ? document.getElementById?.(id) : null) || null;
   const guiQueryAll = (selector) => Array.from(guiScope().querySelectorAll?.(selector) || []);
 
+  const setEmbeddingTestStatus = (state = '', message = '') => {
+    const node = getGuiNode('embeddingTestStatus');
+    if (!node) return false;
+    const normalized = ['testing', 'success', 'failure'].includes(state) ? state : '';
+    node.className = `embedding-test-status${normalized ? ` active ${normalized}` : ''}`;
+    node.textContent = compact(message, 900);
+    return true;
+  };
+
+  const syncRecallQualityPresetUi = (presetId = 'custom') => {
+    const normalized = Object.prototype.hasOwnProperty.call(RECALL_QUALITY_PRESETS, presetId) ? presetId : 'custom';
+    const hidden = getGuiNode('recallQualityPreset');
+    if (hidden) hidden.value = normalized;
+    for (const btn of guiQueryAll('button[data-recall-quality-preset]')) {
+      const active = btn.getAttribute?.('data-recall-quality-preset') === normalized;
+      btn.classList?.toggle?.('active', active);
+      btn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+    }
+    const status = getGuiNode('recallQualityPresetStatus');
+    if (status) {
+      status.textContent = RECALL_QUALITY_PRESET_LABELS[normalized] || RECALL_QUALITY_PRESET_LABELS.custom;
+      status.classList?.toggle?.('active', normalized === 'custom');
+    }
+    return normalized;
+  };
+
+  const applyRecallQualityPresetToUi = (presetId) => {
+    const preset = RECALL_QUALITY_PRESETS[presetId];
+    if (!preset) return false;
+    for (const [id, value] of Object.entries(preset)) {
+      const node = getGuiNode(id);
+      if (node) node.value = String(value);
+    }
+    syncRecallQualityPresetUi(presetId);
+    return true;
+  };
+
   const readSettingsFromUi = () => {
     const base = Runtime.settings || DEFAULTS;
     const checkbox = (id, fallback) => {
@@ -10066,13 +10168,13 @@
     };
     return normalizeSettings({
       ...base,
+      recallQualityPreset: value('recallQualityPreset', base.recallQualityPreset || recallQualityPresetForValues(base)),
       embeddingProvider: value('embeddingProvider', base.embeddingProvider),
       embeddingUrl: value('embeddingUrl', base.embeddingUrl),
       embeddingModel: value('embeddingModel', base.embeddingModel),
       captureAfterRequest: checkbox('captureAfterRequest', base.captureAfterRequest),
       persistEmbeddingKey: checkbox('persistEmbeddingKey', base.persistEmbeddingKey),
       operationLogEnabled: checkbox('operationLogEnabled', base.operationLogEnabled),
-      allowLargeInjection: checkbox('allowLargeInjection', base.allowLargeInjection),
       evidenceGate: checkbox('evidenceGate', base.evidenceGate),
       currentSceneTailEnabled: checkbox('currentSceneTailEnabled', base.currentSceneTailEnabled),
       entityFocusedRecallEnabled: checkbox('entityFocusedRecallEnabled', base.entityFocusedRecallEnabled),
@@ -10092,7 +10194,6 @@
       captureAfterRequest: settings.captureAfterRequest,
       persistEmbeddingKey: settings.persistEmbeddingKey,
       operationLogEnabled: settings.operationLogEnabled,
-      allowLargeInjection: settings.allowLargeInjection,
       evidenceGate: settings.evidenceGate,
       currentSceneTailEnabled: settings.currentSceneTailEnabled,
       entityFocusedRecallEnabled: settings.entityFocusedRecallEnabled,
@@ -10117,6 +10218,7 @@
       const node = getGuiNode(id);
       if (node && String(node.value ?? '') !== String(value ?? '')) node.value = String(value ?? '');
     });
+    syncRecallQualityPresetUi(settings.recallQualityPreset || recallQualityPresetForValues(settings));
     return true;
   };
 
@@ -10725,6 +10827,18 @@
       } catch (error) { await guiError('고급 설정 저장 실패', error); }
       finally { setBusy(false); }
     });
+    for (const btn of guiQueryAll('button[data-recall-quality-preset]')) {
+      btn.addEventListener('click', () => {
+        applyRecallQualityPresetToUi(btn.getAttribute('data-recall-quality-preset') || '');
+      });
+    }
+    for (const id of ['topK', 'minScore', 'candidateLimit', 'gateHighCosine']) {
+      getGuiNode(id)?.addEventListener('input', () => syncRecallQualityPresetUi('custom'));
+    }
+    getGuiNode('maxInjectionChars')?.addEventListener('input', event => {
+      const node = event?.target;
+      if (Number(node?.value) > 8000) node.value = '8000';
+    });
     getGuiNode('clearEmbeddingKeyBtn')?.addEventListener('click', async () => {
       if (!await guiConfirm('로컬에 저장된 API 키 또는 액세스 토큰을 삭제할까요?')) return;
       setBusy(true, '임베딩 키 삭제');
@@ -10737,21 +10851,37 @@
     });
     getGuiNode('embeddingProvider')?.addEventListener('change', () => {
       const provider = getGuiNode('embeddingProvider')?.value || 'hash';
+      setEmbeddingTestStatus('', '');
       const url = getGuiNode('embeddingUrl');
       const model = getGuiNode('embeddingModel');
       if (url && !url.value.trim()) url.value = defaultUrlForProvider(provider);
       if (model && (!model.value.trim() || model.value === DEFAULTS.embeddingModel || model.value === 'nomic-embed-text' || (provider === 'voyageai' && model.value === 'voyage-3-lite'))) model.value = defaultModelForProvider(provider);
     });
     getGuiNode('testEmbedBtn')?.addEventListener('click', async () => {
+      setEmbeddingTestStatus('testing', '임베딩 호출 중...');
       setBusy(true, '임베딩 테스트');
       try {
         const settings = await saveSettings(readSettingsFromUi());
         const key = getGuiNode('embeddingKey')?.value || '';
         if (key.trim()) await saveEmbeddingKeyLocal(key);
         const [v] = await embedTexts(['캐릭터는 중요한 장소에서 상대와 대화했다.'], settings, { taskType: 'query' });
-        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, dim: v.length, preview: v.slice(0, 8) };
+        const provider = normalizeProvider(settings.embeddingProvider);
+        if (provider !== 'hash' && Runtime.lastEmbedUsedFallback) {
+          const error = new Error(Runtime.lastEmbedError || `${provider} 원격 임베딩 응답을 받지 못했습니다.`);
+          error.code = 'EMBEDDING_PROVIDER_TEST_FAILED';
+          throw error;
+        }
+        if (!Array.isArray(v) || !v.length) throw new Error('임베딩 벡터가 비어 있습니다.');
+        const model = provider === 'hash' ? `hash-${settings.hashDimensions}` : settings.embeddingModel;
+        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider, model, dim: v.length, preview: v.slice(0, 8) };
+        setEmbeddingTestStatus('success', `호출 성공 · ${provider} / ${model} · ${formatNumber(v.length)}차원`);
         await refreshUi('provider');
-      } catch (error) { await guiError('임베딩 테스트 실패', error); }
+      } catch (error) {
+        const message = formatErrorMessage(error);
+        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: false, error: message };
+        setEmbeddingTestStatus('failure', `호출 실패 · ${message}`);
+        await guiError('임베딩 테스트 실패', error);
+      }
       finally { setBusy(false); }
     });
     getGuiNode('maintenanceInspectBtn')?.addEventListener('click', async () => {
