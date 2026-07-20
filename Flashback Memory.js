@@ -1,7 +1,7 @@
 //@name flashback_memory
 //@display-name ⚡ FLASHBACK Memory
 //@api 3.0
-//@version 0.8.3
+//@version 0.8.5
 //@allowed-ipc libra_world_manager
 //@allowed-ipc hayaku_locator_continuity
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
@@ -72,7 +72,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.8.3
+ * ⚡ FLASHBACK Memory v0.8.5
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -307,7 +307,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.8.3';
+  const PLUGIN_VERSION = '0.8.5';
   const LIBRA_HAYAKU_PROTOCOL = 'libra-hayaku-v1';
   const LIBRA_MEMORY_INTEROP_PROTOCOL = 'libra-memory-interop-v1';
   const LIBRA_SUITE_IPC_CHANNEL = 'libra-suite-interop-v1';
@@ -3682,6 +3682,22 @@
     && (record?.autoEpisode === true || String(record?.origin || '').startsWith('episode_index'));
   const isRetainedMemoryRecord = (record = {}) => !isLegacyExternalRecordMarker(record)
     && (isResponseMemoryRecord(record) || isResponseDerivedIndexRecord(record));
+  const isInheritedScopeMemoryRecord = (record = {}, scopeOrKey = '') => {
+    const inheritedFromScopeKey = text(record?.clonedFromScopeKey || '').trim();
+    if (!inheritedFromScopeKey) return false;
+    const currentScopeKey = text(typeof scopeOrKey === 'string' ? scopeOrKey : scopeOrKey?.scopeKey || '').trim();
+    return !currentScopeKey || inheritedFromScopeKey !== currentScopeKey;
+  };
+  const normalizeInheritedScopeRecordForActiveHistory = (record = {}) => ({
+    ...record,
+    inheritedSessionHistory: true,
+    turnNodeId: '',
+    logicalTurnId: '',
+    variantId: '',
+    parentTurnNodeId: '',
+    lifecycleStatus: 'active',
+    retiredAt: ''
+  });
 
   const emptyTurnWorldline = (scopeKey = '') => ({
     version: TURN_WORLDLINE_VERSION,
@@ -4528,7 +4544,7 @@
           const records = (Array.isArray(shard?.records) ? shard.records : [])
             .filter(record => record && typeof record === 'object')
             .filter(isRetainedMemoryRecord)
-            .map(record => ({
+            .map(record => normalizeInheritedScopeRecordForActiveHistory({
               ...record,
               scopeKey: toScope.scopeKey,
               clonedFromScopeKey: fromScopeMeta.scopeKey,
@@ -4599,16 +4615,10 @@
         turnWorldlineRevision: 0
       };
       await saveScopeManifest(manifest, toScope);
-      const sourceWorldline = await loadTurnWorldline(fromScopeMeta.scopeKey);
-      await saveTurnWorldline(toScope.scopeKey, {
-        ...sourceWorldline,
-        scopeKey: toScope.scopeKey,
-        revision: 0,
-        liveHash: '',
-        headTurnNodeId: '',
-        nodes: sourceWorldline.nodes.map(node => ({ ...node, status: 'orphaned', activeOrdinal: 0 })),
-        retiredRecords: sourceWorldline.retiredRecords.map(record => ({ ...record, scopeKey: toScope.scopeKey, lifecycleStatus: 'orphaned' }))
-      });
+      // Only active memory records cross a session boundary. The predecessor
+      // chat's reroll/rollback topology is scoped to that chat and must never
+      // become the new chat's worldline.
+      await saveTurnWorldline(toScope.scopeKey, emptyTurnWorldline(toScope.scopeKey));
       await cleanupListedScopeShardOrphans(toScope.scopeKey, targetCommitId).catch(error => warn('listed shard cleanup failed', error));
       return { ok: true, skipped: false, records: copiedRecords };
     });
@@ -4863,7 +4873,12 @@
       const loaded = await loadScopeRecords(scope.scopeKey);
     const map = new Map();
     const duplicateBuckets = new Map();
-    const bucketKey = (record, offset = 0) => `${record.sourceType === 'chat_turn' ? 'response' : record.sourceType || 'unknown'}:${finiteTurnIndex(record) + offset}`;
+    const bucketKey = (record, offset = 0) => {
+      const timeline = isInheritedScopeMemoryRecord(record, scope.scopeKey)
+        ? `inherited:${text(record.clonedFromScopeKey || '')}`
+        : 'live';
+      return `${timeline}:${record.sourceType === 'chat_turn' ? 'response' : record.sourceType || 'unknown'}:${finiteTurnIndex(record) + offset}`;
+    };
     const rememberBucket = (record) => {
       const key = bucketKey(record);
       if (!duplicateBuckets.has(key)) duplicateBuckets.set(key, []);
@@ -5303,8 +5318,44 @@
       if (currentManifest.turnWorldlineLiveHash === liveHash) return { changed: false, reason: 'worldline_current', liveHash };
       const [loaded, storedWorldline] = await Promise.all([loadScopeRecords(scope.scopeKey), loadTurnWorldline(scope.scopeKey)]);
       const reconciled = reconcileFlashbackTurnWorldline(storedWorldline, scope.scopeKey, normalizedLive);
-      const activeGroups = responseGroupsForWorldline(loaded.records);
-      const retiredGroups = responseGroupsForWorldline(storedWorldline.retiredRecords);
+      const inheritedResponseMap = new Map();
+      const inheritedLineageNodeIds = new Set();
+      const inheritedLineageLogicalIds = new Set();
+      const inheritedLineageVariantIds = new Set();
+      let normalizedInheritedRecords = 0;
+      for (const record of [...loaded.records, ...storedWorldline.retiredRecords]) {
+        if (!isResponseMemoryRecord(record) || !isInheritedScopeMemoryRecord(record, scope.scopeKey)) continue;
+        if (record.turnNodeId) inheritedLineageNodeIds.add(text(record.turnNodeId));
+        if (record.logicalTurnId) inheritedLineageLogicalIds.add(text(record.logicalTurnId));
+        if (record.variantId) inheritedLineageVariantIds.add(text(record.variantId));
+        if (record.inheritedSessionHistory !== true || record.turnNodeId || record.logicalTurnId || record.variantId
+          || record.parentTurnNodeId || record.retiredAt || record.lifecycleStatus !== 'active') normalizedInheritedRecords += 1;
+        const normalizedRecord = normalizeInheritedScopeRecordForActiveHistory(record);
+        const key = text(record.id || record.hash || `${record.sourceId || ''}:${record.chunkIndex || 0}`);
+        if (key && !inheritedResponseMap.has(key)) inheritedResponseMap.set(key, normalizedRecord);
+      }
+      const inheritedResponses = Array.from(inheritedResponseMap.values());
+      const recoveredInheritedRecords = inheritedResponses.filter(record =>
+        !loaded.records.some(active => text(active.id || active.hash || '') === text(record.id || record.hash || ''))
+      ).length;
+      // Session-handoff records belong to completed predecessor chats. They
+      // remain recallable history, but must never be reconciled against the
+      // new chat's independent live turn indexes.
+      const currentWorldline = normalizeTurnWorldline({
+        ...reconciled.worldline,
+        nodes: reconciled.worldline.nodes.filter(node =>
+          !inheritedLineageNodeIds.has(text(node.turnNodeId || ''))
+          && !inheritedLineageLogicalIds.has(text(node.logicalTurnId || ''))
+          && !inheritedLineageVariantIds.has(text(node.variantId || ''))
+        )
+      }, scope.scopeKey);
+      const activeGroups = responseGroupsForWorldline(
+        loaded.records.filter(record => !isInheritedScopeMemoryRecord(record, scope.scopeKey))
+      );
+      const timelineRetiredRecords = storedWorldline.retiredRecords.filter(record =>
+        !isInheritedScopeMemoryRecord(record, scope.scopeKey)
+      );
+      const retiredGroups = responseGroupsForWorldline(timelineRetiredRecords);
       const usedActive = new Set();
       const restoredKeys = new Set();
       const nextResponses = [];
@@ -5322,29 +5373,29 @@
           nextResponses.push(...annotateWorldlineRecords(retired.records, descriptor.node, 'active'));
         }
       }
-      const nodeById = new Map(reconciled.worldline.nodes.map(node => [node.turnNodeId, node]));
+      const nodeById = new Map(currentWorldline.nodes.map(node => [node.turnNodeId, node]));
       const newlyRetired = [];
       for (const group of activeGroups) {
         if (usedActive.has(group.key)) continue;
-        const node = nodeById.get(group.turnNodeId) || reconciled.worldline.nodes.find(candidate => candidate.logicalTurnId === group.logicalTurnId && candidate.variantId === group.variantId);
+        const node = nodeById.get(group.turnNodeId) || currentWorldline.nodes.find(candidate => candidate.logicalTurnId === group.logicalTurnId && candidate.variantId === group.variantId);
         const status = node?.status === 'inactive_variant' ? 'inactive_variant' : (node?.status === 'detached_branch' ? 'detached_branch' : 'orphaned');
         newlyRetired.push(...annotateWorldlineRecords(group.records, node, status));
       }
       const restoredRecordKeys = new Set(nextResponses.map(record => text(record.id || record.hash || '')));
       const retiredPool = [
-        ...storedWorldline.retiredRecords.filter(record => !restoredRecordKeys.has(text(record.id || record.hash || ''))),
+        ...timelineRetiredRecords.filter(record => !restoredRecordKeys.has(text(record.id || record.hash || ''))),
         ...newlyRetired
       ];
-      const responseChanged = newlyRetired.length > 0 || restoredKeys.size > 0 || activeGroups.some(group => {
+      const responseChanged = recoveredInheritedRecords > 0 || normalizedInheritedRecords > 0 || newlyRetired.length > 0 || restoredKeys.size > 0 || activeGroups.some(group => {
         const first = group.records[0] || {};
         return usedActive.has(group.key) && (!first.turnNodeId || first.lifecycleStatus !== 'active');
       });
       let saved = { manifest: currentManifest, records: loaded.records };
       if (responseChanged) {
         const nonResponse = loaded.records.filter(record => !isResponseMemoryRecord(record) && !(record.autoEpisode || record.sourceType === 'episode_index'));
-        saved = await saveScopeRecords(scope, [...nonResponse, ...nextResponses], cfg, scope);
+        saved = await saveScopeRecords(scope, [...nonResponse, ...inheritedResponses, ...nextResponses], cfg, scope);
       }
-      const worldline = await saveTurnWorldline(scope.scopeKey, { ...reconciled.worldline, retiredRecords: retiredPool });
+      const worldline = await saveTurnWorldline(scope.scopeKey, { ...currentWorldline, retiredRecords: retiredPool });
       const savedManifest = await saveScopeManifest({
         ...saved.manifest,
         turnWorldlineLiveHash: worldline.liveHash,
@@ -5360,6 +5411,8 @@
         orphanedNodes: worldline.nodes.filter(node => node.status === 'orphaned').length,
         retiredRecords: worldline.retiredRecords.length,
         restoredRecords: restoredRecordKeys.size,
+        recoveredInheritedRecords,
+        normalizedInheritedRecords,
         manifest: savedManifest
       };
     });
@@ -5370,7 +5423,9 @@
     return result;
   };
   const prepareFlashbackWorldlineReplacement = async (scope, existingRecords = [], incomingRecords = [], replacementTurns = new Set()) => {
-    const activeGroups = responseGroupsForWorldline(existingRecords);
+    const activeGroups = responseGroupsForWorldline(
+      existingRecords.filter(record => !isInheritedScopeMemoryRecord(record, scope.scopeKey))
+    );
     const incomingGroups = responseGroupsForWorldline(incomingRecords).filter(group => replacementTurns.has(group.turnIndex));
     let forkAt = Number.POSITIVE_INFINITY;
     for (const incomingGroup of incomingGroups) {
@@ -5402,7 +5457,7 @@
         invalidatedEpisodeIndexes += 1;
         continue;
       }
-      if (isResponseMemoryRecord(record) && finiteTurnIndex(record) >= forkAt) {
+      if (isResponseMemoryRecord(record) && !isInheritedScopeMemoryRecord(record, scope.scopeKey) && finiteTurnIndex(record) >= forkAt) {
         const node = nodes.find(candidate => candidate.turnNodeId === record.turnNodeId) || nodeByGroupKey.get(responseTurnGroupKey(record));
         const status = finiteTurnIndex(record) === forkAt ? 'inactive_variant' : 'detached_branch';
         if (node) {
