@@ -1,7 +1,7 @@
 //@name flashback_memory
 //@display-name ⚡ FLASHBACK Memory
 //@api 3.0
-//@version 0.8.5
+//@version 0.8.7
 //@allowed-ipc libra_world_manager
 //@allowed-ipc hayaku_locator_continuity
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
@@ -72,7 +72,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.8.5
+ * ⚡ FLASHBACK Memory v0.8.6
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -307,7 +307,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.8.5';
+  const PLUGIN_VERSION = '0.8.7';
   const LIBRA_HAYAKU_PROTOCOL = 'libra-hayaku-v1';
   const LIBRA_MEMORY_INTEROP_PROTOCOL = 'libra-memory-interop-v1';
   const LIBRA_SUITE_IPC_CHANNEL = 'libra-suite-interop-v1';
@@ -325,6 +325,20 @@
   const LIBRA_RUNTIME_CONTRACT_RE = /\[LIBRA-(?:HAYAKU|FLASHBACK) Runtime Contract[^\]]*\][\s\S]*?(?=\n\[[A-Z][^\]]+\]|$)/gi;
   const PEER_META_MARKER_RE = /\[(?:LIBRA\s+[^\]\n]{1,100}\s+Injection|LIBRA-(?:HAYAKU|FLASHBACK) Runtime Contract[^\]]*|HAYAKU\s+(?:CONTINUITY CONTEXT|SIDE-WRITE FINAL REMINDER|IMMUTABLE CORE|RECALL KERNEL))\]|HAYAKU_STATE_PACKET_START/i;
   const INTERNAL_LINE_RE = /(^|\n)[^\n]*(?:_locator|_retrieval|storeKey|store_key|internalId|internal_id|locatorUri|locator_uri)[^\n]*(?=\n|$)/gi;
+  const PRE_CHECK_BLOCK_RE = /<pre_check\b[^>]*>[\s\S]*?<\/pre_check>/gi;
+  const EVALUATION_REPORT_BLOCK_RE = /<EvaluationReport\b[^>]*>[\s\S]*?<\/EvaluationReport>/gi;
+  const REVISION_REPORT_BLOCK_RE = /<RevisionReport\b[^>]*>[\s\S]*?<\/RevisionReport>/gi;
+  const DEVELOPMENT_REPORT_BLOCK_RE = /<DevelopmentReport\b[^>]*>[\s\S]*?<\/DevelopmentReport>/gi;
+  const UNTERMINATED_REPORT_BLOCK_RE = /<(?:EvaluationReport|RevisionReport|DevelopmentReport)\b[^>]*>[\s\S]*?(?=\[LBDATA START\]|$)/gi;
+  const LBDATA_BLOCK_RE = /\[LBDATA START\][\s\S]*?\[LBDATA END\]/gi;
+  const LB_SNS_BLOCK_RE = /<lb-sns\b[^>]*>[\s\S]*?<\/lb-sns>/gi;
+  const LB_SNS_MEDIA_BLOCK_RE = /<lb-sns-media\b[^>]*>[\s\S]*?<\/lb-sns-media>/gi;
+  const LB_XNAI_BLOCK_RE = /<lb-xnai\b[^>]*>[\s\S]*?<\/lb-xnai>|<lb-xnai\b[^>]*\/\s*>/gi;
+  const LB_CONTROL_TAG_RE = /<lb-(?:lazy|pending|rerolling|reroll|interaction-identifier|xnai-gen|process)\b[^>]*\/?\s*>/gi;
+  const INLAY_COMMAND_RE = /\{\{inlay::[^}\n]+\}\}/gi;
+  const IMAGE_COMMAND_RE = /<img\b[^>]*>|<image\b[^>]*>[\s\S]*?<\/image>|!\[[^\]\n]*\]\([^)\n]+\)/gi;
+  const RP_STATUS_LINE_RE = /(^|\n)\s*\[[a-zA-Z0-9_가-힣]{1,32}:\s*(?:slightly\s+)?(?:dislike(?:s|d)?(?:\s+it)?|like(?:s|d)?(?:\s+it)?|love(?:s|d)?(?:\s+it)?|hate(?:s|d)?(?:\s+it)?|neutral|indifferent|호감|비호감|좋아함|싫어함)[^\]\n]*\]\s*(?=\n|$)/gi;
+  const SCENE_STATUS_LINE_RE = /(^|\n)\s*\[[^\]\n]{0,180}[☀☁🌧🌙❄⛅🌤🌦][^\]\n]{0,240}[★■][^\]\n]{0,80}\]\s*(?=\n|$)/g;
 
   const STORAGE = Object.freeze({
     settings: `${PLUGIN_STORAGE_ID}:settings:v2`,
@@ -1148,7 +1162,23 @@
     return out;
   };
 
-  const stripSourceArtifacts = (value = '') => text(value)
+  const stripExternalRuntimeArtifacts = (value = '') => text(value)
+    .replace(PRE_CHECK_BLOCK_RE, ' ')
+    .replace(EVALUATION_REPORT_BLOCK_RE, ' ')
+    .replace(REVISION_REPORT_BLOCK_RE, ' ')
+    .replace(DEVELOPMENT_REPORT_BLOCK_RE, ' ')
+    .replace(UNTERMINATED_REPORT_BLOCK_RE, ' ')
+    .replace(LBDATA_BLOCK_RE, '\n')
+    .replace(LB_SNS_BLOCK_RE, '\n')
+    .replace(LB_SNS_MEDIA_BLOCK_RE, '\n')
+    .replace(LB_XNAI_BLOCK_RE, '\n')
+    .replace(LB_CONTROL_TAG_RE, '\n')
+    .replace(INLAY_COMMAND_RE, ' ')
+    .replace(IMAGE_COMMAND_RE, ' ')
+    .replace(RP_STATUS_LINE_RE, '\n')
+    .replace(SCENE_STATUS_LINE_RE, '\n');
+
+  const stripSourceArtifacts = (value = '') => stripExternalRuntimeArtifacts(value)
     .replace(VECTOR_BLOCK_RE, ' ')
     .replace(HAYAKU_CONTEXT_BLOCK_RE, ' ')
     .replace(HAYAKU_IMMUTABLE_CORE_RE, ' ')
@@ -1229,7 +1259,7 @@
   };
 
   const sanitizeAssistantForMemory = (value = '', options = {}) => {
-    let out = text(value || '');
+    let out = stripExternalRuntimeArtifacts(value || '');
     if (!out) return '';
     out = out
       .replace(THOUGHT_BLOCK_RE, '\n')
@@ -2127,6 +2157,7 @@
     roles: {},
     authority: {},
     coexistence: {},
+    currentTurn: { protocol: 'libra-suite-current-turn-v1', resolver: 'provenance_aware_v1' },
     currentScope: { characterId: '', chatId: '', scopeKey: '' },
     promptBudget: { maxInjectionChars: 2400, topK: 6, recentTurnExclusion: 2 },
     snapshot() {
@@ -2140,6 +2171,7 @@
         roles: this.roles,
         authority: this.authority,
         coexistence: this.coexistence,
+        currentTurn: this.currentTurn,
         currentScope: this.currentScope,
         promptBudget: this.promptBudget
       }, {});
@@ -2172,6 +2204,10 @@
       externalMemorySources: false,
       automaticExternalRetirement: true,
       previousFinalizedTurnRecall: true,
+      provenanceCurrentTurn: true,
+      prefillSafePlacement: true,
+      authoritativePairRecovery: true,
+      externalArtifactSanitizer: true,
       turnIdentity: 'Tn=Un+An',
       primaryMemory: !interop.active,
       standaloneMemory: !interop.active,
@@ -8044,8 +8080,8 @@
   const normalizeMessages = (messages) => Array.isArray(messages)
     ? messages.map((msg, index) => ({
         ...msg,
-        role: text(msg?.role || 'unknown').toLowerCase(),
-        contentText: sanitizeSourceText(contentToText(msg?.content)),
+        role: rawMessageRole(msg),
+        contentText: rawMessageContent(msg),
         index
       }))
     : [];
@@ -8419,9 +8455,73 @@
     }
   };
 
+  const FLASHBACK_CURRENT_INPUT_TAGS = Object.freeze([
+    { name: 'Current Input', source: 'Current\\s+Input' },
+    { name: 'Latest User Input to Continue From', source: 'Latest\\s+User\\s+Input\\s+to\\s+Continue\\s+From' },
+    { name: 'Physis', source: 'Physis' },
+    { name: 'Writing Cue', source: 'Writing\\s+Cue' },
+    { name: 'current_message', source: 'current_message' }
+  ]);
+
+  const hasFlashbackChatProvenance = message => {
+    if (!message || typeof message !== 'object') return false;
+    const direct = [
+      message.memo,
+      message.chatId,
+      message.chat_id,
+      message.messageId,
+      message.message_id,
+      message.m_id,
+      message.msgId,
+      message.saying
+    ].some(value => text(value || '').trim());
+    if (direct) return true;
+    if (message.generationInfo && typeof message.generationInfo === 'object' && Object.keys(message.generationInfo).length > 0) return true;
+    const stableId = text(message.id || message.uuid || message.uid || '').trim();
+    const timestamp = Number(message.time || message.timestamp || message.createdAt || 0);
+    return !!stableId && Number.isFinite(timestamp) && timestamp > 0;
+  };
+
+  // 일부 프롬프트 프리셋은 chatAsOriginalOnSystem=false 또는 미설정 상태로
+  // 마지막 user 인풋을 role:'system'으로 프롬프트에 주입한다. 이 경우 Flashback의
+  // resolveFlashbackCurrentTurn 루프가 role 필터링 때문에 user 인풋을 놓치게 된다.
+  // 아래 휴리스틱은 provenance가 확실하고 메타 헤더가 아닌 system 메시지를
+  // user 인풋 후보로 승격시키기 위한 판별기다.
+  const isSystemMessageActingAsUser = (message, body = '') => {
+    if (!message || typeof message !== 'object') return false;
+    const rawRole = rawMessageRole(message);
+    if (rawRole !== 'system' && rawRole !== 'developer' && rawRole !== 'message') return false;
+    const candidate = (typeof body === 'string' && body) || text(message.contentText || message.content || '');
+    if (!candidate || isOwnInjection(candidate) || isLikelyMetaUserMessage(candidate)) return false;
+    if (!hasFlashbackChatProvenance(message)) return false;
+    return true;
+  };
+
+  const stripPromptHeaderFromSystemAsUser = (body) => {
+    const raw = text(body || '');
+    if (!raw) return '';
+    const headerMatch = raw.match(/^\s*(?:#\s*[^#\n]{0,120}|##\s*[^#\n]{0,120}|---+)\s*\n/i);
+    if (!headerMatch) return raw;
+    const headerLine = headerMatch[0].trim();
+    const rest = raw.slice(headerMatch[0].length).replace(/^\s+/, '');
+    if (!rest) return raw;
+    const normalizedHeader = headerLine.toLowerCase().replace(/\s+/g, '');
+    if (
+      /^(#?(?:myinput|userinput|input|lastestuserinput|latestuserinput|currentinput|currentmessage|currentuserinput|writingcue|최근인풋|최근인풋투컨티뉴프롬|래퍼런스인풋|현재인풋|현재챗))/.test(normalizedHeader)
+      || /^---/.test(headerLine)
+    ) {
+      return rest;
+    }
+    return raw;
+  };
+
   const stripCurrentInputWrapper = (value) => {
     let body = sanitizeSourceText(value || '');
-    body = body.replace(/<\/?Current Input>/gi, '');
+    for (const tag of FLASHBACK_CURRENT_INPUT_TAGS) {
+      body = body
+        .replace(new RegExp(`<\\s*${tag.source}\\b[^>]*>`, 'gi'), '')
+        .replace(new RegExp(`<\\s*\\/\\s*${tag.source}\\s*>`, 'gi'), '');
+    }
     const fence = body.match(/```(?:[a-zA-Z0-9_-]+)?\s*([\s\S]*?)\s*```/);
     if (fence) body = fence[1];
     body = body.replace(/^```(?:[a-zA-Z0-9_-]+)?\s*/gm, '').replace(/\s*```$/gm, '');
@@ -8429,31 +8529,46 @@
     return compact(sanitizeSourceText(body), 6000);
   };
 
-  const extractCurrentInputAcrossMessages = (messages) => {
+  const latestFlashbackCurrentInputRange = messages => {
     const normalized = normalizedMessagesFrom(messages);
-    const parts = [];
-    let inside = false;
-    for (const message of normalized) {
-      if (message.role !== 'user') continue;
-      let body = text(message.contentText || message.content || '');
-      if (!inside) {
-        const start = body.search(/<Current Input\b[^>]*>/i);
-        if (start < 0) continue;
-        inside = true;
-        body = body.slice(start);
+    for (let start = normalized.length - 1; start >= 0; start -= 1) {
+      const startBody = text(normalized[start]?.contentText || normalized[start]?.content || '');
+      if (!startBody) continue;
+      for (const tag of FLASHBACK_CURRENT_INPUT_TAGS) {
+        const openRe = new RegExp(`<\\s*${tag.source}\\b[^>]*>`, 'i');
+        const closeRe = new RegExp(`<\\s*\\/\\s*${tag.source}\\s*>`, 'i');
+        const open = startBody.match(openRe);
+        if (!open) continue;
+        const tail = startBody.slice(Number(open.index || 0) + open[0].length);
+        const inlineClose = tail.search(closeRe);
+        if (inlineClose >= 0) {
+          const current = stripCurrentInputWrapper(tail.slice(0, inlineClose));
+          if (current) return { start, end: start, text: current, tag: tag.name };
+          continue;
+        }
+        const parts = [tail];
+        for (let end = start + 1; end < normalized.length; end += 1) {
+          const next = normalized[end];
+          if (next?.role === 'assistant') break;
+          const body = text(next?.contentText || next?.content || '');
+          const closeIndex = body.search(closeRe);
+          if (closeIndex >= 0) {
+            parts.push(body.slice(0, closeIndex));
+            const current = stripCurrentInputWrapper(parts.join('\n'));
+            if (current) return { start, end, text: current, tag: tag.name };
+            break;
+          }
+          if (FLASHBACK_CURRENT_INPUT_TAGS.some(other => new RegExp(`<\\s*${other.source}\\b[^>]*>`, 'i').test(body))) break;
+          parts.push(body);
+        }
       }
-      const end = body.search(/<\/Current Input>/i);
-      if (end >= 0) {
-        parts.push(body.slice(0, end));
-        break;
-      }
-      parts.push(body);
     }
-    if (!parts.length) return '';
-    return stripCurrentInputWrapper(parts.join('\n'));
+    return null;
   };
 
-  const isLikelyMetaUserMessage = (value) => {
+  const extractCurrentInputAcrossMessages = messages => latestFlashbackCurrentInputRange(messages)?.text || '';
+
+  const isLikelyMetaUserMessage = value => {
     const body = text(value).trim();
     if (!body) return true;
     if (isOwnInjection(body)) return true;
@@ -8461,31 +8576,183 @@
     if (/^(---|<\/?(?:Lore|Others Info|Last output|Past conversations|Image Commands|information)>|#\s*(?:Final Check|Tags|Expansion|Annotation Feature)|###\s*Status Interface)/i.test(body)) return true;
     if (/^system\s*:/i.test(body)) return true;
     if (/^Take my current input as inspiration/i.test(body)) return true;
+    if (/^(?:Gate\s*\d+|Now respond\b|I will report you to the System\b|OUTPUT LANGUAGE\b|GLOBAL NOTE\b|THE ARRANGEMENT\b|LET SOLISTE PLAY\b)/i.test(body)) return true;
+    if (/(?:<\/?lb-process\b|\blb-xnai-(?:editing|gen)\b|\bLightBoard\s+Backend\b|\b(?:positive|negative)\s+prompt\b|\b(?:sampler|cfg\s*scale|steps|seed|checkpoint|lora|vae)\s*:|\btranslate\s+(?:the\s+following|to\b)|(?:오직\s*)?(?:json|xml)\s*만\s*(?:출력|반환|응답)|\b(?:json|xml)\s+only\b)/i.test(body)) return true;
     if (body.length > 1800 && /(?:Response template|Narration Principles|Content Policy|Character Information|Basic Information|Long-Term Memory Archive)/i.test(body)) return true;
     return false;
   };
 
-  const extractLatestUserInput = (messages) => {
+  const findFlashbackTerminalAssistantPrefillIndex = messages => {
     const normalized = normalizedMessagesFrom(messages);
-    const currentInput = extractCurrentInputAcrossMessages(normalized);
-    if (currentInput) return currentInput;
-    let firstCurrentInput = '';
-    let explicit = null;
-    let lastUser = null;
-    for (const message of normalized) {
-      if (message.role !== 'user') continue;
-      lastUser = message;
-      if (!firstCurrentInput) {
-        const currentMatch = text(message.contentText || '').match(/<Current Input>[\s\S]*?<\/Current Input>/i);
-        if (currentMatch) firstCurrentInput = currentMatch[0];
+    for (let i = normalized.length - 1; i >= 0; i -= 1) {
+      const message = normalized[i];
+      if (message?.role !== 'assistant') continue;
+      if (hasFlashbackChatProvenance(message)) continue;
+      if (!text(message.contentText || message.content || '').trim()) continue;
+      const laterChatTurn = normalized.slice(i + 1).some(item =>
+        ['user', 'assistant'].includes(item?.role)
+        && hasFlashbackChatProvenance(item)
+        && !isOwnInjection(item?.contentText || item?.content || '')
+      );
+      if (!laterChatTurn) return i;
+    }
+    return -1;
+  };
+
+  const findFlashbackLiveUserMatch = (liveMessages = [], value = '') => {
+    const wanted = canonicalTurnCompareText(value);
+    if (!wanted) return null;
+    const list = Array.isArray(liveMessages) ? liveMessages : [];
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const message = list[i];
+      if (message?.role !== 'user') continue;
+      const body = canonicalTurnCompareText(message.contentText || message.content || '');
+      if (body && body === wanted) {
+        return { message, position: Number(message.index || i) + 1 };
       }
-      if (!isLikelyMetaUserMessage(message.contentText)) explicit = message;
     }
-    if (firstCurrentInput) {
-      const extracted = stripCurrentInputWrapper(firstCurrentInput);
-      if (extracted) return extracted;
+    return null;
+  };
+
+  const resolveFlashbackCurrentTurn = (messages = [], options = {}) => {
+    const normalized = normalizedMessagesFrom(messages);
+    const liveMessages = Array.isArray(options.liveMessages) ? options.liveMessages : [];
+    const terminalPrefillIndex = findFlashbackTerminalAssistantPrefillIndex(normalized);
+    const range = latestFlashbackCurrentInputRange(normalized);
+    if (range?.text) {
+      const live = findFlashbackLiveUserMatch(liveMessages, range.text);
+      return {
+        text: range.text,
+        requestIndex: range.start,
+        requestEndIndex: range.end,
+        liveUserPosition: Number(live?.position || 0),
+        source: live ? 'wrapper_live_match' : 'explicit_wrapper',
+        confidence: live ? 'authoritative_live_match' : 'explicit_wrapper',
+        tag: range.tag || '',
+        terminalPrefillIndex,
+        message: normalized[range.start] || null,
+        liveMessage: live?.message || null
+      };
     }
-    return compact(sanitizeSourceText(explicit?.contentText || lastUser?.contentText || ''), 6000);
+
+    for (let i = normalized.length - 1; i >= 0; i -= 1) {
+      const message = normalized[i];
+      if (isOwnInjection(message.contentText || '')) continue;
+      const rawRole = rawMessageRole(message);
+      const isDirectUser = rawRole === 'user';
+      const isSystemAsUser = !isDirectUser && isSystemMessageActingAsUser(message);
+      if (!isDirectUser && !isSystemAsUser) continue;
+      if (!hasFlashbackChatProvenance(message)) continue;
+      const rawBody = compact(sanitizeSourceText(message.contentText || ''), 6000);
+      if (!rawBody) continue;
+      const body = isSystemAsUser ? stripPromptHeaderFromSystemAsUser(rawBody) : rawBody;
+      if (!body) continue;
+      const live = findFlashbackLiveUserMatch(liveMessages, body);
+      return {
+        text: body,
+        requestIndex: i,
+        requestEndIndex: i,
+        liveUserPosition: Number(live?.position || 0),
+        source: live ? (isSystemAsUser ? 'provenance_system_as_user_live_match' : 'provenance_live_match') : (isSystemAsUser ? 'request_provenance_system_as_user' : 'request_provenance_user'),
+        confidence: live ? 'authoritative_live_match' : (isSystemAsUser ? 'request_provenance_system_as_user' : 'request_provenance'),
+        tag: '',
+        terminalPrefillIndex,
+        message,
+        liveMessage: live?.message || null
+      };
+    }
+
+    const latestLiveUser = liveMessages.slice().reverse().find(message => message?.role === 'user' && canonicalChatUserText(message.contentText || message.content || '')) || null;
+    if (latestLiveUser) {
+      const liveText = canonicalChatUserText(latestLiveUser.contentText || latestLiveUser.content || '');
+      for (let i = normalized.length - 1; i >= 0; i -= 1) {
+        const message = normalized[i];
+        if (isOwnInjection(message.contentText || '')) continue;
+        const rawRole = rawMessageRole(message);
+        const isDirectUser = rawRole === 'user';
+        const isSystemAsUser = !isDirectUser && isSystemMessageActingAsUser(message);
+        if (!isDirectUser && !isSystemAsUser) continue;
+        if (!sameTurnText(message.contentText || '', liveText)) continue;
+        return {
+          text: liveText,
+          requestIndex: i,
+          requestEndIndex: i,
+          liveUserPosition: Number(latestLiveUser.index || 0) + 1,
+          source: isSystemAsUser ? 'request_live_chat_text_match_system_as_user' : 'request_live_chat_text_match',
+          confidence: 'authoritative_live_match',
+          tag: '',
+          terminalPrefillIndex,
+          message,
+          liveMessage: latestLiveUser
+        };
+      }
+    }
+
+    const legacyLimit = terminalPrefillIndex >= 0 ? terminalPrefillIndex - 1 : normalized.length - 1;
+    const legacy = [];
+    for (let i = legacyLimit; i >= 0; i -= 1) {
+      const message = normalized[i];
+      const rawRole = rawMessageRole(message);
+      const isDirectUser = rawRole === 'user';
+      const isSystemAsUser = !isDirectUser && isSystemMessageActingAsUser(message);
+      if (!isDirectUser && !isSystemAsUser) continue;
+      const rawBody = compact(sanitizeSourceText(message.contentText || ''), 6000);
+      if (!rawBody || isOwnInjection(rawBody) || isLikelyMetaUserMessage(rawBody)) continue;
+      const body = isSystemAsUser ? stripPromptHeaderFromSystemAsUser(rawBody) : rawBody;
+      if (!body || isLikelyMetaUserMessage(body)) continue;
+      legacy.push({ index: i, message, body, isSystemAsUser });
+      if (legacy.length >= 2) break;
+    }
+    if (legacy.length === 1) {
+      return {
+        text: legacy[0].body,
+        requestIndex: legacy[0].index,
+        requestEndIndex: legacy[0].index,
+        liveUserPosition: 0,
+        source: legacy[0].isSystemAsUser ? 'unique_legacy_system_as_user' : 'unique_legacy_user',
+        confidence: legacy[0].isSystemAsUser ? 'legacy_system_as_user' : 'legacy_unique',
+        tag: '',
+        terminalPrefillIndex,
+        message: legacy[0].message,
+        liveMessage: null
+      };
+    }
+
+    if (latestLiveUser) {
+      return {
+        text: canonicalChatUserText(latestLiveUser.contentText || latestLiveUser.content || ''),
+        requestIndex: -1,
+        requestEndIndex: -1,
+        liveUserPosition: Number(latestLiveUser.index || 0) + 1,
+        source: 'authoritative_chat_fallback',
+        confidence: 'authoritative_chat_fallback',
+        tag: '',
+        terminalPrefillIndex,
+        message: null,
+        liveMessage: latestLiveUser
+      };
+    }
+
+    return {
+      text: '',
+      requestIndex: -1,
+      requestEndIndex: -1,
+      liveUserPosition: 0,
+      source: 'none',
+      confidence: 'none',
+      tag: '',
+      terminalPrefillIndex,
+      message: null,
+      liveMessage: null
+    };
+  };
+
+  const extractLatestUserInput = messages => resolveFlashbackCurrentTurn(messages).text || '';
+
+  FlashbackRuntimeContract.currentTurn = {
+    protocol: 'libra-suite-current-turn-v1',
+    resolver: 'provenance_aware_v1',
+    resolve: (messages = [], options = {}) => cloneInteropValue(resolveFlashbackCurrentTurn(messages, options), {})
   };
 
   const buildRecallQuery = (latestUser, messages, settings = Runtime.settings || DEFAULTS) => {
@@ -8519,18 +8786,16 @@
     return digestHash(hash);
   };
 
-  const findCurrentInputInsertionIndex = (messages = []) => {
-    for (let i = 0; i < messages.length; i += 1) {
-      const body = contentToText(messages[i]?.content ?? '').trim();
-      if (/<Current Input\b/i.test(body) || /^\s*<Current Input>\s*$/i.test(body)) return i;
-    }
-    return -1;
+  const findCurrentInputInsertionIndex = (messages = [], options = {}) => {
+    const resolved = resolveFlashbackCurrentTurn(messages, options);
+    return Number(resolved?.requestIndex ?? -1);
   };
 
-  const findLastUserInsertionIndex = (messages = []) => {
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (text(messages[i]?.role).toLowerCase() === 'user') return i;
-    }
+  const findLastUserInsertionIndex = (messages = [], options = {}) => {
+    const resolved = resolveFlashbackCurrentTurn(messages, options);
+    if (Number(resolved?.requestIndex) >= 0) return Number(resolved.requestIndex);
+    const terminalPrefillIndex = Number(resolved?.terminalPrefillIndex ?? findFlashbackTerminalAssistantPrefillIndex(messages));
+    if (terminalPrefillIndex >= 0) return terminalPrefillIndex;
     return -1;
   };
 
@@ -8560,7 +8825,7 @@
     };
   };
 
-  const injectMessage = (messages, block, position) => {
+  const injectMessage = (messages, block, position, options = {}) => {
     if (!block || !Array.isArray(messages)) return messages;
     const next = messages.map(msg => {
       const copy = { ...msg };
@@ -8573,40 +8838,41 @@
       return copy;
     }).filter(Boolean);
     const injection = { role: 'system', name: PLUGIN_SLUG, content: block };
-    if (position === 'before_current_input') {
-      const idx = findCurrentInputInsertionIndex(next);
-      if (idx >= 0) next.splice(idx, 0, injection);
-      else {
-        const userIdx = findLastUserInsertionIndex(next);
-        if (userIdx >= 0) next.splice(userIdx, 0, injection);
-        else next.unshift(injection);
-      }
-      return next;
-    }
-    if (position === 'before_last_user') {
-      const idx = findLastUserInsertionIndex(next);
-      if (idx >= 0) next.splice(idx, 0, injection);
+    const resolved = resolveFlashbackCurrentTurn(next, { liveMessages: options.liveMessages || [] });
+    const terminalPrefillIndex = Number(resolved?.terminalPrefillIndex ?? findFlashbackTerminalAssistantPrefillIndex(next));
+    const resolvedIndex = Number(resolved?.requestIndex ?? -1);
+    const strongResolution = /(?:wrapper|provenance|live_match|chat_fallback)/i.test(
+      `${resolved?.source || ''} ${resolved?.confidence || ''}`
+    );
+    const safeResolvedIndex = resolvedIndex >= 0
+      ? (!strongResolution && terminalPrefillIndex >= 0 && resolvedIndex > terminalPrefillIndex ? terminalPrefillIndex : resolvedIndex)
+      : -1;
+
+    if (position === 'before_current_input' || position === 'before_last_user') {
+      if (safeResolvedIndex >= 0) next.splice(safeResolvedIndex, 0, injection);
+      else if (terminalPrefillIndex >= 0) next.splice(terminalPrefillIndex, 0, injection);
       else next.unshift(injection);
       return next;
     }
     if (position === 'last_system') {
       let idx = -1;
       for (let i = 0; i < next.length; i += 1) {
-        const role = text(next[i]?.role).toLowerCase();
+        const role = rawMessageRole(next[i]);
         if (role === 'system' || role === 'developer') idx = i;
       }
       if (idx >= 0) next.splice(idx + 1, 0, injection);
+      else if (terminalPrefillIndex >= 0) next.splice(terminalPrefillIndex, 0, injection);
       else next.unshift(injection);
       return next;
     }
-    next.unshift(injection);
+    if (safeResolvedIndex >= 0) next.splice(safeResolvedIndex, 0, injection);
+    else if (terminalPrefillIndex >= 0) next.splice(terminalPrefillIndex, 0, injection);
+    else next.unshift(injection);
     return next;
   };
 
   const capturePendingTurnForMessages = async (messages, requestClass = {}, settings = Runtime.settings || DEFAULTS, options = {}) => {
     const normalizedMessages = normalizeMessages(messages);
-    const latestUser = extractLatestUserInput(normalizedMessages);
-    if (!latestUser) return { queued: false, reason: 'no_user_input', normalizedMessages };
     let scope = options.scope?.scopeKey ? options.scope : null;
     let liveChat = options.liveChat || null;
     if (!scope || !liveChat) {
@@ -8619,9 +8885,13 @@
       }
     }
     if (!scope?.scopeKey && Runtime.currentScope?.scopeKey) scope = Runtime.currentScope;
-    if (!scope?.scopeKey) return { queued: false, reason: 'no_scope', latestUser, normalizedMessages };
-    const retrievalQuery = buildRecallQuery(latestUser, normalizedMessages, settings);
     const liveMessages = Array.isArray(liveChat?.normalized) ? liveChat.normalized : [];
+    const currentUserResolution = resolveFlashbackCurrentTurn(normalizedMessages, { liveMessages });
+    const latestUser = currentUserResolution.text || '';
+    if (!latestUser) return { queued: false, reason: 'no_user_input', normalizedMessages, currentUserResolution, scope, liveChat };
+    if (!scope?.scopeKey) return { queued: false, reason: 'no_scope', latestUser, normalizedMessages, currentUserResolution, scope, liveChat };
+
+    const retrievalQuery = buildRecallQuery(latestUser, normalizedMessages, settings);
     const liveState = liveChatStateFromNormalized(liveMessages);
     const lastLive = liveMessages[liveMessages.length - 1] || null;
     const lastPair = Array.isArray(liveState.pairs) ? liveState.pairs[liveState.pairs.length - 1] : null;
@@ -8633,7 +8903,7 @@
       : expectedAssistantTurnIndex(scope, liveMessages, latestUser);
     const userMessagePosition = continuesExistingAssistant
       ? Number(lastPair.userPosition || 0)
-      : latestUserPositionInLiveMessages(liveMessages, latestUser);
+      : (Number(currentUserResolution.liveUserPosition || 0) || latestUserPositionInLiveMessages(liveMessages, latestUser));
     const expectedPairIndex = continuesExistingAssistant
       ? Number(lastPair.pairIndex || liveState.pairCount || 1)
       : Number(liveState.pairCount || 0) + 1;
@@ -8641,6 +8911,11 @@
       latestUser,
       retrievalQuery,
       messageHash: messageHash(normalizedMessages),
+      userTextHash: stableHash(canonicalChatUserText(latestUser)),
+      requestUserIndex: Number(currentUserResolution.requestIndex ?? -1),
+      resolutionSource: currentUserResolution.source || 'none',
+      resolutionConfidence: currentUserResolution.confidence || 'none',
+      terminalPrefillIndex: Number(currentUserResolution.terminalPrefillIndex ?? -1),
       scope,
       requestType: requestClass.normalizedType || requestClass.requestType || 'model',
       requestMessageCount: Math.max(Number(scope.chatMessageCount || 0) || 0, Number(liveState.count || 0) || 0),
@@ -8652,7 +8927,16 @@
       baselineAssistantText: continuesExistingAssistant ? canonicalChatResponseText(lastPair.assistantText || '') : '',
       at: Date.now()
     });
-    return { queued: !!pending, pending, latestUser, retrievalQuery, normalizedMessages, scope, liveChat };
+    return {
+      queued: !!pending,
+      pending,
+      latestUser,
+      retrievalQuery,
+      normalizedMessages,
+      currentUserResolution,
+      scope,
+      liveChat
+    };
   };
 
   const stopFinalizedCaptureMonitor = (pendingId = '') => {
@@ -8689,13 +8973,29 @@
       candidate = assistants.find(item => item.position >= minPosition) || null;
     }
     if (!candidate) return null;
-    const pair = liveState.pairByAssistantPosition instanceof Map
+    let pair = liveState.pairByAssistantPosition instanceof Map
       ? liveState.pairByAssistantPosition.get(candidate.position)
       : null;
-    if (pair?.userText && pending.latestUser && !sameTurnText(pair.userText, pending.latestUser)) return null;
+    let resolverMismatch = !!(pair?.userText && pending.latestUser && !sameTurnText(pair.userText, pending.latestUser));
+    if (resolverMismatch) {
+      const requestCount = Math.max(0, Number(pending.requestMessageCount || 0) || 0);
+      const newlyFinalized = assistants.filter(item => item.position > requestCount);
+      if (newlyFinalized.length !== 1) return null;
+      candidate = newlyFinalized[0];
+      pair = liveState.pairByAssistantPosition instanceof Map
+        ? liveState.pairByAssistantPosition.get(candidate.position)
+        : null;
+      if (!pair?.userText) return null;
+      resolverMismatch = !!(pending.latestUser && !sameTurnText(pair.userText, pending.latestUser));
+    }
     const finalizedPairText = canonicalChatResponseText(pair?.assistantText || candidate.body);
     if (baselinePosition === candidate.position && baselineText && sameTurnText(finalizedPairText, baselineText)) return null;
-    return candidate;
+    return {
+      ...candidate,
+      authoritativePair: pair || null,
+      resolverMismatch,
+      authoritativeUserText: pair?.userText || ''
+    };
   };
 
   const captureSnapshotMatchesScope = (scope = {}, snapshot = {}) => {
@@ -8728,17 +9028,19 @@
       if (!scope?.scopeKey || !captureSnapshotMatchesScope(scope, snapshot)) return false;
       const live = liveChatReadState(snapshot.chat || {});
       const liveState = liveChatStateFromNormalized(live.normalized || []);
-      const pair = liveState.pairByAssistantPosition instanceof Map
+      const pair = candidate?.authoritativePair || (liveState.pairByAssistantPosition instanceof Map
         ? liveState.pairByAssistantPosition.get(candidate.position)
-        : null;
+        : null);
       const pairIndex = Number(pair?.pairIndex || pending.pairIndex || 0) || inferPairIndexFromAssistantPosition(candidate.position);
       const assistantPosition = Number(pair?.assistantPosition || candidate.position || 0) || candidate.position;
       const assistantRaw = pair?.assistantText || candidate.raw || candidate.body || '';
       const assistant = sanitizeAssistantForMemory(assistantRaw).trim();
       if (assistant.length < settings.minCaptureChars) return false;
       const userMessagePosition = Number(pair?.userPosition || pending.userMessagePosition || 0) || Math.max(0, candidate.position - 1);
-      const latestUser = pair?.userText && sameTurnText(pair.userText, pending.latestUser || '') ? pair.userText : pending.latestUser;
+      const latestUser = pair?.userText || candidate?.authoritativeUserText || pending.latestUser;
       if (!canonicalChatUserText(latestUser || '')) return false;
+      const resolverMismatch = candidate?.resolverMismatch === true
+        || !!(pair?.userText && pending.latestUser && !sameTurnText(pair.userText, pending.latestUser));
       const turnHash = stableHash(`${scope.scopeKey}\n${pairIndex}\n${latestUser}\n---assistant---\n${assistant}`);
       const source = {
         sourceType: 'response',
@@ -8757,13 +9059,21 @@
           candidate.message?.sourceMessageIds || [],
           `assistant:${stableHash(assistant)}`
         ], 16),
-        metadata: extractMemoryMetadata(assistantRaw),
+        metadata: {
+          ...extractMemoryMetadata(assistantRaw),
+          currentTurnResolution: {
+            source: pending.resolutionSource || '',
+            confidence: pending.resolutionConfidence || '',
+            requestUserIndex: Number(pending.requestUserIndex ?? -1),
+            resolverMismatch
+          }
+        },
         text: [`User:\n${latestUser}`, `Assistant:\n${assistant}`].join('\n\n---\n\n')
       };
       const result = await ingestSources([source], settings, scope, { replaceTurnPair: true });
       removePendingTurnById(pendingId);
       upsertChatMonitorAssistant(scope, assistantPosition, assistant, { pairIndex, userPosition: userMessagePosition, userText: latestUser });
-      Runtime.lastCapture = { at: Date.now(), scopeKey: scope.scopeKey, turnHash, assistantChars: assistant.length, finalized: true, ...result };
+      Runtime.lastCapture = { at: Date.now(), scopeKey: scope.scopeKey, turnHash, assistantChars: assistant.length, finalized: true, resolverMismatch, ...result };
       opLog('finalized_capture_saved', { hook: 'liveChatMonitor', pending, scopeKey: scope.scopeKey, turnHash, assistantChars: assistant.length, result });
       log('captured finalized chat response', Runtime.lastCapture);
       return true;
@@ -9033,7 +9343,10 @@
       }
       log('injecting recall block', Runtime.lastRecall);
       opLog('before_inject', { hook: 'beforeRequest', type, pending: pendingCapture.pending, scopeKey: scope.scopeKey, blockChars: block.length, injectionPosition: settings.injectionPosition });
-      return injectMessage(messages, block, settings.injectionPosition);
+      return injectMessage(messages, block, settings.injectionPosition, {
+        liveMessages: liveChat.normalized || [],
+        currentUserResolution: pendingCapture.currentUserResolution
+      });
     } catch (error) {
       prunePendingTurns('before_failed');
       opLog('before_error', { hook: 'beforeRequest', type, requestClass, error: formatErrorMessage(error, 900) }, 'error');
@@ -11629,7 +11942,7 @@
     exportDebugLogFile,
     exportOperationLogs: flushOperationLogs,
     clearOperationLogs,
-    _test: { hashEmbedding, splitTextIntoChunks, lexicalOverlap, extractLatestUserInput, isLikelyMetaUserMessage, stripSourceArtifacts, formatRecallBlock, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, applyFlashbackInteropProfile, resolveFlashbackInteropState, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, classifyRequestType, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { hashEmbedding, splitTextIntoChunks, lexicalOverlap, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, isSystemMessageActingAsUser, stripPromptHeaderFromSystemAsUser, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, applyFlashbackInteropProfile, resolveFlashbackInteropState, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, classifyRequestType, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
