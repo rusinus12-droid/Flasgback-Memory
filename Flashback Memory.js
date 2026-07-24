@@ -1,7 +1,7 @@
 //@name flashback_memory
 //@display-name ⚡ FLASHBACK Memory
 //@api 3.0
-//@version 0.9.3
+//@version 0.9.4
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
 //@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
@@ -69,7 +69,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.3
+ * ⚡ FLASHBACK Memory v0.9.4
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
