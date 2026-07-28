@@ -1,7 +1,7 @@
 //@name flashback_memory
 //@display-name ⚡ FLASHBACK Memory
 //@api 3.0
-//@version 0.9.11
+//@version 0.9.12
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
 //@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
@@ -68,7 +68,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.11
+ * ⚡ FLASHBACK Memory v0.9.12
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -308,7 +308,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.9.11';
+  const PLUGIN_VERSION = '0.9.12';
   const INJECTION_HEADER = '[FLASHBACK EVIDENCE]';
   const INJECTION_FOOTER = '[/FLASHBACK EVIDENCE]';
   const VECTOR_BLOCK_RE = /(?:\[VECTOR RAG MEMORY\][\s\S]*?\[\/VECTOR RAG MEMORY\]|\[FLASHBACK EVIDENCE\][\s\S]*?\[\/FLASHBACK EVIDENCE\])/gi;
@@ -3828,6 +3828,7 @@
     stats: { byType: {} },
     responseTurnMax: 0,
     responseTurnCount: 0,
+    permanentSessionHistoryCount: 0,
     copiedFromScopeKey: '',
     copiedFromChatId: '',
     copiedFromChatTitle: '',
@@ -3883,6 +3884,7 @@
       nextId: clampInt(parsed.nextId, 1, 1000000000, 1),
       responseTurnMax: clampInt(parsed.responseTurnMax, 0, 10000000, 0),
       responseTurnCount: clampInt(parsed.responseTurnCount, 0, 10000000, 0),
+      permanentSessionHistoryCount: clampInt(parsed.permanentSessionHistoryCount, 0, 10000000, 0),
       externalRetirementVersion: clampInt(parsed.externalRetirementVersion, 0, 1000, 0),
       externalRetiredAt: text(parsed.externalRetiredAt || ''),
       externalRetiredRecords: clampInt(parsed.externalRetiredRecords, 0, 10000000, 0),
@@ -3987,22 +3989,55 @@
     && (record?.autoEpisode === true || String(record?.origin || '').startsWith('episode_index'));
   const isRetainedMemoryRecord = (record = {}) => !isLegacyExternalRecordMarker(record)
     && (isResponseMemoryRecord(record) || isResponseDerivedIndexRecord(record));
+  const PERMANENT_SESSION_HISTORY_PROTECTION = 'permanent_session_history';
+  const isPermanentSessionHistoryRecord = (record = {}) => {
+    const protection = text(record?.historicalProtection || '').trim();
+    return record?.permanentSessionHistory === true
+      || record?.inheritedSessionHistory === true
+      || protection === PERMANENT_SESSION_HISTORY_PROTECTION
+      || Boolean(text(record?.inheritedFromScopeKey || record?.clonedFromScopeKey || '').trim());
+  };
   const isInheritedScopeMemoryRecord = (record = {}, scopeOrKey = '') => {
-    const inheritedFromScopeKey = text(record?.clonedFromScopeKey || '').trim();
+    if (isPermanentSessionHistoryRecord(record)) return true;
+    const inheritedFromScopeKey = text(record?.inheritedFromScopeKey || record?.clonedFromScopeKey || '').trim();
     if (!inheritedFromScopeKey) return false;
     const currentScopeKey = text(typeof scopeOrKey === 'string' ? scopeOrKey : scopeOrKey?.scopeKey || '').trim();
     return !currentScopeKey || inheritedFromScopeKey !== currentScopeKey;
   };
-  const normalizeInheritedScopeRecordForActiveHistory = (record = {}) => ({
-    ...record,
-    inheritedSessionHistory: true,
-    turnNodeId: '',
-    logicalTurnId: '',
-    variantId: '',
-    parentTurnNodeId: '',
-    lifecycleStatus: 'active',
-    retiredAt: ''
-  });
+  const normalizeInheritedScopeRecordForActiveHistory = (record = {}) => {
+    const inheritedFromScopeKey = text(
+      record?.inheritedFromScopeKey
+      || record?.clonedFromScopeKey
+      || ''
+    ).trim();
+    const inheritedViaScopeKey = text(record?.inheritedViaScopeKey || record?.clonedFromScopeKey || '').trim();
+    const permanentHistoryId = text(record?.permanentHistoryId || '').trim() || stableHash([
+      PERMANENT_SESSION_HISTORY_PROTECTION,
+      inheritedFromScopeKey,
+      text(record?.hash || record?.id || record?.sourceHash || record?.sourceId || ''),
+      Number(record?.turnIndex || 0) || 0,
+      Number(record?.chunkIndex || 0) || 0,
+      text(record?.text || '').slice(0, 800)
+    ].join('\n'));
+    return {
+      ...record,
+      inheritedSessionHistory: true,
+      permanentSessionHistory: true,
+      historicalProtection: PERMANENT_SESSION_HISTORY_PROTECTION,
+      permanentHistoryId,
+      inheritedFromScopeKey,
+      inheritedViaScopeKey,
+      orphanExempt: true,
+      retentionProtected: true,
+      deletionProtected: true,
+      turnNodeId: '',
+      logicalTurnId: '',
+      variantId: '',
+      parentTurnNodeId: '',
+      lifecycleStatus: 'active',
+      retiredAt: ''
+    };
+  };
 
   const emptyTurnWorldline = (scopeKey = '') => ({
     version: TURN_WORLDLINE_VERSION,
@@ -4539,11 +4574,16 @@
     const retentionLimit = Number.isFinite(requestedRetentionLimit) && requestedRetentionLimit >= 1
       ? clampInt(requestedRetentionLimit, 1, 50000, DEFAULTS.maxResponseItems)
       : DEFAULTS.maxResponseItems;
-    if (responseRecords.length > retentionLimit) {
-      responseRecords = responseRecords
+    const protectedResponseRecords = responseRecords.filter(isPermanentSessionHistoryRecord);
+    let ordinaryResponseRecords = responseRecords.filter(record => !isPermanentSessionHistoryRecord(record));
+    if (ordinaryResponseRecords.length > retentionLimit) {
+      ordinaryResponseRecords = ordinaryResponseRecords
         .sort((a, b) => text(a.createdAt).localeCompare(text(b.createdAt)))
-        .slice(Math.max(0, responseRecords.length - retentionLimit));
+        .slice(Math.max(0, ordinaryResponseRecords.length - retentionLimit));
     }
+    // Session-handoff history is a permanent archive. The live-response cap is
+    // intentionally applied only to this session's ordinary response records.
+    responseRecords = [...protectedResponseRecords, ...ordinaryResponseRecords];
     clean = [...derivedRecords, ...responseRecords]
       .map(record => ({
         ...record,
@@ -4598,6 +4638,7 @@
       stats,
       responseTurnMax: responseTurnStats.max,
       responseTurnCount: responseTurnStats.count,
+      permanentSessionHistoryCount: clean.filter(isPermanentSessionHistoryRecord).length,
       chatMessageCount: scope.chatMessageCount || oldManifest.chatMessageCount || 0,
       chatFingerprint: scope.chatFingerprint || oldManifest.chatFingerprint || '',
       chatTailHash: scope.chatTailHash || oldManifest.chatTailHash || '',
@@ -4719,6 +4760,20 @@
     return await withScopeWriteLock(scopeKey, async () => {
       const manifest = await loadScopeManifest(scopeKey);
       assertNoForeignScopeCollision(manifest, 'scope deletion');
+      const loaded = await loadScopeRecords(scopeKey);
+      assertCompleteScopeLoad(loaded, 'scope deletion protection check');
+      const protectedRecords = loaded.records.filter(isPermanentSessionHistoryRecord);
+      if (protectedRecords.length) {
+        return {
+          at: Date.now(),
+          deleted: false,
+          protected: true,
+          reason: 'permanent_session_history_protected',
+          scopeKey,
+          protectedRecords: protectedRecords.length,
+          removedRecords: 0
+        };
+      }
       const settings = await loadSettings();
       // Commit an empty scope before physical deletion. If any later removal
       // fails, readers see a valid empty manifest instead of a manifest that
@@ -4741,7 +4796,7 @@
       clearRuntimeScopeState(scopeKey);
       Runtime.guiScopeReadyByKey.delete(scopeKey);
       invalidateGuiDataCache('all');
-      return Runtime.lastStorageAction;
+      return { ...Runtime.lastStorageAction, deleted: true, protected: false };
     });
   };
 
@@ -4991,6 +5046,8 @@
               ...record,
               scopeKey: toScope.scopeKey,
               clonedFromScopeKey: fromScopeMeta.scopeKey,
+              inheritedFromScopeKey: record.inheritedFromScopeKey || record.clonedFromScopeKey || fromScopeMeta.scopeKey,
+              inheritedViaScopeKey: fromScopeMeta.scopeKey,
               clonedAt,
               updatedAt: clonedAt
             }));
@@ -5032,6 +5089,7 @@
         chatFingerprint: text(toScope.chatFingerprint || sourceManifest.chatFingerprint || ''),
         chatTailHash: text(toScope.chatTailHash || sourceManifest.chatTailHash || ''),
         count: copiedRecords,
+        permanentSessionHistoryCount: copiedRecords,
         shardCount: sourceShardCount,
         shardSize: sourceManifest.shardSize || DEFAULTS.shardSize,
         shardIndexVersion: 1,
@@ -5143,16 +5201,27 @@
   const clearRecords = async (scopeOverride = null) => {
     const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false));
     const settings = await loadSettings();
+    let protectedRecords = [];
     await withScopeWriteLock(scope.scopeKey, async () => {
       const manifest = await loadScopeManifest(scope.scopeKey);
       assertNoForeignScopeCollision(manifest, 'scope clear');
+      const loaded = await loadScopeRecords(scope.scopeKey);
+      assertCompleteScopeLoad(loaded, 'scope clear protection check');
+      protectedRecords = loaded.records.filter(isPermanentSessionHistoryRecord);
       // Reset lineage first, then atomically swap the manifest to an empty
-      // commit. Old shards become unreachable before best-effort cleanup.
+      // commit. Permanent predecessor history remains outside the new live
+      // worldline and cannot be cleared.
       await saveTurnWorldline(scope.scopeKey, emptyTurnWorldline(scope.scopeKey));
-      await saveScopeRecords(scope, [], settings, scope);
+      await saveScopeRecords(scope, protectedRecords, settings, scope);
     });
     Runtime.lastRecall = null;
-    Runtime.lastImport = { at: Date.now(), imported: 0, cleared: true, scopeKey: scope.scopeKey };
+    Runtime.lastImport = {
+      at: Date.now(),
+      imported: 0,
+      cleared: true,
+      scopeKey: scope.scopeKey,
+      protectedRecords: protectedRecords.length
+    };
   };
 
   const splitTextIntoChunks = (value, maxChars = DEFAULTS.chunkChars, overlap = DEFAULTS.chunkOverlap) => {
@@ -12446,6 +12515,9 @@ ${cleanedText}`, 80),
       dim: Number(record.dim || (Array.isArray(record.vector) ? record.vector.length : 0)) || 0,
       provider: compact(record.provider || '', 40),
       model: compact(record.model || '', 80),
+      permanentSessionHistory: isPermanentSessionHistoryRecord(record),
+      deletionProtected: isPermanentSessionHistoryRecord(record),
+      permanentHistoryId: compact(record.permanentHistoryId || '', 96),
       tokens: Number(record.tokenEstimate || 0) || estimateTokens(body),
       chars: body.length,
       preview: compact(body, 420)
@@ -12578,10 +12650,16 @@ ${cleanedText}`, 80),
       let removedRecords = 0;
       let removedResponseRecords = 0;
       let removedEpisodeIndexes = 0;
+      let protectedSkipped = 0;
       for (const record of loaded.records) {
         const isEpisode = record.autoEpisode || record.sourceType === 'episode_index';
         const selected = normalizedRecordSourceType(record) === 'response' && keySet.has(manualRecordDeleteKey(record));
         if (selected) {
+          if (isPermanentSessionHistoryRecord(record)) {
+            protectedSkipped += 1;
+            keptBase.push(record);
+            continue;
+          }
           removedRecords += 1;
           if (normalizedRecordSourceType(record) === 'response') removedResponseRecords += 1;
           if (isEpisode) removedEpisodeIndexes += 1;
@@ -12590,12 +12668,12 @@ ${cleanedText}`, 80),
         if (isEpisode) episodeRecords.push(record);
         else keptBase.push(record);
       }
-      if (!removedRecords) return { removedRecords: 0, removedResponseRecords: 0, removedEpisodeIndexes, total: loaded.records.length, manifest: loaded.manifest };
+      if (!removedRecords) return { removedRecords: 0, removedResponseRecords: 0, removedEpisodeIndexes, protectedSkipped, total: loaded.records.length, manifest: loaded.manifest };
       const removeStaleEpisodes = removedResponseRecords > 0;
       if (removeStaleEpisodes) removedEpisodeIndexes += episodeRecords.length;
       const kept = removeStaleEpisodes ? keptBase : [...keptBase, ...episodeRecords];
       const saved = await saveScopeRecords(scope, kept, settings, scope);
-      return { removedRecords, removedResponseRecords, removedEpisodeIndexes, total: saved.records.length, manifest: saved.manifest };
+      return { removedRecords, removedResponseRecords, removedEpisodeIndexes, protectedSkipped, total: saved.records.length, manifest: saved.manifest };
     });
     if (result.removedRecords > 0) {
       if (result.removedResponseRecords > 0) await maybeRebuildEpisodeIndex(scope, settings, null, { force: true, reason: 'manual_editor_delete' });
@@ -12607,6 +12685,7 @@ ${cleanedText}`, 80),
         removedRecords: result.removedRecords,
         removedResponseRecords: result.removedResponseRecords,
         removedEpisodeIndexes: result.removedEpisodeIndexes,
+        protectedSkipped: result.protectedSkipped || 0,
         total: result.total
       };
       Runtime.guiManualEditor.pendingDeleteKeys = [];
@@ -14485,7 +14564,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, cloneScopeStorage, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
