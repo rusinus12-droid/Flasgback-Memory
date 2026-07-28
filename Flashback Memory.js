@@ -1,7 +1,7 @@
 //@name flashback_memory
 //@display-name ⚡ FLASHBACK Memory
 //@api 3.0
-//@version 0.9.12
+//@version 0.9.13
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
 //@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
@@ -68,7 +68,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.12
+ * ⚡ FLASHBACK Memory v0.9.13
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -308,7 +308,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.9.12';
+  const PLUGIN_VERSION = '0.9.13';
   const INJECTION_HEADER = '[FLASHBACK EVIDENCE]';
   const INJECTION_FOOTER = '[/FLASHBACK EVIDENCE]';
   const VECTOR_BLOCK_RE = /(?:\[VECTOR RAG MEMORY\][\s\S]*?\[\/VECTOR RAG MEMORY\]|\[FLASHBACK EVIDENCE\][\s\S]*?\[\/FLASHBACK EVIDENCE\])/gi;
@@ -353,8 +353,11 @@
   const HOOK_RECALL_TIMEOUT_POLICY_VERSION = 1;
   const SETTINGS_POLICY_VERSION = 4;
   const TURN_WORLDLINE_VERSION = 'flashback_turn_worldline_v1';
-  const TURN_WORLDLINE_MAX_NODES = 256;
-  const TURN_WORLDLINE_MAX_RETIRED_RECORDS = 192;
+  // Keep at least the default 1,200-response retention horizon plus reroll
+  // variants. A smaller cap can sever the still-visible prefix during a long
+  // rollback (for example T300 -> T10) and make exact branch restore impossible.
+  const TURN_WORLDLINE_MAX_NODES = 2048;
+  const TURN_WORLDLINE_MAX_RETIRED_RECORDS = 2048;
 
   const PROVIDER_CHOICES = Object.freeze([
     'hash',
@@ -4019,6 +4022,20 @@
       Number(record?.chunkIndex || 0) || 0,
       text(record?.text || '').slice(0, 800)
     ].join('\n'));
+    const historicalEpochAt = text(
+      record?.historicalEpochAt
+      || record?.inheritedAt
+      || record?.clonedAt
+      || record?.createdAt
+      || record?.updatedAt
+      || nowIso()
+    ).trim();
+    const historicalTurnIndex = Math.max(0, Number(
+      record?.historicalTurnIndex
+      || record?.turnIndex
+      || record?.pairIndex
+      || 0
+    ) || 0);
     return {
       ...record,
       inheritedSessionHistory: true,
@@ -4027,6 +4044,8 @@
       permanentHistoryId,
       inheritedFromScopeKey,
       inheritedViaScopeKey,
+      historicalEpochAt,
+      historicalTurnIndex,
       orphanExempt: true,
       retentionProtected: true,
       deletionProtected: true,
@@ -4177,7 +4196,7 @@
       const type = record.sourceType === 'chat_turn' ? 'response' : text(record.sourceType || 'unknown');
       sourceTypes.add(type);
       const turn = finiteTurnIndex(record);
-      if (type === 'response' && turn > 0) {
+      if (type === 'response' && turn > 0 && !isInheritedScopeMemoryRecord(record)) {
         responseTurnMin = responseTurnMin ? Math.min(responseTurnMin, turn) : turn;
         responseTurnMax = Math.max(responseTurnMax, turn);
       }
@@ -4616,7 +4635,7 @@
     const responseTurnStats = clean.reduce((acc, record) => {
       const type = record.sourceType === 'chat_turn' ? 'response' : record.sourceType;
       const turn = finiteTurnIndex(record);
-      if (type === 'response' && turn > 0) {
+      if (type === 'response' && turn > 0 && !isInheritedScopeMemoryRecord(record, scope.scopeKey)) {
         responseTurnKeys.add(responseTurnGroupKey(record));
         acc.max = Math.max(acc.max, turn);
       }
@@ -5068,13 +5087,6 @@
         await removeCommitShardSet(toScope.scopeKey, targetCommitId, sourceShardCount).catch(cleanupError => warn('empty clone shard cleanup failed', cleanupError));
         return { ok: false, skipped: true, reason: 'source_empty' };
       }
-      const copiedResponseGroups = new Set();
-      let copiedResponseTurnMax = 0;
-      for (const record of copiedRecordList) {
-        if (!isResponseMemoryRecord(record)) continue;
-        copiedResponseGroups.add(responseTurnGroupKey(record));
-        copiedResponseTurnMax = Math.max(copiedResponseTurnMax, finiteTurnIndex(record));
-      }
       const manifest = {
         ...sourceManifest,
         scopeKey: toScope.scopeKey,
@@ -5096,8 +5108,8 @@
         shardSummaries: clonedShardSummaries,
         commitId: targetCommitId,
         stats: statsForRecords(copiedRecordList),
-        responseTurnMax: copiedResponseTurnMax,
-        responseTurnCount: copiedResponseGroups.size,
+        responseTurnMax: 0,
+        responseTurnCount: 0,
         episodeSourceDigest: sourceManifest.episodeSourceDigest || '',
         episodeIndexedAt: sourceManifest.episodeIndexedAt || '',
         episodeCount: Number(sourceManifest.episodeCount || 0) || 0,
@@ -6740,10 +6752,9 @@
   };
 
   const responseRecordSort = (a, b) => {
-    const at = finiteTurnIndex(a);
-    const bt = finiteTurnIndex(b);
-    if (at || bt) return at - bt || text(a.createdAt).localeCompare(text(b.createdAt)) || text(a.id).localeCompare(text(b.id));
-    return text(a.createdAt).localeCompare(text(b.createdAt)) || text(a.id).localeCompare(text(b.id));
+    return storyOrderValue(a) - storyOrderValue(b)
+      || text(a.createdAt).localeCompare(text(b.createdAt))
+      || text(a.id).localeCompare(text(b.id));
   };
 
   const recordVectorSpace = (record = {}, settings = Runtime.settings || DEFAULTS) => {
@@ -6779,6 +6790,7 @@
 
   const responseRecordsForEpisodeIndex = (records = [], settings = Runtime.settings || DEFAULTS) => buildStoredTurnVectorGroups(records
     .filter(record => (record.sourceType === 'chat_turn' ? 'response' : record.sourceType) === 'response')
+    .filter(record => !isInheritedScopeMemoryRecord(record))
     .filter(record => Array.isArray(record.vector) && record.vector.length && sanitizeAssistantForMemory(record.text, { stripRolePrefix: false }) && !isOwnInjection(record.text)))
     .map(group => {
       const first = group.records[0] || {};
@@ -6995,19 +7007,20 @@
     assertCompleteScopeLoad(current, 'episode index rebuild');
     const digest = episodeSourceDigestForRecords(current.records, cfg);
     const existingEpisodes = current.records.filter(record => record.autoEpisode || record.sourceType === 'episode_index');
+    const liveExistingEpisodes = existingEpisodes.filter(record => !isInheritedScopeMemoryRecord(record, scope.scopeKey));
     if (digest && current.manifest.episodeSourceDigest === digest && options.force !== true) {
       Runtime.lastEpisodeIndex = { at: Date.now(), scopeKey: scope.scopeKey, rebuilt: false, reason: 'unchanged', episodes: existingEpisodes.length, digest };
       return Runtime.lastEpisodeIndex;
     }
-    if (!digest && !existingEpisodes.length) {
-      Runtime.lastEpisodeIndex = { at: Date.now(), scopeKey: scope.scopeKey, rebuilt: false, reason: 'no_responses', episodes: 0, digest: '' };
+    if (!digest) {
+      Runtime.lastEpisodeIndex = { at: Date.now(), scopeKey: scope.scopeKey, rebuilt: false, reason: 'no_responses', episodes: existingEpisodes.length, digest: '' };
       return Runtime.lastEpisodeIndex;
     }
-    if (options.force !== true && existingEpisodes.length) {
-      const latestIndexedTurn = existingEpisodes
+    if (options.force !== true && liveExistingEpisodes.length) {
+      const latestIndexedTurn = liveExistingEpisodes
         .filter(record => (record.episodeLevel || 'scene') === 'scene')
         .reduce((max, record) => Math.max(max, Number(record?.turnRange?.end || 0) || 0), 0);
-      const latestResponseTurn = latestResponseTurnIndex(current.records);
+      const latestResponseTurn = latestLiveResponseTurnIndex(current.records);
       if (latestIndexedTurn > 0 && latestResponseTurn > latestIndexedTurn && latestResponseTurn - latestIndexedTurn < EPISODE_REBUILD_MIN_NEW_TURNS) {
         Runtime.lastEpisodeIndex = { at: Date.now(), scopeKey: scope.scopeKey, rebuilt: false, reason: 'batched_incremental_wait', episodes: existingEpisodes.length, pendingTurns: latestResponseTurn - latestIndexedTurn, digest };
         return Runtime.lastEpisodeIndex;
@@ -7020,17 +7033,22 @@
       const latest = await loadScopeRecords(scope.scopeKey);
       assertCompleteScopeLoad(latest, 'episode index commit');
       const latestBase = latest.records.filter(record => !(record.autoEpisode || record.sourceType === 'episode_index'));
+      const latestInheritedEpisodes = latest.records.filter(record => (
+        (record.autoEpisode || record.sourceType === 'episode_index')
+        && isInheritedScopeMemoryRecord(record, scope.scopeKey)
+      ));
       const latestDigest = episodeSourceDigestForRecords(latestBase, cfg);
       const finalEpisodes = latestDigest === digest ? episodes : buildEpisodeIndexRecords(latestBase, cfg, scope);
-      const savedInner = await saveScopeRecords(scope, [...latestBase, ...finalEpisodes], cfg, scope);
+      const allEpisodes = [...latestInheritedEpisodes, ...finalEpisodes];
+      const savedInner = await saveScopeRecords(scope, [...latestBase, ...allEpisodes], cfg, scope);
       const manifestInner = await saveScopeManifest({
         ...savedInner.manifest,
         episodeSourceDigest: latestDigest || digest,
         episodeIndexedAt: indexedAt,
-        episodeCount: finalEpisodes.length,
-        episodeChildCount: finalEpisodes.reduce((sum, record) => sum + Number(record.childCount || 0), 0)
+        episodeCount: allEpisodes.length,
+        episodeChildCount: allEpisodes.reduce((sum, record) => sum + Number(record.childCount || 0), 0)
       }, scope);
-      return { latestDigest, finalEpisodes, manifest: manifestInner };
+      return { latestDigest, finalEpisodes: allEpisodes, manifest: manifestInner };
     });
     const { latestDigest, finalEpisodes, manifest } = result;
     Runtime.lastEpisodeIndex = { at: Date.now(), scopeKey: scope.scopeKey, rebuilt: true, episodes: finalEpisodes.length, episodeChildCount: manifest.episodeChildCount, digest: manifest.episodeSourceDigest };
@@ -8312,7 +8330,9 @@
   const recencySignal = (record, settings) => {
     const group = sourceGroup(record.sourceType);
     if (group !== 'response') return 0;
-    const t = parseTimeMs(record.updatedAt || record.createdAt);
+    const t = parseTimeMs(isInheritedScopeMemoryRecord(record)
+      ? (record.historicalEpochAt || record.clonedAt || record.createdAt || record.updatedAt)
+      : (record.updatedAt || record.createdAt));
     if (!t) return 0;
     const ageDays = Math.max(0, (Date.now() - t) / 86400000);
     const halfLife = Math.max(1, Number(settings.recencyHalfLifeDays || DEFAULTS.recencyHalfLifeDays));
@@ -8381,7 +8401,7 @@
     const current = Number(options.currentPairIndex || 0) || 0;
     if (current === 1) return 0;
     if (current > 1) return current - 1;
-    return latestResponseTurnIndex(records);
+    return latestLiveResponseTurnIndex(records);
   };
 
   const requestContainsPreviousTurn = (messages = [], previousAssistantText = '') => {
@@ -8460,6 +8480,7 @@
   const computeStoryRecency = (record, records = [], settings = Runtime.settings || DEFAULTS, knownLatestTurn = 0) => {
     const group = sourceGroup(record?.sourceType);
     if (group !== 'response') return recencySignal(record, settings);
+    if (isInheritedScopeMemoryRecord(record)) return recencySignal(record, settings);
     const turn = finiteTurnIndex(record);
     if (!turn) return recencySignal(record, settings);
     const providedLatest = Number(knownLatestTurn || 0) || 0;
@@ -8473,12 +8494,25 @@
 
   const storyOrderValue = (record) => {
     const turn = finiteTurnIndex(record);
-    if (turn) return turn * 1000000000000 + (Number(record.chunkIndex || 0) || 0);
-    return parseTimeMs(record?.updatedAt || record?.createdAt) || 0;
+    const inherited = isInheritedScopeMemoryRecord(record);
+    const epoch = parseTimeMs(inherited
+      ? (record?.historicalEpochAt || record?.clonedAt || record?.createdAt || record?.updatedAt)
+      : (record?.createdAt || record?.updatedAt));
+    if (epoch) {
+      return epoch * 2048
+        + Math.min(2047, Math.max(0, turn))
+        + (Math.min(999, Math.max(0, Number(record?.chunkIndex || 0) || 0)) / 1000);
+    }
+    if (turn) return turn * 2048 + (Number(record.chunkIndex || 0) || 0);
+    return 0;
   };
 
   const latestResponseTurnIndex = (records = []) => {
     const turns = responseTurnIndexes(records);
+    return turns.length ? Math.max(...turns) : 0;
+  };
+  const latestLiveResponseTurnIndex = (records = []) => {
+    const turns = responseTurnIndexes(records.filter(record => !isInheritedScopeMemoryRecord(record)));
     return turns.length ? Math.max(...turns) : 0;
   };
 
@@ -8503,7 +8537,8 @@
     const out = new Map();
     records
       .filter(record => (record.sourceType === 'chat_turn' ? 'response' : record.sourceType) === 'response')
-      .sort((a, b) => finiteTurnIndex(b) - finiteTurnIndex(a) || (parseTimeMs(b.updatedAt || b.createdAt) || 0) - (parseTimeMs(a.updatedAt || a.createdAt) || 0))
+      .sort((a, b) => storyOrderValue(b) - storyOrderValue(a)
+        || text(b.id || b.hash).localeCompare(text(a.id || a.hash)))
       .forEach((record, index) => out.set(record.id || record.hash, index + 1));
     return out;
   };
@@ -9330,7 +9365,7 @@
       excludedFromInjection: excludedPreviousTurnNumber > 0
     };
     if (!records.length) return { records: [], currentStateFacts, total: 0, storedTotal: manifest.count || 0, loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, privacyFiltered, stageElapsed };
-    const latestResponseTurn = Math.max(latestResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
+    const latestResponseTurn = Math.max(latestLiveResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
     const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber };
     const candidateLimit = Math.max(effectiveTopK, Math.min(records.length, Math.ceil(Number(cfg.candidateLimit || DEFAULTS.candidateLimit) * topKMultiplier)));
     const sparseStageStartedAt = Date.now();
@@ -14564,7 +14599,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, cloneScopeStorage, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, cloneScopeStorage, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
