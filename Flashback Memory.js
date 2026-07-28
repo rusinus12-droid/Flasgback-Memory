@@ -1,5 +1,5 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory
+//@display-name ⚡ FLASHBACK Memory v0.9.13
 //@api 3.0
 //@version 0.9.13
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
