@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.9.13
+//@display-name ⚡ FLASHBACK Memory v0.9.14
 //@api 3.0
-//@version 0.9.13
+//@version 0.9.14
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
 //@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
@@ -68,7 +68,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.13
+ * ⚡ FLASHBACK Memory v0.9.14
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -308,7 +308,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.9.13';
+  const PLUGIN_VERSION = '0.9.14';
   const INJECTION_HEADER = '[FLASHBACK EVIDENCE]';
   const INJECTION_FOOTER = '[/FLASHBACK EVIDENCE]';
   const VECTOR_BLOCK_RE = /(?:\[VECTOR RAG MEMORY\][\s\S]*?\[\/VECTOR RAG MEMORY\]|\[FLASHBACK EVIDENCE\][\s\S]*?\[\/FLASHBACK EVIDENCE\])/gi;
@@ -7293,7 +7293,13 @@
   ]));
   const isStrongPresentStateLookupQuery = query => /(?:현재|지금|방금|최신|今|現在|さっき|最新|latest|current|now|right now)/i.test(text(query));
   const isExplicitStateHistoryComparisonQuery = query => /(?:(?:현재|지금|current|now|現在)[\s\S]{0,80}(?:과거|예전|이전|처음|최초|past|previous|before|昔|以前)[\s\S]{0,80}(?:둘\s*다|모두|각각|함께|비교|변천|이력|both|compare|history|timeline)|(?:과거|예전|이전|처음|최초|past|previous|before|昔|以前)[\s\S]{0,80}(?:현재|지금|current|now|現在)[\s\S]{0,80}(?:둘\s*다|모두|각각|함께|비교|변천|이력|both|compare|history|timeline))/i.test(text(query));
-  const isPastStateLookupQuery = query => /(?:과거|예전|이전|전에|지난|당시|처음|최초|원래|변경\s*전|정정\s*전|바뀌기\s*전|옮기기\s*전|했었던|했던|있었|있던|있었는지|있었음|過去|昔|以前|最初|元々|前に|当時|あった|いた|past|previous|before|first|originally|formerly|used to|where was|where were)/i.test(text(query))
+  const isExplicitFirstHistoryLookupQuery = query => {
+    const body = text(query || '').normalize('NFKC').toLowerCase();
+    if (!/(?:처음|최초|最初|\bfirst\b)/i.test(body)) return false;
+    return /(?:기억|회상|떠올|무슨\s*일|어땠|만났을\s*때|remember|recall|what\s+happened|when|where|who|how|history|timeline|back\s+then)/i.test(body);
+  };
+  const isPastStateLookupQuery = query => /(?:과거|예전|이전|전에|지난|당시|원래|변경\s*전|정정\s*전|바뀌기\s*전|옮기기\s*전|했었던|했던|있었|있던|있었는지|있었음|過去|昔|以前|元々|前に|当時|あった|いた|past|previous|before|originally|formerly|used to|where was|where were)/i.test(text(query))
+    || isExplicitFirstHistoryLookupQuery(query)
     || (!isStrongPresentStateLookupQuery(query) && /(?:기록|내역|이력|변천|변화|히스토리|記録|履歴|変遷|変化|経緯|ヒストリー|history|timeline|record|log)/i.test(text(query)));
   const isPresentStateLookupQuery = query => /(?:현재|지금|방금|최신|위치|장소|어디|상태|있어|있나|있니|있음|今|現在|さっき|最新|位置|場所|どこ|何処|状態|様子|いる|ある|latest|current|now|right now|where|location|place|status|state)/i.test(text(query));
 
@@ -8187,11 +8193,20 @@
     return clampNumber(score, 0, 1, 0);
   };
 
+  const isExplicitRelationLookupQuery = query => {
+    const body = text(query || '').normalize('NFKC').toLowerCase();
+    if (/(?:사이|관계|어떻게 생각|느낌이 어때|관련|친해|좋아해|싫어해|믿어|relationship|relation|feel about|think about)/i.test(body)) return true;
+    if (!/\bbetween\b/i.test(body)) return false;
+    if (/\b(?:balance|difference|distinction|choice|trade-?off|gap|distance|space|time)\s+between\b/i.test(body)) return false;
+    return /\bbetween\s+[a-z][a-z0-9_-]{1,31}\s+and\s+[a-z][a-z0-9_-]{1,31}\b/i.test(body)
+      || /(?:bond|dynamic|tension|trust|friendship|romance|feelings?).{0,32}\bbetween\b|\bbetween\b.{0,32}(?:bond|dynamic|tension|trust|friendship|romance|feelings?)/i.test(body);
+  };
+
   const classifyRecallQuery = (query, anchors = extractRecallAnchors(query)) => {
     const norm = anchors.normalized || normalizeForLexical(query);
     if (anchors.continuation) return QUERY_TYPES.CONTINUATION;
     if (/(?:지금|현재|요즘|지금은|현재는).{0,24}(?:어디|뭐|무엇|어때|있어|하고|상태|위치|기분)|(?:where|current|currently|now).{0,24}(?:is|are|doing|state|location)/i.test(norm)) return QUERY_TYPES.STATE;
-    if (/(?:사이|관계|어떻게 생각|느낌이 어때|관련|친해|좋아해|싫어해|믿어|relationship|relation|between|feel about|think about)/i.test(norm)) return QUERY_TYPES.RELATION;
+    if (isExplicitRelationLookupQuery(norm)) return QUERY_TYPES.RELATION;
     if (/(?:기분|감정|마음|느낌|슬프|기쁘|화가|불안|무서|행복|emotion|feeling|mood|sad|happy|angry|anxious|afraid)/i.test(norm)) return QUERY_TYPES.EMOTION;
     if (/(?:그때|아까|전에|예전에|이전에|무슨 일|일어났|했었|됐었|사건|장면|기억|when|before|previously|happened|event|scene|remember)/i.test(norm)) return QUERY_TYPES.EVENT;
     return QUERY_TYPES.FACT;
@@ -11218,8 +11233,12 @@
     if (!pendingId || Runtime.finalizedCaptureInFlight.has(pendingId)) return false;
     Runtime.finalizedCaptureInFlight.add(pendingId);
     try {
-      const scope = pending.scope?.scopeKey ? pending.scope : resolveScopeFromSnapshot(snapshot);
-      if (!scope?.scopeKey || !captureSnapshotMatchesScope(scope, snapshot)) return false;
+      const pendingScope = pending.scope?.scopeKey ? pending.scope : resolveScopeFromSnapshot(snapshot);
+      if (!pendingScope?.scopeKey || !captureSnapshotMatchesScope(pendingScope, snapshot)) return false;
+      const snapshotScope = resolveScopeFromSnapshot(snapshot);
+      const scope = snapshotScope?.scopeKey === pendingScope.scopeKey
+        ? { ...pendingScope, ...snapshotScope, scopeKey: pendingScope.scopeKey }
+        : pendingScope;
       const live = liveChatReadState(snapshot.chat || {});
       const liveState = liveChatStateFromNormalized(live.normalized || []);
       const pair = candidate?.authoritativePair || (liveState.pairByAssistantPosition instanceof Map
@@ -11582,6 +11601,7 @@
         latestUser: compact(latestUser, 600),
         retrievalQuery: retrievalQuery === latestUser ? '' : compact(retrievalQuery, 900),
         totalRecords: recall.total,
+        storedRecords: Number(recall.storedTotal ?? recall.total ?? 0) || 0,
         candidates: recall.candidates || 0,
         gateRejected: recall.gateRejected || 0,
         scoreRejected: recall.scoreRejected || 0,
@@ -12950,16 +12970,25 @@ ${cleanedText}`, 80),
     const selected = Array.isArray(recall.selected) ? recall.selected : [];
     const arms = recall.candidateArms || {};
     const laneSelected = recall.laneDiagnostics?.selected || {};
+    const alignment = recall.recallAlignment && typeof recall.recallAlignment === 'object'
+      ? recall.recallAlignment
+      : Runtime.recallAlignment;
+    const alignmentLabel = alignment?.peerDataUsed === true
+      ? 'peer+visible-u+a'
+      : (alignment?.independent === true
+        ? 'independent-visible-u+a'
+        : text(alignment?.profile || '').trim());
     const meta = [
       recall.queryType ? `type=${recall.queryType}` : '',
       recall.temporalIntent ? `time=${recall.temporalIntent}` : '',
       recall.truthIntent && recall.truthIntent !== TRUTH_INTENTS.NORMAL ? `truth=${recall.truthIntent}` : '',
       `selected=${selected.length}`,
+      `stored=${formatNumber(recall.storedRecords ?? recall.totalRecords ?? 0)}`,
       `candidates=${formatNumber(recall.candidates || 0)}`,
       arms.dense != null ? `arms d${formatNumber(arms.dense || 0)}/s${formatNumber(arms.sparse || 0)}/e${formatNumber(arms.exact || 0)}/f${formatNumber(arms.forced || 0)}` : '',
       recall.rrfUnionCount ? `rrf=${formatNumber(recall.rrfUnionCount)}` : '',
       recall.laneDiagnostics ? `lane ${formatNumber(laneSelected.short || 0)}/${formatNumber(laneSelected.medium || 0)}/${formatNumber(laneSelected.long || 0)}` : '',
-      'align=independent-visible-u+a',
+      alignmentLabel ? `align=${alignmentLabel}` : '',
       recall.inactiveBranchFiltered ? `branch-${formatNumber(recall.inactiveBranchFiltered)}` : '',
       recall.privacyFiltered ? `privacy-${formatNumber(recall.privacyFiltered)}` : '',
       recall.sparseCache ? `cache ${formatNumber(recall.sparseCache.hits || 0)}/${formatNumber(recall.sparseCache.misses || 0)}` : '',
