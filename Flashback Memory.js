@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.9.14
+//@display-name ⚡ FLASHBACK Memory v0.9.17
 //@api 3.0
-//@version 0.9.14
+//@version 0.9.17
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
 //@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
@@ -68,7 +68,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.14
+ * ⚡ FLASHBACK Memory v0.9.17
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -87,8 +87,9 @@
  *   discarded-artifact count may remain for maintenance diagnostics.
  * - Flashback does not read peer runtime state, IPC channels, prompt budgets, canon
  *   snapshots, or retrieval results. It always operates as a standalone memory engine.
- * - PluginStorage is isolated per chat scope. When a copied chat is detected, the
- *   old chat scope can be adopted into the new chat scope.
+ * - PluginStorage is isolated per chat scope. A native copied chat receives a
+ *   fresh live branch, while only a validated Memory Bridge handoff turns the
+ *   predecessor scope into permanent session history.
  */
 
 (async () => {
@@ -308,7 +309,8 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.9.14';
+  const PLUGIN_VERSION = '0.9.17';
+  const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const INJECTION_HEADER = '[FLASHBACK EVIDENCE]';
   const INJECTION_FOOTER = '[/FLASHBACK EVIDENCE]';
   const VECTOR_BLOCK_RE = /(?:\[VECTOR RAG MEMORY\][\s\S]*?\[\/VECTOR RAG MEMORY\]|\[FLASHBACK EVIDENCE\][\s\S]*?\[\/FLASHBACK EVIDENCE\])/gi;
@@ -1043,9 +1045,13 @@
 
   const sanitizeOperationLogData = (data = {}) => {
     const out = {};
-    const copyText = ['hook', 'type', 'requestType', 'normalizedType', 'reason', 'oldScopeKey', 'newScopeKey', 'injectionPosition', 'turnHash', 'error'];
-    const copyNumber = ['seq', 'timeoutMs', 'messageCount', 'blockChars', 'chars', 'minCaptureChars', 'assistantChars'];
-    const copyBool = ['pendingQueued', 'cancelled'];
+    const copyText = ['hook', 'type', 'requestType', 'normalizedType', 'reason', 'oldScopeKey', 'newScopeKey', 'injectionPosition', 'turnHash', 'error', 'mode', 'version'];
+    const copyNumber = [
+      'seq', 'timeoutMs', 'messageCount', 'blockChars', 'chars', 'minCaptureChars', 'assistantChars',
+      'pairIndex', 'turnIndex', 'stored', 'storedRecords', 'totalRecords', 'candidates', 'selected',
+      'chunks', 'inserted', 'updated', 'deduped', 'attempts'
+    ];
+    const copyBool = ['pendingQueued', 'cancelled', 'operationLogEnabled', 'captureAfterRequest', 'injected'];
     for (const key of copyText) if (data[key] != null && data[key] !== '') out[key] = compact(data[key], key === 'error' ? 700 : 180);
     for (const key of copyNumber) if (data[key] != null) out[key] = Number(data[key] || 0) || 0;
     for (const key of copyBool) if (data[key] != null) out[key] = !!data[key];
@@ -3651,6 +3657,38 @@
     return { ...personas[0], __source: 'personas[0]' };
   };
 
+  const memorySessionBridgeMarker = (chat = {}, currentChatId = '') => {
+    const marker = chat?.memorySessionBridge && typeof chat.memorySessionBridge === 'object'
+      ? chat.memorySessionBridge
+      : null;
+    if (!marker) return { present: false, valid: false, reason: 'bridge_marker_absent', marker: null };
+    if (marker.schema !== MEMORY_SESSION_BRIDGE_SCHEMA) {
+      return { present: true, valid: false, reason: 'bridge_schema_invalid', marker };
+    }
+    if (marker.includeFlashback !== true) {
+      return { present: true, valid: false, reason: 'bridge_flashback_not_included', marker };
+    }
+    const sourceChatId = text(marker.sourceChatId || '').trim();
+    const targetChatId = text(marker.targetChatId || '').trim();
+    const transferId = text(marker.transferId || '').trim();
+    const activeChatId = text(currentChatId || chat?.id || '').trim();
+    if (!sourceChatId || !targetChatId || !transferId) {
+      return { present: true, valid: false, reason: 'bridge_identity_incomplete', marker };
+    }
+    if (!activeChatId || targetChatId !== activeChatId || sourceChatId === activeChatId) {
+      return { present: true, valid: false, reason: 'bridge_target_mismatch', marker };
+    }
+    return {
+      present: true,
+      valid: true,
+      reason: 'bridge_marker_valid',
+      marker,
+      sourceChatId,
+      targetChatId,
+      transferId
+    };
+  };
+
   const resolveScopeFromSnapshot = (snapshot) => {
     const character = snapshot.character || {};
     const chat = snapshot.chat || {};
@@ -3678,11 +3716,17 @@
     const chatTailHash = tail ? stableHash(tail) : (messageCount ? chatFingerprint : stableHash(chatTitle));
     const chatId = chatStableId || `chatHash:${chatFingerprint}`;
     const scopeKey = `char:${keyHash(characterId)}|chat:${keyHash(chatId)}|persona:${keyHash(personaId)}`;
-    const copiedFromChatId = firstFilled(chat.copiedFromChatId, chat.copyFromChatId, chat.sourceChatId, chat.originChatId, chat.parentChatId, chat.clonedFromChatId, chat.importedFromChatId);
-    const copiedFromScopeKey = firstFilled(chat.copiedFromScopeKey, chat.copyFromScopeKey, chat.sourceScopeKey, chat.originScopeKey);
-    const copiedFromScopeId = firstFilled(chat.copiedFromScopeId, chat.copyFromScopeId, chat.sourceScopeId, chat.originScopeId, chat.parentScopeId, chat.clonedFromScopeId, chat.importedFromScopeId);
-    const copySourceChatId = firstFilled(chat.copySourceChatId, chat.originalChatId, chat.original_chat_id, chat.rootChatId, chat.parent?.chatId, chat.meta?.sourceChatId, chat.metadata?.sourceChatId);
-    const copySourceScopeId = firstFilled(chat.copySourceScopeId, chat.originalScopeId, chat.original_scope_id, chat.rootScopeId, chat.parent?.scopeId, chat.meta?.sourceScopeId, chat.metadata?.sourceScopeId);
+    const bridgeMarkerState = memorySessionBridgeMarker(chat, chatId);
+    // Native RisuAI copies clone arbitrary chat properties. If a bridge-created
+    // chat is copied later, its marker points at the old target and every
+    // copiedFrom* field is stale. Ignore those explicit fields so the ordinary
+    // copy can be located from its transcript instead of becoming a new handoff.
+    const ignoreStaleBridgeMetadata = bridgeMarkerState.present && !bridgeMarkerState.valid;
+    const copiedFromChatId = ignoreStaleBridgeMetadata ? '' : firstFilled(chat.copiedFromChatId, chat.copyFromChatId, chat.sourceChatId, chat.originChatId, chat.parentChatId, chat.clonedFromChatId, chat.importedFromChatId);
+    const copiedFromScopeKey = ignoreStaleBridgeMetadata ? '' : firstFilled(chat.copiedFromScopeKey, chat.copyFromScopeKey, chat.sourceScopeKey, chat.originScopeKey);
+    const copiedFromScopeId = ignoreStaleBridgeMetadata ? '' : firstFilled(chat.copiedFromScopeId, chat.copyFromScopeId, chat.sourceScopeId, chat.originScopeId, chat.parentScopeId, chat.clonedFromScopeId, chat.importedFromScopeId);
+    const copySourceChatId = ignoreStaleBridgeMetadata ? '' : firstFilled(chat.copySourceChatId, chat.originalChatId, chat.original_chat_id, chat.rootChatId, chat.parent?.chatId, chat.meta?.sourceChatId, chat.metadata?.sourceChatId);
+    const copySourceScopeId = ignoreStaleBridgeMetadata ? '' : firstFilled(chat.copySourceScopeId, chat.originalScopeId, chat.original_scope_id, chat.rootScopeId, chat.parent?.scopeId, chat.meta?.sourceScopeId, chat.metadata?.sourceScopeId);
     return {
       scopeKey,
       storageHash: keyHash(scopeKey),
@@ -3700,10 +3744,17 @@
       copiedFromChatId,
       copiedFromScopeKey,
       copiedFromScopeId,
-      sourceChatId: copiedFromChatId || copySourceChatId,
+      sourceChatId: bridgeMarkerState.valid
+        ? bridgeMarkerState.sourceChatId
+        : (copiedFromChatId || copySourceChatId),
       sourceScopeId: copiedFromScopeKey || copiedFromScopeId || copySourceScopeId,
       copySourceChatId,
       copySourceScopeId,
+      bridgeHandoffValid: bridgeMarkerState.valid === true,
+      bridgeHandoffSourceChatId: bridgeMarkerState.valid ? bridgeMarkerState.sourceChatId : '',
+      bridgeHandoffTargetChatId: bridgeMarkerState.valid ? bridgeMarkerState.targetChatId : '',
+      bridgeHandoffTransferId: bridgeMarkerState.valid ? bridgeMarkerState.transferId : '',
+      bridgeHandoffValidationReason: bridgeMarkerState.reason,
       seenAt: Date.now()
     };
   };
@@ -3838,6 +3889,8 @@
     copiedAt: '',
     copyAdoptedCompleteAt: '',
     copyAdoptedComplete: false,
+    copyAdoptionMode: '',
+    copyClassificationRepairedAt: '',
     legacyMigratedAt: '',
     externalRetirementVersion: 0,
     externalRetiredAt: '',
@@ -4667,6 +4720,8 @@
       copiedAt: oldManifest.copiedAt || '',
       copyAdoptedCompleteAt: oldManifest.copyAdoptedCompleteAt || '',
       copyAdoptedComplete: oldManifest.copyAdoptedComplete || false,
+      copyAdoptionMode: oldManifest.copyAdoptionMode || '',
+      copyClassificationRepairedAt: oldManifest.copyClassificationRepairedAt || '',
       legacyMigratedAt: oldManifest.legacyMigratedAt || '',
       externalRetirementVersion: oldManifest.externalRetirementVersion || 0,
       externalRetiredAt: oldManifest.externalRetiredAt || '',
@@ -5032,11 +5087,54 @@
     return weighted[0] ? { source: weighted[0].source, reason: weighted[0].reason, weight: weighted[0].weight } : null;
   };
 
+  const liveRecordForNativeChatCopy = (record, fromScopeKey, toScopeKey, clonedAt) => ({
+      ...record,
+      scopeKey: toScopeKey,
+      copiedFromLiveScopeKey: fromScopeKey,
+      copyAdoptionMode: 'chat_copy_live',
+      clonedFromScopeKey: '',
+      inheritedFromScopeKey: '',
+      inheritedViaScopeKey: '',
+      inheritedSessionHistory: false,
+      permanentSessionHistory: false,
+      historicalProtection: '',
+      permanentHistoryId: '',
+      historicalEpochAt: '',
+      historicalTurnIndex: 0,
+      orphanExempt: false,
+      retentionProtected: false,
+      deletionProtected: false,
+      turnNodeId: '',
+      logicalTurnId: '',
+      variantId: '',
+      parentTurnNodeId: '',
+      lifecycleStatus: 'active',
+      retiredAt: '',
+      clonedAt,
+      updatedAt: clonedAt
+    });
+  const cloneRecordForNativeChatCopy = (record, fromScopeKey, toScopeKey, clonedAt) => {
+    if (isPermanentSessionHistoryRecord(record)) {
+      return normalizeInheritedScopeRecordForActiveHistory({
+        ...record,
+        scopeKey: toScopeKey,
+        clonedFromScopeKey: fromScopeKey,
+        inheritedFromScopeKey: record.inheritedFromScopeKey || record.clonedFromScopeKey || fromScopeKey,
+        inheritedViaScopeKey: fromScopeKey,
+        clonedAt,
+        updatedAt: clonedAt
+      });
+    }
+    return liveRecordForNativeChatCopy(record, fromScopeKey, toScopeKey, clonedAt);
+  };
+
   const cloneScopeStorage = async (fromScopeMeta, toScope, settings, cloneMeta = {}) => {
     const sourceManifest = await loadScopeManifest(fromScopeMeta);
     const sourceShardCount = Math.max(0, Number(sourceManifest.shardCount || 0) || 0);
     if (!sourceManifest.scopeKey || sourceShardCount <= 0) return { ok: false, skipped: true, reason: 'source_empty' };
     const clonedAt = nowIso();
+    const cloneMode = cloneMeta.mode === 'session_handoff' ? 'session_handoff' : 'chat_copy_live';
+    const sessionHandoff = cloneMode === 'session_handoff';
     const targetCommitId = stableHash(`${toScope.scopeKey}|clone|${fromScopeMeta.scopeKey}|${Date.now()}|${Math.random()}`);
     const result = await withScopeWriteLock(toScope.scopeKey, async () => {
       const targetManifest = await loadScopeManifest(toScope);
@@ -5061,15 +5159,17 @@
           const records = (Array.isArray(shard?.records) ? shard.records : [])
             .filter(record => record && typeof record === 'object')
             .filter(isRetainedMemoryRecord)
-            .map(record => normalizeInheritedScopeRecordForActiveHistory({
-              ...record,
-              scopeKey: toScope.scopeKey,
-              clonedFromScopeKey: fromScopeMeta.scopeKey,
-              inheritedFromScopeKey: record.inheritedFromScopeKey || record.clonedFromScopeKey || fromScopeMeta.scopeKey,
-              inheritedViaScopeKey: fromScopeMeta.scopeKey,
-              clonedAt,
-              updatedAt: clonedAt
-            }));
+            .map(record => sessionHandoff
+              ? normalizeInheritedScopeRecordForActiveHistory({
+                ...record,
+                scopeKey: toScope.scopeKey,
+                clonedFromScopeKey: fromScopeMeta.scopeKey,
+                inheritedFromScopeKey: record.inheritedFromScopeKey || record.clonedFromScopeKey || fromScopeMeta.scopeKey,
+                inheritedViaScopeKey: fromScopeMeta.scopeKey,
+                clonedAt,
+                updatedAt: clonedAt
+              })
+              : cloneRecordForNativeChatCopy(record, fromScopeMeta.scopeKey, toScope.scopeKey, clonedAt));
           copiedRecords += records.length;
           copiedRecordList.push(...records);
           clonedShardSummaries.push(buildRecallShardSummary(records, i, settings));
@@ -5101,15 +5201,15 @@
         chatFingerprint: text(toScope.chatFingerprint || sourceManifest.chatFingerprint || ''),
         chatTailHash: text(toScope.chatTailHash || sourceManifest.chatTailHash || ''),
         count: copiedRecords,
-        permanentSessionHistoryCount: copiedRecords,
+        permanentSessionHistoryCount: copiedRecordList.filter(isPermanentSessionHistoryRecord).length,
         shardCount: sourceShardCount,
         shardSize: sourceManifest.shardSize || DEFAULTS.shardSize,
         shardIndexVersion: 1,
         shardSummaries: clonedShardSummaries,
         commitId: targetCommitId,
         stats: statsForRecords(copiedRecordList),
-        responseTurnMax: 0,
-        responseTurnCount: 0,
+        responseTurnMax: sessionHandoff ? 0 : Math.max(0, Number(sourceManifest.responseTurnMax || 0) || 0),
+        responseTurnCount: sessionHandoff ? 0 : Math.max(0, Number(sourceManifest.responseTurnCount || 0) || 0),
         episodeSourceDigest: sourceManifest.episodeSourceDigest || '',
         episodeIndexedAt: sourceManifest.episodeIndexedAt || '',
         episodeCount: Number(sourceManifest.episodeCount || 0) || 0,
@@ -5124,22 +5224,86 @@
         copiedAt: clonedAt,
         copyAdoptedCompleteAt: clonedAt,
         copyAdoptedComplete: true,
+        copyAdoptionMode: cloneMode,
         turnWorldlineLiveHash: '',
         turnWorldlineRevision: 0
       };
       await saveScopeManifest(manifest, toScope);
-      // Only active memory records cross a session boundary. The predecessor
-      // chat's reroll/rollback topology is scoped to that chat and must never
-      // become the new chat's worldline.
+      // Both handoffs and native copies receive a fresh scope-local worldline.
+      // A handoff keeps predecessor records as permanent history; a native copy
+      // keeps the copied chat's records live and lets the visible transcript
+      // rebuild their target-scope lineage on the next synchronization.
       await saveTurnWorldline(toScope.scopeKey, emptyTurnWorldline(toScope.scopeKey));
       await cleanupListedScopeShardOrphans(toScope.scopeKey, targetCommitId).catch(error => warn('listed shard cleanup failed', error));
       return { ok: true, skipped: false, records: copiedRecords };
     });
     if (result.ok) {
-      Runtime.lastClone = { at: Date.now(), fromScopeKey: fromScopeMeta.scopeKey, toScopeKey: toScope.scopeKey, records: result.records || 0, reason: cloneMeta.reason || '', weight: cloneMeta.weight || 0, directStorageClone: true };
-      return { ok: true, skipped: false, records: result.records || 0, reason: cloneMeta.reason || '', weight: cloneMeta.weight || 0, directStorageClone: true };
+      Runtime.lastClone = { at: Date.now(), fromScopeKey: fromScopeMeta.scopeKey, toScopeKey: toScope.scopeKey, records: result.records || 0, reason: cloneMeta.reason || '', mode: cloneMode, weight: cloneMeta.weight || 0, directStorageClone: true };
+      return { ok: true, skipped: false, records: result.records || 0, reason: cloneMeta.reason || '', mode: cloneMode, weight: cloneMeta.weight || 0, directStorageClone: true };
     }
     return result;
+  };
+
+  const repairMisclassifiedNativeCopyScope = async (scope, manifest, settings) => {
+    if (scope?.bridgeHandoffValid === true
+      || manifest?.copyAdoptedComplete !== true
+      || manifest?.copyAdoptionMode === 'chat_copy_live'
+      || manifest?.copyAdoptionMode === 'session_handoff') {
+      return { changed: false, reason: 'copy_repair_not_required', manifest };
+    }
+    const sourceScopeKey = text(manifest?.copiedFromScopeKey || '').trim();
+    if (!sourceScopeKey || sourceScopeKey === scope.scopeKey) {
+      return { changed: false, reason: 'copy_source_unavailable', manifest };
+    }
+    const [targetLoaded, sourceLoaded] = await Promise.all([
+      loadScopeRecords(scope.scopeKey),
+      loadScopeRecords(sourceScopeKey).catch(() => ({ records: [] }))
+    ]);
+    assertCompleteScopeLoad(targetLoaded, 'native copy classification repair');
+    const sourceById = new Map((sourceLoaded.records || [])
+      .filter(record => record?.id)
+      .map(record => [text(record.id), record]));
+    const repairedAt = nowIso();
+    let convertedRecords = 0;
+    const records = (targetLoaded.records || []).map(record => {
+      const clonedFromScopeKey = text(record?.clonedFromScopeKey || '').trim();
+      if (clonedFromScopeKey !== sourceScopeKey || !isPermanentSessionHistoryRecord(record)) return record;
+      const sourceRecord = sourceById.get(text(record?.id || '')) || null;
+      const wasAlreadyHistorical = sourceRecord
+        ? isPermanentSessionHistoryRecord(sourceRecord)
+        : Boolean(
+          text(record?.inheritedFromScopeKey || '').trim()
+          && text(record?.inheritedFromScopeKey || '').trim() !== clonedFromScopeKey
+        );
+      if (wasAlreadyHistorical) return record;
+      convertedRecords += 1;
+      return liveRecordForNativeChatCopy(record, sourceScopeKey, scope.scopeKey, repairedAt);
+    });
+    if (!convertedRecords) {
+      const updatedManifest = {
+        ...manifest,
+        copyAdoptionMode: 'chat_copy_live',
+        copyClassificationRepairedAt: repairedAt
+      };
+      await saveScopeManifest(updatedManifest, scope);
+      return { changed: true, convertedRecords: 0, reason: 'copy_classification_marked_live', manifest: updatedManifest };
+    }
+    return await withScopeWriteLock(scope.scopeKey, async () => {
+      await saveTurnWorldline(scope.scopeKey, emptyTurnWorldline(scope.scopeKey));
+      const saved = await saveScopeRecords(scope, records, settings, scope);
+      const updatedManifest = {
+        ...(saved.manifest || manifest),
+        copyAdoptionMode: 'chat_copy_live',
+        copyClassificationRepairedAt: repairedAt
+      };
+      await saveScopeManifest(updatedManifest, scope);
+      return {
+        changed: true,
+        convertedRecords,
+        reason: 'copied_chat_history_reclassified_live',
+        manifest: updatedManifest
+      };
+    });
   };
 
   const ensureScopeStorageReady = async (scope, settings, options = {}) => {
@@ -5150,9 +5314,11 @@
     }
     const hasStoredRecords = Number(manifest.count || 0) > 0 || Number(manifest.shardCount || 0) > 0;
     if (hasStoredRecords || manifest.copyAdoptedComplete) {
-      if (manifest.externalRetirementVersion < EXTERNAL_RETIREMENT_VERSION) scheduleExternalRetirement(scope, { reason: 'scope_fast_path' });
+      const copyRepair = await repairMisclassifiedNativeCopyScope(scope, manifest, settings);
+      const readyManifest = copyRepair.manifest || manifest;
+      if (readyManifest.externalRetirementVersion < EXTERNAL_RETIREMENT_VERSION) scheduleExternalRetirement(scope, { reason: 'scope_fast_path' });
       scheduleLegacyGlobalMigration(scope, settings);
-      return { scope, adopted: false, manifest, fastPath: true };
+      return { scope, adopted: false, manifest: readyManifest, copyRepair, fastPath: true };
     }
     const registry = await readRegistry();
     const storedScopes = await listStoredScopeManifestMetas().catch(error => {
@@ -5165,7 +5331,12 @@
     ];
     const source = await findCloneSource(scope, registry, { previousScope: Runtime.previousScope, extraScopes });
     if (source?.source) {
-      const cloned = await cloneScopeStorage(source.source, scope, settings, { reason: source.reason, weight: source.weight });
+      const cloneMode = scope?.bridgeHandoffValid === true ? 'session_handoff' : 'chat_copy_live';
+      const cloned = await cloneScopeStorage(source.source, scope, settings, {
+        reason: source.reason,
+        mode: cloneMode,
+        weight: source.weight
+      });
       if (cloned.ok) {
         const afterClone = await loadScopeRecords(scope.scopeKey);
         scheduleExternalRetirement(scope, { reason: 'clone_adopt' });
@@ -11319,7 +11490,14 @@
       if (Runtime.unloaded || Runtime.finalizedCaptureMonitors.get(pendingId) !== state) return;
       const current = (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns : []).find(item => item?.pendingId === pendingId);
       if (!current || Date.now() - Number(state.startedAt || 0) > FINALIZED_CAPTURE_MAX_AGE_MS) {
-        if (current) removePendingTurnById(pendingId);
+        if (current) {
+          removePendingTurnById(pendingId);
+          pushActivityLog('capture_expired', '최종 응답을 확인하지 못해 캡처 대기가 만료됐습니다.', {
+            scopeKey: current.scope?.scopeKey || '',
+            pairIndex: Number(current.pairIndex || 0) || 0,
+            reason: 'finalized_capture_max_age'
+          }, 'warn');
+        }
         stopFinalizedCaptureMonitor(pendingId);
         return;
       }
@@ -11357,6 +11535,13 @@
             if (candidate.body.length < settings.minCaptureChars && stableFor >= FINALIZED_CAPTURE_SHORT_GRACE_MS) {
               removePendingTurnById(pendingId);
               Runtime.lastCapture = { at: Date.now(), skipped: true, reason: 'finalized_assistant_too_short', scopeKey: current.scope?.scopeKey || '', chars: candidate.body.length };
+              pushActivityLog('capture_skipped', '최종 응답이 최소 캡처 길이보다 짧아 저장하지 않았습니다.', {
+                scopeKey: current.scope?.scopeKey || '',
+                pairIndex: Number(current.pairIndex || 0) || 0,
+                chars: candidate.body.length,
+                minCaptureChars: settings.minCaptureChars,
+                reason: 'finalized_assistant_too_short'
+              }, 'warn');
               stopFinalizedCaptureMonitor(pendingId);
               return;
             }
@@ -11379,6 +11564,12 @@
                   attempts: state.attempts
                 };
                 opLog('finalized_capture_abandoned', { hook: 'liveChatMonitor', pending: current, result: Runtime.lastCapture }, 'warn');
+                pushActivityLog('capture_failed', '확정 응답 저장이 반복해서 거절되어 캡처를 중단했습니다.', {
+                  scopeKey: current.scope?.scopeKey || '',
+                  pairIndex: Number(current.pairIndex || 0) || 0,
+                  attempts: state.attempts,
+                  reason: 'finalized_capture_save_rejected'
+                }, 'error');
                 stopFinalizedCaptureMonitor(pendingId);
                 return;
               }
@@ -11402,6 +11593,13 @@
             error: formatErrorMessage(error, 500)
           };
           opLog('finalized_capture_abandoned', { hook: 'liveChatMonitor', pending: current, result: Runtime.lastCapture }, 'error');
+          pushActivityLog('capture_failed', '최종 응답 감시 중 오류가 반복되어 캡처를 중단했습니다.', {
+            scopeKey: current.scope?.scopeKey || '',
+            pairIndex: Number(current.pairIndex || 0) || 0,
+            attempts: state.attempts,
+            error: Runtime.lastCapture.error,
+            reason: 'finalized_capture_monitor_failed'
+          }, 'error');
           stopFinalizedCaptureMonitor(pendingId);
           return;
         }
@@ -11510,6 +11708,12 @@
       if (pendingCapture.queued) {
         scheduleFinalizedCaptureMonitor(pendingCapture.pending, settings);
         opLog('pending_queued', { hook: 'beforeRequest', type: requestClass.requestType || '', pending: pendingCapture.pending, latestUser: pendingCapture.latestUser, retrievalQuery: pendingCapture.retrievalQuery });
+        pushActivityLog('capture_waiting', '이번 턴의 최종 응답 캡처를 기다립니다.', {
+          scopeKey: scope.scopeKey,
+          pairIndex: Number(pendingCapture.pending?.pairIndex || 0) || 0,
+          turnIndex: Number(pendingCapture.pending?.turnIndex || 0) || 0,
+          pendingQueued: true
+        });
       }
       if (!pendingCapture.queued) {
         markPendingCaptureBarrier('before_no_user_input', requestClass);
@@ -11524,6 +11728,10 @@
         };
         refreshLastRecallPanel();
         opLog('before_no_pending_user', { hook: 'beforeRequest', type, requestClass, reason: pendingCapture.reason || 'no_user_input' }, 'warn');
+        pushActivityLog('recall_skipped', '현재 유저 입력을 확인하지 못해 리콜을 건너뛰었습니다.', {
+          scopeKey: scope.scopeKey,
+          reason: pendingCapture.reason || 'no_user_input'
+        }, 'warn');
         return messages;
       }
       const { normalizedMessages, latestUser, retrievalQuery } = pendingCapture;
@@ -11564,6 +11772,11 @@
         };
         refreshLastRecallPanel();
         opLog('before_recall_deadline', Runtime.lastRecall, 'warn');
+        pushActivityLog('recall_timeout', '리콜 제한시간을 초과해 이번 요청은 기억 주입 없이 진행합니다.', {
+          scopeKey: scope.scopeKey,
+          timeoutMs: settings.hookRecallTimeoutMs || DEFAULTS.hookRecallTimeoutMs,
+          reason: 'recall_deadline'
+        }, 'warn');
         return messages;
       }
       recall.stageElapsed = {
@@ -11678,8 +11891,36 @@
       refreshLastRecallPanel();
       refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
       opLog('before_recall_complete', { hook: 'beforeRequest', type, pending: pendingCapture.pending, scope, recall, blockChars: text(dynamicBlock).length });
+      const activityStoredCount = Number(recall.storedTotal ?? recall.total ?? 0) || 0;
+      const activityCandidateCount = Number(recall.candidates || 0) || 0;
+      const activitySelectedCount = Array.isArray(recall.records) ? recall.records.length : 0;
+      const recallActivityMessage = activityStoredCount <= 0
+        ? '저장된 기억이 없어 이번 리콜에서 선택된 기억이 없습니다.'
+        : (activityCandidateCount <= 0
+          ? '현재 입력과 관련된 기억 후보를 찾지 못했습니다.'
+          : (activitySelectedCount <= 0
+            ? '후보를 검토했지만 주입할 기억을 선택하지 못했습니다.'
+            : `${formatNumber(activitySelectedCount)}개의 기억을 선택했습니다.`));
+      pushActivityLog('memory_recall_completed', recallActivityMessage, {
+        scopeKey: scope.scopeKey,
+        pairIndex: Number(pendingCapture.pending?.pairIndex || 0) || 0,
+        stored: activityStoredCount,
+        candidates: activityCandidateCount,
+        selected: activitySelectedCount,
+        blockChars: text(dynamicBlock).length,
+        injected: !!dynamicBlock
+      }, activitySelectedCount > 0 ? 'success' : 'info');
       if (!dynamicBlock) {
         opLog('before_no_injection_block', { hook: 'beforeRequest', type, pending: pendingCapture.pending, scopeKey: scope.scopeKey, reason: recall.reason || '' }, 'debug');
+        if (activitySelectedCount > 0) {
+          pushActivityLog('memory_injection_skipped', '기억은 선택됐지만 주입 블록을 만들지 못했습니다.', {
+            scopeKey: scope.scopeKey,
+            pairIndex: Number(pendingCapture.pending?.pairIndex || 0) || 0,
+            selected: activitySelectedCount,
+            blockChars: 0,
+            reason: recall.reason || 'empty_injection_block'
+          }, 'warn');
+        }
         return messages;
       }
       log('injecting recall block', Runtime.lastRecall);
@@ -11716,6 +11957,11 @@
         refreshLastRecallPanel();
       }
       opLog('before_error', { hook: 'beforeRequest', type, requestClass, error: formatErrorMessage(error, 900) }, 'error');
+      pushActivityLog('recall_failed', '리콜 처리 중 오류가 발생해 기억 주입 없이 진행합니다.', {
+        scopeKey: Runtime.currentScope?.scopeKey || '',
+        error: formatErrorMessage(error, 700),
+        reason: error?.code || 'before_request_error'
+      }, 'error');
       warn('beforeRequest failed', error);
       return messages;
     } finally {
@@ -11740,6 +11986,11 @@
     if (settings.mode === 'off' || !settings.captureAfterRequest) {
       clearPendingTurn(settings.mode === 'off' ? 'after_mode_off' : 'after_capture_disabled');
       opLog('after_skip_capture_disabled', { hook: 'afterRequest', type, reason: settings.mode === 'off' ? 'mode_off' : 'capture_disabled' }, 'debug');
+      pushActivityLog('capture_skipped', '응답 자동 캡처가 비활성화되어 저장을 건너뛰었습니다.', {
+        scopeKey: Runtime.currentScope?.scopeKey || '',
+        reason: settings.mode === 'off' ? 'mode_off' : 'capture_disabled',
+        captureAfterRequest: settings.captureAfterRequest
+      }, 'warn');
       return content;
     }
     const pending = Runtime.pendingTurn || (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns[Runtime.pendingTurns.length - 1] : null);
@@ -11782,6 +12033,19 @@
       },
       stats: statsForRecords(selectedRecords),
       records: returnedRecords
+    };
+  };
+
+  const inspectMemoryLedger = async (scopeOverride = null, options = {}) => {
+    const snapshot = await debugRecordsSnapshot(scopeOverride, {
+      ...options,
+      includeRecords: options?.includeRecords !== false
+    });
+    return {
+      schema: 'flashback_memory_ledger_inspection_v1',
+      readOnly: true,
+      version: PLUGIN_VERSION,
+      ...snapshot
     };
   };
 
@@ -13093,12 +13357,14 @@ ${cleanedText}`, 80),
   };
 
   const buildActivityLogTab = () => {
+    const diagnosticLogState = Runtime.settings?.operationLogEnabled ? '켜짐' : '꺼짐';
     return `<section class="panel" data-panel="activity">
       <div class="card activity-log-card">
         <div class="activity-log-toolbar">
           <div>
             <div class="card-title">작업 로그 <span id="activityLogCount" class="nav-count">${formatNumber(Runtime.activityLog.length)}</span></div>
-            <div class="tiny">현재 플러그인 실행 중인 기록만 RAM에 보관합니다. 다시 로드하면 자동으로 사라집니다.</div>
+            <div class="tiny">현재 실행의 리콜·주입·캡처·유지보수 기록을 RAM에 보관합니다. 다시 로드하면 사라집니다.</div>
+            <div class="tiny">개발자 진단 로그: ${escapeHtml(diagnosticLogState)} · 진단 로그는 별도로 저장되어 디버그 내보내기에 포함됩니다.</div>
           </div>
           <button id="clearActivityLogBtn" class="btn" type="button">로그 비우기</button>
         </div>
@@ -14265,6 +14531,12 @@ ${cleanedText}`, 80),
             ? await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey)
             : await inspectEmbeddingKeyPersistence());
         Runtime.lastStorageAction = { at: Date.now(), savedSettings: true, embeddingKeyPersistence: keyPersistence };
+        pushActivityLog('settings_saved', '프로바이더 설정을 저장했습니다.', {
+          scopeKey: Runtime.currentScope?.scopeKey || '',
+          mode: settings.mode,
+          captureAfterRequest: settings.captureAfterRequest,
+          operationLogEnabled: settings.operationLogEnabled
+        }, 'success');
         await refreshUi('provider');
       } catch (error) { await guiError('설정 저장 실패', error); }
       finally { setBusy(false); }
@@ -14281,6 +14553,12 @@ ${cleanedText}`, 80),
           savedAdvancedSettings: true,
           embeddingKeyPersistence: keyPersistence
         };
+        pushActivityLog('advanced_settings_saved', `고급 설정을 저장했습니다. 개발자 진단 로그: ${settings.operationLogEnabled ? '켜짐' : '꺼짐'}`, {
+          scopeKey: Runtime.currentScope?.scopeKey || '',
+          mode: settings.mode,
+          captureAfterRequest: settings.captureAfterRequest,
+          operationLogEnabled: settings.operationLogEnabled
+        }, 'success');
         syncMountedSettingsUi(settings);
         await refreshUi('advanced');
       } catch (error) { await guiError('고급 설정 저장 실패', error); }
@@ -14599,6 +14877,10 @@ ${cleanedText}`, 80),
     }),
     loadSettings,
     saveSettings,
+    memory: Object.freeze({
+      inspect: inspectMemoryLedger
+    }),
+    inspectMemoryLedger,
     inspectMemoryMaintenance,
     runMemoryMaintenance,
     ingestLiveChatColdStart,
@@ -14628,7 +14910,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, cloneScopeStorage, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
@@ -14637,6 +14919,12 @@ ${cleanedText}`, 80),
     Runtime.settings = await loadSettings(true);
     Runtime.effectiveSettings = Runtime.settings;
     syncFlashbackRuntimeState(Runtime.settings, Runtime.currentScope || null);
+    pushActivityLog('plugin_started', `${PLUGIN_NAME}가 시작되었습니다.`, {
+      version: PLUGIN_VERSION,
+      mode: Runtime.settings.mode,
+      captureAfterRequest: Runtime.settings.captureAfterRequest,
+      operationLogEnabled: Runtime.settings.operationLogEnabled
+    });
     await readEmbeddingKey().catch(error => warn('embedding key persistence load failed', error));
     await inspectEmbeddingKeyPersistence({ includeArgument: true }).catch(error => warn('embedding key persistence inspection failed', error));
     if (!Runtime.settings.operationLogEnabled) {
