@@ -1,7 +1,8 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.9.17
+//@display-name ⚡ FLASHBACK Memory v0.9.20
 //@api 3.0
-//@version 0.9.17
+//@version 0.9.20
+//@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
 //@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
@@ -20,9 +21,9 @@
 //@arg injection_position string before_current_input|last_system|before_last_user; blank uses before_current_input
 //@arg chunk_chars string Maximum source chunk characters before embedding; blank uses 1200
 //@arg chunk_overlap string Overlap characters between chunks; blank uses 160
-//@arg max_response_items string Maximum captured response records retained per chat scope; blank uses 1200
+//@arg max_response_items string Maximum complete captured U+A turns retained per chat scope; blank uses 1200
 //@arg capture_after_request string true|false; blank uses true
-//@arg min_capture_chars string Minimum assistant response chars for chat capture; blank uses 40
+//@arg min_capture_chars string Legacy compatibility only; finalized non-empty responses are always captured
 //@arg include_scores string true|false; blank uses true
 //@arg enable_gui string true|false; blank uses true
 //@arg auto_open_gui string true|false; blank uses false (legacy compatibility only)
@@ -68,7 +69,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.17
+ * ⚡ FLASHBACK Memory v0.9.20
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -82,6 +83,10 @@
  *   exclusively from those response turns; external sources are never embedded.
  * - beforeRequest combines dense retrieval with visible-U+A-derived BM25F, exact
  *   anchors, deterministic RRF, and injects only selected source excerpts.
+ * - Narrative chunks preserve sentence/role/atomic-structure boundaries and
+ *   retain source offsets so a U+A turn can be reconstructed without whitespace drift.
+ * - Pending finalized captures survive reload through a short-lived proof-only
+ *   journal; user and assistant bodies are never copied into that journal.
  * - Peer hidden packet contents are stripped as source artifacts. They are never
  *   parsed, indexed, converted into state, or injected by Flashback; only a generic
  *   discarded-artifact count may remain for maintenance diagnostics.
@@ -309,8 +314,12 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.9.17';
+  const PLUGIN_VERSION = '0.9.20';
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
+  const MEMORY_SESSION_BRIDGE_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
+  const MEMORY_SESSION_BRIDGE_PLUGIN_ID = 'flashback_hayaku_bridge';
+  const MEMORY_SESSION_BRIDGE_REQUEST_CHANNEL = 'flashback_memory_bridge_request_v1';
+  const MEMORY_SESSION_BRIDGE_RESPONSE_CHANNEL = 'flashback_memory_bridge_response_v1';
   const INJECTION_HEADER = '[FLASHBACK EVIDENCE]';
   const INJECTION_FOOTER = '[/FLASHBACK EVIDENCE]';
   const VECTOR_BLOCK_RE = /(?:\[VECTOR RAG MEMORY\][\s\S]*?\[\/VECTOR RAG MEMORY\]|\[FLASHBACK EVIDENCE\][\s\S]*?\[\/FLASHBACK EVIDENCE\])/gi;
@@ -346,6 +355,7 @@
     settings: `${PLUGIN_STORAGE_ID}:settings:v2`,
     registry: `${PLUGIN_STORAGE_ID}:scope_registry:v2`,
     operationLog: `${PLUGIN_STORAGE_ID}:operation_log:v1`,
+    pendingCaptureJournal: `${PLUGIN_STORAGE_ID}:pending_capture_journal:v1`,
     localSecret: `${PLUGIN_STORAGE_ID}:embedding_secret:v2`,
     legacyManifest: `${PLUGIN_STORAGE_ID}:manifest:v1`,
     legacyShardPrefix: `${PLUGIN_STORAGE_ID}:records:shard:`,
@@ -355,6 +365,7 @@
   const HOOK_RECALL_TIMEOUT_POLICY_VERSION = 1;
   const SETTINGS_POLICY_VERSION = 4;
   const TURN_WORLDLINE_VERSION = 'flashback_turn_worldline_v1';
+  const TURN_WORLDLINE_BINDING_POLICY_VERSION = 2;
   // Keep at least the default 1,200-response retention horizon plus reroll
   // variants. A smaller cap can sever the still-visible prefix during a long
   // rollback (for example T300 -> T10) and make exact branch restore impossible.
@@ -412,6 +423,7 @@
   const FLASHBACK_BM25F_K1 = 1.2;
   const FLASHBACK_CANDIDATE_RRF_K = 52;
   const FLASHBACK_SPARSE_INDEX_VERSION = 2;
+  const FLASHBACK_SHARD_INDEX_VERSION = 3;
   const FLASHBACK_SPARSE_CACHE_MAX = 1600;
   const RECALL_LANES = Object.freeze(['short', 'medium', 'long']);
   const RECALL_LANE_LIMITS = Object.freeze({
@@ -510,6 +522,9 @@
   const CONVERSATION_DRIFT_DISMISS_MS = 10 * 60 * 1000;
   const PENDING_TURN_MAX_AGE_MS = 30 * 60 * 1000;
   const MAX_PENDING_TURNS = 8;
+  const PENDING_CAPTURE_JOURNAL_VERSION = 1;
+  const PENDING_CAPTURE_JOURNAL_TTL_MS = 10 * 60 * 1000;
+  const PENDING_CAPTURE_JOURNAL_MAX_ENTRIES = MAX_PENDING_TURNS;
   const PENDING_FALLBACK_MIN_OVERLAP = 0.08;
   const PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP = 0.22;
   const PENDING_SHORT_LATEST_SCORE_SLACK = 0.03;
@@ -522,7 +537,6 @@
   const FINALIZED_CAPTURE_POLL_MS = 900;
   const FINALIZED_CAPTURE_IDLE_POLL_MS = 2200;
   const FINALIZED_CAPTURE_STABLE_MS = 4000;
-  const FINALIZED_CAPTURE_SHORT_GRACE_MS = 12000;
   const FINALIZED_CAPTURE_MAX_AGE_MS = 4 * 60 * 1000;
   const SCOPE_REGISTRY_REMEMBER_TTL_MS = 30000;
 
@@ -561,6 +575,8 @@
     previousScope: null,
     pendingTurn: null,
     pendingTurns: [],
+    pendingCaptureJournalWrite: null,
+    lastPendingCaptureRecovery: null,
     pendingCaptureBarrier: null,
     requestDecisionQueue: [],
     requestDecisionSeq: 0,
@@ -727,10 +743,15 @@
   };
 
   const clearPendingTurn = (reason = '') => {
-    const previous = Runtime.pendingTurn || (Array.isArray(Runtime.pendingTurns) && Runtime.pendingTurns.length ? Runtime.pendingTurns[Runtime.pendingTurns.length - 1] : null);
+    const pendingList = Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns.slice() : [];
+    const previous = Runtime.pendingTurn || (pendingList.length ? pendingList[pendingList.length - 1] : null);
     Runtime.pendingTurn = null;
     Runtime.pendingTurns = [];
     Runtime.pendingCaptureBarrier = null;
+    const pendingIds = pendingList.map(item => text(item?.pendingId || '')).filter(Boolean);
+    if (pendingIds.length) {
+      void removePendingCaptureJournalEntries(pendingIds).catch(error => warn('pending capture journal clear failed', error));
+    }
     if (!previous) return null;
     if (reason) Runtime.lastPendingTurnClear = { at: Date.now(), reason, scopeKey: previous.scope?.scopeKey || '', cleared: 'all' };
     return previous;
@@ -742,6 +763,11 @@
     const kept = list.filter(item => item?.latestUser && now - Number(item.at || 0) <= PENDING_TURN_MAX_AGE_MS);
     if (kept.length !== list.length && reason) Runtime.lastPendingTurnClear = { at: now, reason, cleared: list.length - kept.length };
     Runtime.pendingTurns = kept.slice(Math.max(0, kept.length - MAX_PENDING_TURNS));
+    const retainedIds = new Set(Runtime.pendingTurns.map(item => text(item?.pendingId || '')).filter(Boolean));
+    const removedIds = list.map(item => text(item?.pendingId || '')).filter(id => id && !retainedIds.has(id));
+    if (removedIds.length) {
+      void removePendingCaptureJournalEntries(removedIds).catch(error => warn('pending capture journal prune failed', error));
+    }
     Runtime.pendingTurn = Runtime.pendingTurns[Runtime.pendingTurns.length - 1] || null;
     return Runtime.pendingTurns;
   };
@@ -772,7 +798,8 @@
       Runtime.pendingTurn = existing;
       return existing;
     }
-    const pendingId = stableHash(`${pending.scope?.scopeKey || ''}\n${pending.messageHash || ''}\n${pending.latestUser || ''}\n${Date.now()}\n${Math.random()}`);
+    const pendingId = text(pending.pendingId || '').trim()
+      || stableHash(`${pending.scope?.scopeKey || ''}\n${pending.messageHash || ''}\n${pending.latestUser || ''}\n${Date.now()}\n${Math.random()}`);
     const item = { ...pending, pendingId, lastRequestAt: now, requestSeenCount: 1 };
     list.push(item);
     Runtime.pendingTurns = list.slice(Math.max(0, list.length - MAX_PENDING_TURNS));
@@ -819,6 +846,7 @@
     const [item] = list.splice(idx, 1);
     Runtime.pendingTurns = list;
     Runtime.pendingTurn = Runtime.pendingTurns[Runtime.pendingTurns.length - 1] || null;
+    void removePendingCaptureJournalEntries([id]).catch(error => warn('pending capture journal removal failed', error));
     return item || null;
   };
 
@@ -834,6 +862,10 @@
     }
     Runtime.pendingTurns = kept;
     Runtime.pendingTurn = Runtime.pendingTurns[Runtime.pendingTurns.length - 1] || null;
+    if (removed.length) {
+      void removePendingCaptureJournalEntries(removed.map(item => item?.pendingId).filter(Boolean))
+        .catch(error => warn('pending capture journal removal failed', error));
+    }
     if (removed.length && reason) Runtime.lastPendingTurnClear = { at: Date.now(), reason, cleared: removed.length };
     return removed;
   };
@@ -1384,6 +1416,7 @@
   };
 
   const MEMORY_SANITIZER_VERSION = 4;
+  const NARRATIVE_CHUNK_SCHEMA_VERSION = 2;
   const THOUGHT_TAG_RE = /<\s*(\/?)\s*(Thoughts?|Reasoning|Thinking|Analysis|ChainOfThought|chain_of_thought)\b[^>]*>/gi;
   const VISIBLE_RESPONSE_BOUNDARY_RE = /(?:^|\n)\s*(?:#{1,4}\s*(?:응답|Response|Record|기록|Approved|승인됨)(?=\s|$))/gim;
   const STATUS_DATA_RE = /<statusData\b[^>]*>[\s\S]*?<\/statusData>/gi;
@@ -1596,7 +1629,10 @@
       .replace(MEMORY_WRAPPER_RE, '\n')
       .replace(DEBUG_LINE_RE, '\n')
       .replace(INTERNAL_LINE_RE, '\n');
-    if (options.stripRolePrefix !== false) out = out.replace(/^(?:Assistant|어시스턴트|응답)\s*:\s*/gim, '');
+    if (options.stripRolePrefix !== false) {
+      out = stripNarrativeStructuralRoleMarkers(out, new Set(['assistant']))
+        .replace(/^(?:어시스턴트|응답)\s*:\s*/i, '');
+    }
     out = out
       .replace(/\r\n/g, '\n')
       .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -2169,6 +2205,152 @@
     return true;
   };
 
+  const normalizePendingCaptureJournalEntry = (value = {}, now = Date.now()) => {
+    if (!value || typeof value !== 'object') return null;
+    const pendingId = text(value.pendingId || '').trim().slice(0, 160);
+    const scopeKey = text(value.scopeKey || '').trim().slice(0, 240);
+    const userTextHash = text(value.userTextHash || '').trim().slice(0, 160);
+    if (!pendingId || !scopeKey || !userTextHash) return null;
+    const at = Math.max(0, Number(value.at || 0) || 0);
+    const lastRequestAt = Math.max(at, Number(value.lastRequestAt || 0) || at);
+    const expiresAt = Math.max(
+      lastRequestAt,
+      Number(value.expiresAt || 0) || (lastRequestAt + PENDING_CAPTURE_JOURNAL_TTL_MS)
+    );
+    if (!at || expiresAt <= now || at > now + (5 * 60 * 1000)) return null;
+    return Object.freeze({
+      version: PENDING_CAPTURE_JOURNAL_VERSION,
+      pendingId,
+      scopeKey,
+      pairIndex: Math.max(0, Number(value.pairIndex || 0) || 0),
+      userMessagePosition: Math.max(0, Number(value.userMessagePosition || 0) || 0),
+      expectedAssistantPosition: Math.max(0, Number(value.expectedAssistantPosition || 0) || 0),
+      requestMessageCount: Math.max(0, Number(value.requestMessageCount || 0) || 0),
+      requestUserIndex: Number(value.requestUserIndex ?? -1),
+      terminalPrefillIndex: Number(value.terminalPrefillIndex ?? -1),
+      baselineAssistantPosition: Math.max(0, Number(value.baselineAssistantPosition || 0) || 0),
+      baselineAssistantHash: text(value.baselineAssistantHash || '').trim().slice(0, 160),
+      messageHash: text(value.messageHash || '').trim().slice(0, 160),
+      userTextHash,
+      requestType: text(value.requestType || 'model').trim().slice(0, 80),
+      resolutionSource: text(value.resolutionSource || '').trim().slice(0, 120),
+      resolutionConfidence: text(value.resolutionConfidence || '').trim().slice(0, 80),
+      at,
+      lastRequestAt,
+      expiresAt
+    });
+  };
+
+  const normalizePendingCaptureJournalEnvelope = (raw, now = Date.now()) => {
+    const parsed = typeof raw === 'string' ? tryJsonParse(raw, null) : raw;
+    const source = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.entries) ? parsed.entries : []);
+    const byId = new Map();
+    for (const candidate of source) {
+      const entry = normalizePendingCaptureJournalEntry(candidate, now);
+      if (!entry) continue;
+      const previous = byId.get(entry.pendingId);
+      if (!previous || Number(entry.lastRequestAt || 0) >= Number(previous.lastRequestAt || 0)) {
+        byId.set(entry.pendingId, entry);
+      }
+    }
+    const entries = Array.from(byId.values())
+      .sort((a, b) => Number(a.lastRequestAt || a.at || 0) - Number(b.lastRequestAt || b.at || 0))
+      .slice(-PENDING_CAPTURE_JOURNAL_MAX_ENTRIES);
+    return {
+      version: PENDING_CAPTURE_JOURNAL_VERSION,
+      updatedAt: Math.max(0, Number(parsed?.updatedAt || 0) || 0),
+      entries
+    };
+  };
+
+  const serializePendingCaptureJournalEntry = (pending = {}, now = Date.now()) => {
+    const baselineText = canonicalChatResponseText(pending.baselineAssistantText || '');
+    const lastRequestAt = Math.max(Number(pending.lastRequestAt || 0) || 0, Number(pending.at || 0) || now);
+    return normalizePendingCaptureJournalEntry({
+      pendingId: pending.pendingId,
+      scopeKey: pending.scope?.scopeKey,
+      pairIndex: pending.pairIndex,
+      userMessagePosition: pending.userMessagePosition,
+      expectedAssistantPosition: pending.expectedAssistantPosition,
+      requestMessageCount: pending.requestMessageCount,
+      requestUserIndex: pending.requestUserIndex,
+      terminalPrefillIndex: pending.terminalPrefillIndex,
+      baselineAssistantPosition: pending.baselineAssistantPosition,
+      baselineAssistantHash: pending.baselineAssistantHash
+        || (baselineText ? stableHash(baselineText) : ''),
+      messageHash: pending.messageHash,
+      userTextHash: pending.userTextHash || stableHash(canonicalChatUserText(pending.latestUser || '')),
+      requestType: pending.requestType,
+      resolutionSource: pending.resolutionSource,
+      resolutionConfidence: pending.resolutionConfidence,
+      at: Number(pending.at || 0) || now,
+      lastRequestAt,
+      expiresAt: lastRequestAt + PENDING_CAPTURE_JOURNAL_TTL_MS
+    }, now);
+  };
+
+  const queuePendingCaptureJournalMutation = (mutator) => {
+    const predecessor = Runtime.pendingCaptureJournalWrite;
+    const task = Promise.resolve(predecessor)
+      .catch(() => null)
+      .then(async () => {
+        const now = Date.now();
+        const raw = await RisuCompat.getItem(STORAGE.pendingCaptureJournal);
+        const current = normalizePendingCaptureJournalEnvelope(raw, now);
+        const proposed = typeof mutator === 'function' ? await mutator(current.entries.slice(), now) : current.entries;
+        const next = normalizePendingCaptureJournalEnvelope({
+          version: PENDING_CAPTURE_JOURNAL_VERSION,
+          updatedAt: now,
+          entries: Array.isArray(proposed) ? proposed : current.entries
+        }, now);
+        await requireStorageWrite(
+          STORAGE.pendingCaptureJournal,
+          safeStringify({ ...next, updatedAt: now }),
+          'pending capture journal save'
+        );
+        return next;
+      });
+    Runtime.pendingCaptureJournalWrite = task;
+    task.then(
+      () => { if (Runtime.pendingCaptureJournalWrite === task) Runtime.pendingCaptureJournalWrite = null; },
+      () => { if (Runtime.pendingCaptureJournalWrite === task) Runtime.pendingCaptureJournalWrite = null; }
+    );
+    return task;
+  };
+
+  const persistPendingCaptureJournalEntry = async (pending = {}) => {
+    const entry = serializePendingCaptureJournalEntry(pending);
+    if (!entry) return { saved: false, reason: 'invalid_pending_capture' };
+    const envelope = await queuePendingCaptureJournalMutation((entries) => [
+      ...entries.filter(item => item.pendingId !== entry.pendingId),
+      entry
+    ]);
+    return { saved: envelope.entries.some(item => item.pendingId === entry.pendingId), entry };
+  };
+
+  const removePendingCaptureJournalEntries = async (pendingIds = []) => {
+    const ids = new Set((Array.isArray(pendingIds) ? pendingIds : [pendingIds])
+      .map(id => text(id || '').trim())
+      .filter(Boolean));
+    if (!ids.size) return { removed: 0 };
+    let removed = 0;
+    const envelope = await queuePendingCaptureJournalMutation((entries) => {
+      const kept = entries.filter(item => {
+        if (!ids.has(item.pendingId)) return true;
+        removed += 1;
+        return false;
+      });
+      return kept;
+    });
+    return { removed, remaining: envelope.entries.length };
+  };
+
+  const loadPendingCaptureJournalEntries = async () => {
+    await Promise.resolve(Runtime.pendingCaptureJournalWrite).catch(() => null);
+    const raw = await RisuCompat.getItem(STORAGE.pendingCaptureJournal);
+    return normalizePendingCaptureJournalEnvelope(raw, Date.now()).entries;
+  };
+
   function isProbablyLocalNetworkUrl(url) {
     try {
       const host = new URL(String(url || '')).hostname.toLowerCase();
@@ -2438,6 +2620,7 @@
       storyPlanner: false,
       peerRuntimeReads: false,
       peerIpc: false,
+      ownerLedgerBridgeIpc: true,
       peerEvidenceSnapshots: false,
       requestTypes: ['model']
     };
@@ -3754,6 +3937,12 @@
       bridgeHandoffSourceChatId: bridgeMarkerState.valid ? bridgeMarkerState.sourceChatId : '',
       bridgeHandoffTargetChatId: bridgeMarkerState.valid ? bridgeMarkerState.targetChatId : '',
       bridgeHandoffTransferId: bridgeMarkerState.valid ? bridgeMarkerState.transferId : '',
+      bridgeHandoffSourceScopeKey: bridgeMarkerState.valid
+        ? text(bridgeMarkerState.marker?.sourceFlashbackScopeKey || copiedFromScopeKey || '').trim()
+        : '',
+      bridgeHandoffExpectedRecords: bridgeMarkerState.valid
+        ? Math.max(0, Number(bridgeMarkerState.marker?.flashbackRecordCount || 0) || 0)
+        : 0,
       bridgeHandoffValidationReason: bridgeMarkerState.reason,
       seenAt: Date.now()
     };
@@ -3876,7 +4065,7 @@
     count: 0,
     shardCount: 0,
     shardSize: DEFAULTS.shardSize,
-    shardIndexVersion: 1,
+    shardIndexVersion: FLASHBACK_SHARD_INDEX_VERSION,
     shardSummaries: [],
     nextId: 1,
     stats: { byType: {} },
@@ -3890,6 +4079,11 @@
     copyAdoptedCompleteAt: '',
     copyAdoptedComplete: false,
     copyAdoptionMode: '',
+    copyTransferId: '',
+    copyTransferSchema: '',
+    copySourceChatId: '',
+    copyTargetChatId: '',
+    copyExpectedRecordCount: 0,
     copyClassificationRepairedAt: '',
     legacyMigratedAt: '',
     externalRetirementVersion: 0,
@@ -3901,7 +4095,8 @@
     episodeCount: 0,
     episodeChildCount: 0,
     turnWorldlineLiveHash: '',
-    turnWorldlineRevision: 0
+    turnWorldlineRevision: 0,
+    turnWorldlineBindingPolicyVersion: 0
   });
 
   const loadScopeManifest = async (scopeOrKey) => {
@@ -3951,6 +4146,7 @@
       episodeChildCount: clampInt(parsed.episodeChildCount, 0, 10000000, 0),
       turnWorldlineLiveHash: compact(parsed.turnWorldlineLiveHash || '', 96),
       turnWorldlineRevision: clampInt(parsed.turnWorldlineRevision, 0, 1000000000, 0),
+      turnWorldlineBindingPolicyVersion: clampInt(parsed.turnWorldlineBindingPolicyVersion, 0, 1000, 0),
       stats: parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : { byType: {} }
     };
   };
@@ -4228,7 +4424,21 @@
     return count ? compactVectorForStorage(normalizeVector(sum.map(value => value / count))) : [];
   };
 
+  const isRecallIndexableRecord = (record = {}) => {
+    const lifecycle = text(record.lifecycleStatus || 'active').trim().toLowerCase();
+    if (INACTIVE_RECALL_LIFECYCLES.has(lifecycle)) return false;
+    return !(
+      record.restrictedOnly === true
+      || record.privacyRestricted === true
+      || record.metadata?.restrictedOnly === true
+      || structuredMetadataRowRestricted(record)
+      || structuredMetadataRowRestricted(record.metadata)
+      || /^(?:restricted|secret|private)(?:_|$)/i.test(text(record.sourceType || ''))
+    );
+  };
+
   const buildRecallShardSummary = (records = [], shardIndex = 0, settings = Runtime.settings || DEFAULTS) => {
+    const recallableRecords = records.filter(isRecallIndexableRecord);
     const sourceTypes = new Set();
     const anchors = new Set();
     const properties = new Set();
@@ -4239,16 +4449,38 @@
     const vectorGroups = new Map();
     let responseTurnMin = 0;
     let responseTurnMax = 0;
+    let responseStoryOrderMin = 0;
+    let responseStoryOrderMax = 0;
+    let stateStoryOrderMax = 0;
+    let inheritedResponseCount = 0;
     let stateFactCount = 0;
+    const inheritedStoryTurns = new Map();
     const bumpTerm = value => {
       const key = text(value || '').trim();
       if (!key) return;
       termCounts.set(key, (termCounts.get(key) || 0) + 1);
     };
-    for (const record of records) {
+    for (const record of recallableRecords) {
       const type = record.sourceType === 'chat_turn' ? 'response' : text(record.sourceType || 'unknown');
       sourceTypes.add(type);
       const turn = finiteTurnIndex(record);
+      const storyOrder = storyOrderValue(record);
+      if (type === 'response' && storyOrder > 0) {
+        responseStoryOrderMin = responseStoryOrderMin ? Math.min(responseStoryOrderMin, storyOrder) : storyOrder;
+        responseStoryOrderMax = Math.max(responseStoryOrderMax, storyOrder);
+        if (isInheritedScopeMemoryRecord(record)) {
+          inheritedResponseCount += 1;
+          const turnKey = stableHash(storyTurnKey(record));
+          const previous = inheritedStoryTurns.get(turnKey);
+          if (!previous || storyOrder >= previous.storyOrder) {
+            inheritedStoryTurns.set(turnKey, {
+              timelineKey: stableHash(storyTimelineKey(record)),
+              turnKey,
+              storyOrder
+            });
+          }
+        }
+      }
       if (type === 'response' && turn > 0 && !isInheritedScopeMemoryRecord(record)) {
         responseTurnMin = responseTurnMin ? Math.min(responseTurnMin, turn) : turn;
         responseTurnMax = Math.max(responseTurnMax, turn);
@@ -4256,6 +4488,7 @@
       for (const anchor of recordEntityAnchorSet(record)) if (anchors.size < 128) anchors.add(anchor);
       const facts = recordStructuredStateFacts(record);
       stateFactCount += facts.length;
+      if (facts.length && storyOrder > 0) stateStoryOrderMax = Math.max(stateStoryOrderMax, storyOrder);
       for (const fact of facts) {
         if (properties.size < 96) properties.add(fact.property);
         if (anchors.size < 128) anchors.add(fact.entity);
@@ -4296,9 +4529,17 @@
     return {
       shardIndex,
       recordCount: records.length,
+      recallableRecordCount: recallableRecords.length,
       sourceTypes: Array.from(sourceTypes).slice(0, 24),
       responseTurnMin,
       responseTurnMax,
+      responseStoryOrderMin,
+      responseStoryOrderMax,
+      stateStoryOrderMax,
+      inheritedResponseCount,
+      inheritedStoryTurns: Array.from(inheritedStoryTurns.values())
+        .sort((a, b) => a.storyOrder - b.storyOrder || a.turnKey.localeCompare(b.turnKey))
+        .slice(-128),
       stateFactCount,
       anchors: Array.from(anchors).slice(0, 128),
       properties: Array.from(properties).slice(0, 96),
@@ -4311,7 +4552,7 @@
         topState: topSparse('state'),
         topEvent: topSparse('event'),
         topTemporal: topSparse('temporal'),
-        documentCount: records.length
+        documentCount: recallableRecords.length
       },
       centroids
     };
@@ -4322,7 +4563,7 @@
     const all = Array.from({ length: shardCount }, (_, index) => index);
     const summaries = Array.isArray(manifest.shardSummaries) ? manifest.shardSummaries : [];
     const threshold = clampInt(settings.recallFullScanThreshold, 1, 64, DEFAULTS.recallFullScanThreshold);
-    if (shardCount <= threshold || summaries.length !== shardCount || Number(manifest.shardIndexVersion || 0) < 1) {
+    if (shardCount <= threshold || summaries.length !== shardCount || Number(manifest.shardIndexVersion || 0) < FLASHBACK_SHARD_INDEX_VERSION) {
       return { indexes: all, fullScan: true, reason: shardCount <= threshold ? 'small_scope' : 'missing_index', shardCount };
     }
     const queryAnchors = extractRecallAnchors(query);
@@ -4376,8 +4617,13 @@
       selected.push(row.index);
     };
     const latestResponse = scored.filter(row => Number(row.summary?.responseTurnMax || 0) > 0).sort((a, b) => Number(b.summary?.responseTurnMax || 0) - Number(a.summary?.responseTurnMax || 0))[0];
+    const latestStoryResponse = scored.filter(row => Number(row.summary?.responseStoryOrderMax || 0) > 0)
+      .sort((a, b) => Number(b.summary?.responseStoryOrderMax || 0) - Number(a.summary?.responseStoryOrderMax || 0))[0];
+    const latestState = scored.filter(row => Number(row.summary?.stateStoryOrderMax || 0) > 0)
+      .sort((a, b) => Number(b.summary?.stateStoryOrderMax || 0) - Number(a.summary?.stateStoryOrderMax || 0))[0];
+    add(latestStoryResponse);
     add(latestResponse);
-    if (queryType === QUERY_TYPES.STATE) add(scored.find(row => Number(row.summary?.stateFactCount || 0) > 0));
+    add(latestState);
     if (queryType === QUERY_TYPES.EVENT) add(scored.find(row => (row.summary?.sourceTypes || []).includes('episode_index')));
     scored.forEach(add);
     return { indexes: selected.sort((a, b) => a - b), fullScan: selected.length >= shardCount, reason: 'indexed_selection', shardCount, selected: selected.length };
@@ -4402,6 +4648,71 @@
       .filter(({ summary, index }) => index >= 0 && index < shardCount && Number(summary?.responseTurnMax || 0) === latest && latest > 0)
       .map(item => item.index)
       .slice(0, 3)
+      .sort((a, b) => a - b);
+  };
+
+  const currentSceneSourceShardIndexes = (manifest = {}, currentPairIndex = 0, settings = Runtime.settings || DEFAULTS) => {
+    if (settings.currentSceneTailEnabled === false) return [];
+    const shardCount = clampInt(manifest.shardCount, 0, 100000, 0);
+    const summaries = Array.isArray(manifest.shardSummaries) ? manifest.shardSummaries : [];
+    if (summaries.length !== shardCount || Number(manifest.shardIndexVersion || 0) < 1) return [];
+    const pairIndex = Number(currentPairIndex || 0) || 0;
+    const latestFinalizedTurn = pairIndex === 1
+      ? 0
+      : (pairIndex > 1 ? pairIndex - 1 : Number(manifest.responseTurnMax || 0) || 0);
+    const tailTurns = clampInt(
+      Math.max(
+        Number(settings.currentSceneTailTurns || DEFAULTS.currentSceneTailTurns),
+        Number(settings.currentSceneTailLimit || DEFAULTS.currentSceneTailLimit)
+      ),
+      1,
+      20,
+      DEFAULTS.currentSceneTailTurns
+    );
+    if (latestFinalizedTurn <= 0) {
+      if (Number(manifest.shardIndexVersion || 0) < FLASHBACK_SHARD_INDEX_VERSION) return [];
+      const inheritedRows = summaries.flatMap((summary, index) => {
+        const shardIndex = Number(summary?.shardIndex ?? index);
+        if (shardIndex < 0 || shardIndex >= shardCount) return [];
+        return (Array.isArray(summary?.inheritedStoryTurns) ? summary.inheritedStoryTurns : [])
+          .map(row => ({
+            shardIndex,
+            timelineKey: text(row?.timelineKey || ''),
+            turnKey: text(row?.turnKey || ''),
+            storyOrder: Number(row?.storyOrder || 0) || 0
+          }))
+          .filter(row => row.timelineKey && row.turnKey && row.storyOrder > 0);
+      });
+      if (!inheritedRows.length) return [];
+      const newest = inheritedRows.slice().sort((a, b) => (
+        b.storyOrder - a.storyOrder
+        || b.timelineKey.localeCompare(a.timelineKey)
+        || b.turnKey.localeCompare(a.turnKey)
+      ))[0];
+      const turnOrder = new Map();
+      for (const row of inheritedRows) {
+        if (row.timelineKey !== newest.timelineKey) continue;
+        turnOrder.set(row.turnKey, Math.max(turnOrder.get(row.turnKey) || 0, row.storyOrder));
+      }
+      const selectedTurnKeys = new Set(Array.from(turnOrder.entries())
+        .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+        .slice(-tailTurns)
+        .map(([turnKey]) => turnKey));
+      return Array.from(new Set(inheritedRows
+        .filter(row => row.timelineKey === newest.timelineKey && selectedTurnKeys.has(row.turnKey))
+        .map(row => row.shardIndex)))
+        .sort((a, b) => a - b);
+    }
+    const firstTailTurn = Math.max(1, latestFinalizedTurn - tailTurns + 1);
+    return Array.from(new Set(summaries
+      .map((summary, index) => ({ summary, index: Number(summary?.shardIndex ?? index) }))
+      .filter(({ summary, index }) => {
+        if (index < 0 || index >= shardCount) return false;
+        const min = Number(summary?.responseTurnMin || 0) || 0;
+        const max = Number(summary?.responseTurnMax || 0) || 0;
+        return min > 0 && max >= firstTailTurn && min <= latestFinalizedTurn;
+      })
+      .map(item => item.index)))
       .sort((a, b) => a - b);
   };
 
@@ -4648,13 +4959,31 @@
       : DEFAULTS.maxResponseItems;
     const protectedResponseRecords = responseRecords.filter(isPermanentSessionHistoryRecord);
     let ordinaryResponseRecords = responseRecords.filter(record => !isPermanentSessionHistoryRecord(record));
-    if (ordinaryResponseRecords.length > retentionLimit) {
-      ordinaryResponseRecords = ordinaryResponseRecords
-        .sort((a, b) => text(a.createdAt).localeCompare(text(b.createdAt)))
-        .slice(Math.max(0, ordinaryResponseRecords.length - retentionLimit));
+    const ordinaryTurnGroups = new Map();
+    for (const record of ordinaryResponseRecords) {
+      const groupKey = text(record.sourceHash || record.sourceId || `${record.turnIndex || 0}:${record.pairIndex || 0}:${record.id || record.hash || ''}`);
+      if (!ordinaryTurnGroups.has(groupKey)) ordinaryTurnGroups.set(groupKey, []);
+      ordinaryTurnGroups.get(groupKey).push(record);
+    }
+    if (ordinaryTurnGroups.size > retentionLimit) {
+      const retainedGroupKeys = new Set(
+        Array.from(ordinaryTurnGroups.entries())
+          .map(([key, group]) => ({
+            key,
+            order: group.reduce((max, record) => Math.max(max, parseTimeMs(record.updatedAt || record.createdAt)), 0),
+            turn: group.reduce((max, record) => Math.max(max, finiteTurnIndex(record)), 0)
+          }))
+          .sort((a, b) => a.order - b.order || a.turn - b.turn || a.key.localeCompare(b.key))
+          .slice(Math.max(0, ordinaryTurnGroups.size - retentionLimit))
+          .map(item => item.key)
+      );
+      ordinaryResponseRecords = ordinaryResponseRecords.filter(record => retainedGroupKeys.has(
+        text(record.sourceHash || record.sourceId || `${record.turnIndex || 0}:${record.pairIndex || 0}:${record.id || record.hash || ''}`)
+      ));
     }
     // Session-handoff history is a permanent archive. The live-response cap is
-    // intentionally applied only to this session's ordinary response records.
+    // intentionally applied only to complete live U+A source groups, never to
+    // individual chunks, so retention cannot leave a partial canonical turn.
     responseRecords = [...protectedResponseRecords, ...ordinaryResponseRecords];
     clean = [...derivedRecords, ...responseRecords]
       .map(record => ({
@@ -4688,7 +5017,12 @@
     const responseTurnStats = clean.reduce((acc, record) => {
       const type = record.sourceType === 'chat_turn' ? 'response' : record.sourceType;
       const turn = finiteTurnIndex(record);
-      if (type === 'response' && turn > 0 && !isInheritedScopeMemoryRecord(record, scope.scopeKey)) {
+      if (
+        type === 'response'
+        && turn > 0
+        && !isInheritedScopeMemoryRecord(record, scope.scopeKey)
+        && isRecallIndexableRecord(record)
+      ) {
         responseTurnKeys.add(responseTurnGroupKey(record));
         acc.max = Math.max(acc.max, turn);
       }
@@ -4703,7 +5037,7 @@
       count: clean.length,
       shardCount,
       shardSize,
-      shardIndexVersion: 1,
+      shardIndexVersion: FLASHBACK_SHARD_INDEX_VERSION,
       shardSummaries,
       commitId,
       nextId: Math.max(oldManifest.nextId || 1, maxNumericId + 1),
@@ -4732,7 +5066,8 @@
       episodeCount: oldManifest.episodeCount || 0,
       episodeChildCount: oldManifest.episodeChildCount || 0,
       turnWorldlineLiveHash: oldManifest.turnWorldlineLiveHash || '',
-      turnWorldlineRevision: oldManifest.turnWorldlineRevision || 0
+      turnWorldlineRevision: oldManifest.turnWorldlineRevision || 0,
+      turnWorldlineBindingPolicyVersion: oldManifest.turnWorldlineBindingPolicyVersion || 0
     };
     let savedManifest;
     try {
@@ -5187,6 +5522,20 @@
         await removeCommitShardSet(toScope.scopeKey, targetCommitId, sourceShardCount).catch(cleanupError => warn('empty clone shard cleanup failed', cleanupError));
         return { ok: false, skipped: true, reason: 'source_empty' };
       }
+      const copiedLiveTurnKeys = new Set();
+      let copiedLiveTurnMax = 0;
+      for (const record of copiedRecordList) {
+        const type = record.sourceType === 'chat_turn' ? 'response' : record.sourceType;
+        const turn = finiteTurnIndex(record);
+        if (
+          type !== 'response'
+          || turn <= 0
+          || isInheritedScopeMemoryRecord(record, toScope.scopeKey)
+          || !isRecallIndexableRecord(record)
+        ) continue;
+        copiedLiveTurnKeys.add(responseTurnGroupKey(record));
+        copiedLiveTurnMax = Math.max(copiedLiveTurnMax, turn);
+      }
       const manifest = {
         ...sourceManifest,
         scopeKey: toScope.scopeKey,
@@ -5204,12 +5553,12 @@
         permanentSessionHistoryCount: copiedRecordList.filter(isPermanentSessionHistoryRecord).length,
         shardCount: sourceShardCount,
         shardSize: sourceManifest.shardSize || DEFAULTS.shardSize,
-        shardIndexVersion: 1,
+        shardIndexVersion: FLASHBACK_SHARD_INDEX_VERSION,
         shardSummaries: clonedShardSummaries,
         commitId: targetCommitId,
         stats: statsForRecords(copiedRecordList),
-        responseTurnMax: sessionHandoff ? 0 : Math.max(0, Number(sourceManifest.responseTurnMax || 0) || 0),
-        responseTurnCount: sessionHandoff ? 0 : Math.max(0, Number(sourceManifest.responseTurnCount || 0) || 0),
+        responseTurnMax: copiedLiveTurnMax,
+        responseTurnCount: copiedLiveTurnKeys.size,
         episodeSourceDigest: sourceManifest.episodeSourceDigest || '',
         episodeIndexedAt: sourceManifest.episodeIndexedAt || '',
         episodeCount: Number(sourceManifest.episodeCount || 0) || 0,
@@ -5225,8 +5574,16 @@
         copyAdoptedCompleteAt: clonedAt,
         copyAdoptedComplete: true,
         copyAdoptionMode: cloneMode,
+        copyTransferId: sessionHandoff ? text(cloneMeta.transferId || '') : '',
+        copyTransferSchema: sessionHandoff && cloneMeta.transferId ? MEMORY_SESSION_BRIDGE_SCHEMA : '',
+        copySourceChatId: sessionHandoff ? text(cloneMeta.sourceChatId || fromScopeMeta.chatId || '') : '',
+        copyTargetChatId: sessionHandoff ? text(cloneMeta.targetChatId || toScope.chatId || '') : '',
+        copyExpectedRecordCount: sessionHandoff
+          ? Math.max(0, Number(cloneMeta.expectedRecordCount ?? copiedRecords) || 0)
+          : 0,
         turnWorldlineLiveHash: '',
-        turnWorldlineRevision: 0
+        turnWorldlineRevision: 0,
+        turnWorldlineBindingPolicyVersion: 0
       };
       await saveScopeManifest(manifest, toScope);
       // Both handoffs and native copies receive a fresh scope-local worldline.
@@ -5335,7 +5692,11 @@
       const cloned = await cloneScopeStorage(source.source, scope, settings, {
         reason: source.reason,
         mode: cloneMode,
-        weight: source.weight
+        weight: source.weight,
+        transferId: cloneMode === 'session_handoff' ? scope.bridgeHandoffTransferId : '',
+        sourceChatId: cloneMode === 'session_handoff' ? scope.bridgeHandoffSourceChatId : '',
+        targetChatId: cloneMode === 'session_handoff' ? scope.bridgeHandoffTargetChatId : '',
+        expectedRecordCount: cloneMode === 'session_handoff' ? scope.bridgeHandoffExpectedRecords : 0
       });
       if (cloned.ok) {
         const afterClone = await loadScopeRecords(scope.scopeKey);
@@ -5369,6 +5730,329 @@
     // scope registration, clone adoption, external retirement and worldline
     // reconciliation are deliberately kept on the request/capture paths.
     return scope;
+  };
+
+  const chatIdentityValues = (chat = {}) => uniqueTextList([
+    chat.id,
+    chat._id,
+    chat.uid,
+    chat.uuid,
+    chat.key,
+    chat.chatId,
+    chat.fileName,
+    chat.filename
+  ], 24);
+
+  const sessionHandoffTargetSnapshot = (snapshot = {}, targetChatId = '') => {
+    const wanted = text(targetChatId || '').trim();
+    if (!wanted) return null;
+    const refs = characterChatRefs(snapshot.character || {});
+    const matched = refs.find(item => chatIdentityValues(item?.chat || {}).includes(wanted));
+    if (!matched?.chat) return null;
+    const charIndex = Number.isFinite(Number(snapshot.chatInfo?.charIndex))
+      ? Number(snapshot.chatInfo.charIndex)
+      : Number.isFinite(Number(snapshot.characterInfo?.charIndex))
+        ? Number(snapshot.characterInfo.charIndex)
+        : -1;
+    return {
+      ...snapshot,
+      chat: matched.chat,
+      chatInfo: {
+        ...(snapshot.chatInfo || {}),
+        charIndex,
+        chatIndex: Number.isFinite(Number(matched.index)) ? Number(matched.index) : -1,
+        source: 'memory_bridge_target'
+      }
+    };
+  };
+
+  const handoffRecordIdentity = (record = {}) => stableHash(safeStringify([
+    text(record.id || ''),
+    text(record.hash || ''),
+    text(record.sourceHash || ''),
+    text(record.sourceId || ''),
+    normalizeDisplaySourceType(record.sourceType || record.type || ''),
+    Number(record.turnIndex || record.pairIndex || 0) || 0,
+    Number(record.chunkIndex || 0) || 0,
+    text(record.text || '')
+  ]));
+
+  const verifySessionHandoffRecords = (sourceRecords = [], targetRecords = [], sourceScopeKey = '') => {
+    const source = (Array.isArray(sourceRecords) ? sourceRecords : []).filter(isRetainedMemoryRecord);
+    const inherited = (Array.isArray(targetRecords) ? targetRecords : []).filter(record => {
+      const via = text(record?.inheritedViaScopeKey || '').trim();
+      const cloned = text(record?.clonedFromScopeKey || '').trim();
+      return via === sourceScopeKey || cloned === sourceScopeKey;
+    });
+    const sourceIds = source.map(handoffRecordIdentity).sort();
+    const inheritedIds = inherited.map(handoffRecordIdentity).sort();
+    const identityMatches = sourceIds.length === inheritedIds.length
+      && sourceIds.every((value, index) => value === inheritedIds[index]);
+    const protectionMatches = inherited.every(record => (
+      isPermanentSessionHistoryRecord(record)
+      && record.inheritedSessionHistory === true
+      && record.permanentSessionHistory === true
+      && record.orphanExempt === true
+      && record.retentionProtected === true
+      && record.deletionProtected === true
+      && text(record.historicalProtection || '') === PERMANENT_SESSION_HISTORY_PROTECTION
+    ));
+    return {
+      sourceRecords: source.length,
+      inheritedRecords: inherited.length,
+      identityMatches,
+      protectionMatches,
+      verified: identityMatches && protectionMatches
+    };
+  };
+
+  const adoptSessionHandoff = async (options = {}) => {
+    const expectedTargetChatId = text(options.targetChatId || '').trim();
+    const expectedTransferId = text(options.transferId || '').trim();
+    const requestedSourceScopeKey = text(options.sourceScopeKey || '').trim();
+    const requestedExpectedRecords = Object.prototype.hasOwnProperty.call(options, 'expectedRecords')
+      ? Math.max(0, Number(options.expectedRecords || 0) || 0)
+      : null;
+    const base = {
+      schema: 'flashback_memory.session_handoff_adoption.v2',
+      version: PLUGIN_VERSION,
+      available: true,
+      ok: false,
+      adopted: false,
+      verified: false,
+      durable: false,
+      targetChatId: expectedTargetChatId,
+      transferId: expectedTransferId,
+      sourceScopeKey: requestedSourceScopeKey,
+      targetScopeKey: '',
+      records: 0,
+      expectedRecords: requestedExpectedRecords ?? 0
+    };
+    if (!expectedTargetChatId || !expectedTransferId) {
+      return { ...base, reason: 'handoff_identity_incomplete' };
+    }
+
+    try {
+      const settings = await loadSettings();
+      const currentSnapshot = await loadRisuSnapshot(options.requestPermission === true);
+      const targetSnapshot = sessionHandoffTargetSnapshot(currentSnapshot, expectedTargetChatId);
+      if (!targetSnapshot) return { ...base, reason: 'target_chat_not_found' };
+      const targetScope = resolveScopeFromSnapshot(targetSnapshot);
+      const markerState = memorySessionBridgeMarker(targetSnapshot.chat || {}, targetScope.chatId);
+      const marker = markerState.marker || {};
+      const targetBase = {
+        ...base,
+        scopeKey: text(targetScope.scopeKey || ''),
+        targetScopeKey: text(targetScope.scopeKey || ''),
+        chatId: text(targetScope.chatId || ''),
+        targetChatId: text(markerState.targetChatId || expectedTargetChatId),
+        transferId: text(markerState.transferId || expectedTransferId)
+      };
+      if (!markerState.valid) return { ...targetBase, reason: markerState.reason };
+      if (markerState.targetChatId !== expectedTargetChatId) {
+        return { ...targetBase, reason: 'expected_target_mismatch' };
+      }
+      if (markerState.transferId !== expectedTransferId) {
+        return { ...targetBase, reason: 'expected_transfer_mismatch' };
+      }
+
+      const markerSourceScopeKey = text(marker.sourceFlashbackScopeKey || targetScope.copiedFromScopeKey || '').trim();
+      if (requestedSourceScopeKey && markerSourceScopeKey && requestedSourceScopeKey !== markerSourceScopeKey) {
+        return { ...targetBase, sourceScopeKey: markerSourceScopeKey, reason: 'expected_source_scope_mismatch' };
+      }
+      const sourceScopeKey = requestedSourceScopeKey || markerSourceScopeKey;
+      if (!sourceScopeKey || sourceScopeKey === targetScope.scopeKey) {
+        return { ...targetBase, sourceScopeKey, reason: 'source_scope_invalid' };
+      }
+
+      const markerExpectedRecords = Math.max(0, Number(marker.flashbackRecordCount || 0) || 0);
+      if (requestedExpectedRecords != null
+        && markerExpectedRecords > 0
+        && requestedExpectedRecords !== markerExpectedRecords) {
+        return {
+          ...targetBase,
+          sourceScopeKey,
+          records: 0,
+          expectedRecords: markerExpectedRecords,
+          reason: 'expected_record_count_mismatch'
+        };
+      }
+
+      const sourceLoaded = await loadScopeRecords(sourceScopeKey);
+      assertCompleteScopeLoad(sourceLoaded, 'session handoff source verification');
+      const sourceManifest = sourceLoaded.manifest || {};
+      const sourceRecords = Array.isArray(sourceLoaded.records) ? sourceLoaded.records : [];
+      const expectedRecords = requestedExpectedRecords != null
+        ? requestedExpectedRecords
+        : (markerExpectedRecords || sourceRecords.length);
+      const sourceCountMatches = sourceRecords.length === expectedRecords;
+      const sourceChatMatches = !sourceManifest.chatId
+        || !markerState.sourceChatId
+        || text(sourceManifest.chatId) === text(markerState.sourceChatId);
+      const actorMatches = (
+        (!sourceManifest.characterId || !targetScope.characterId
+          || text(sourceManifest.characterId) === text(targetScope.characterId))
+        && (!sourceManifest.personaId || !targetScope.personaId
+          || text(sourceManifest.personaId) === text(targetScope.personaId))
+      );
+      if (!sourceCountMatches) {
+        return {
+          ...targetBase,
+          sourceScopeKey,
+          records: sourceRecords.length,
+          expectedRecords,
+          reason: 'source_record_count_mismatch'
+        };
+      }
+      if (!sourceChatMatches || !actorMatches) {
+        return {
+          ...targetBase,
+          sourceScopeKey,
+          records: sourceRecords.length,
+          expectedRecords,
+          reason: !sourceChatMatches ? 'source_chat_mismatch' : 'source_actor_mismatch'
+        };
+      }
+      if (expectedRecords <= 0) {
+        return {
+          ...targetBase,
+          ok: true,
+          verified: true,
+          durable: true,
+          sourceScopeKey,
+          records: 0,
+          expectedRecords: 0,
+          reason: 'session_handoff_empty'
+        };
+      }
+
+      let targetLoaded = await loadScopeRecords(targetScope.scopeKey);
+      assertCompleteScopeLoad(targetLoaded, 'session handoff target verification');
+      const targetManifestBefore = targetLoaded.manifest || {};
+      const targetHasRecords = targetLoaded.records.length > 0
+        || Number(targetManifestBefore.shardCount || 0) > 0
+        || targetManifestBefore.copyAdoptedComplete === true;
+      let cloned = null;
+      if (!targetHasRecords) {
+        cloned = await cloneScopeStorage(sourceManifest, targetScope, settings, {
+          mode: 'session_handoff',
+          reason: 'memory_bridge_explicit_adoption',
+          transferId: expectedTransferId,
+          sourceChatId: markerState.sourceChatId,
+          targetChatId: expectedTargetChatId,
+          expectedRecordCount: expectedRecords
+        });
+        if (cloned?.ok !== true) {
+          return {
+            ...targetBase,
+            sourceScopeKey,
+            records: 0,
+            expectedRecords,
+            reason: text(cloned?.reason || 'session_handoff_clone_failed')
+          };
+        }
+        targetLoaded = await loadScopeRecords(targetScope.scopeKey);
+        assertCompleteScopeLoad(targetLoaded, 'session handoff committed readback');
+      }
+
+      let targetManifest = targetLoaded.manifest || {};
+      const existingTransferId = text(targetManifest.copyTransferId || '').trim();
+      if (existingTransferId && existingTransferId !== expectedTransferId) {
+        return {
+          ...targetBase,
+          sourceScopeKey,
+          records: targetLoaded.records.length,
+          expectedRecords,
+          reason: 'target_transfer_conflict'
+        };
+      }
+      const recordVerification = verifySessionHandoffRecords(
+        sourceRecords,
+        targetLoaded.records,
+        sourceScopeKey
+      );
+      const manifestMatches = targetManifest.copyAdoptedComplete === true
+        && targetManifest.copyAdoptionMode === 'session_handoff'
+        && text(targetManifest.copiedFromScopeKey || '') === sourceScopeKey;
+      if (!manifestMatches || !recordVerification.verified) {
+        return {
+          ...targetBase,
+          sourceScopeKey,
+          records: recordVerification.inheritedRecords,
+          expectedRecords,
+          reason: !manifestMatches
+            ? 'target_manifest_not_handoff'
+            : !recordVerification.identityMatches
+              ? 'target_record_identity_mismatch'
+              : 'target_history_protection_mismatch',
+          diagnostics: recordVerification
+        };
+      }
+
+      const receiptMatches = existingTransferId === expectedTransferId
+        && text(targetManifest.copySourceChatId || '') === text(markerState.sourceChatId)
+        && text(targetManifest.copyTargetChatId || '') === expectedTargetChatId
+        && Number(targetManifest.copyExpectedRecordCount || 0) === expectedRecords;
+      if (!receiptMatches) {
+        targetManifest = await saveScopeManifest({
+          ...targetManifest,
+          copyTransferId: expectedTransferId,
+          copyTransferSchema: MEMORY_SESSION_BRIDGE_SCHEMA,
+          copySourceChatId: markerState.sourceChatId,
+          copyTargetChatId: expectedTargetChatId,
+          copyExpectedRecordCount: expectedRecords
+        }, targetScope);
+      }
+
+      const durableLoaded = await loadScopeRecords(targetScope.scopeKey);
+      assertCompleteScopeLoad(durableLoaded, 'session handoff durable receipt verification');
+      const durableManifest = durableLoaded.manifest || {};
+      const durableRecords = verifySessionHandoffRecords(
+        sourceRecords,
+        durableLoaded.records,
+        sourceScopeKey
+      );
+      const durable = durableRecords.verified
+        && durableManifest.copyAdoptedComplete === true
+        && durableManifest.copyAdoptionMode === 'session_handoff'
+        && text(durableManifest.copiedFromScopeKey || '') === sourceScopeKey
+        && text(durableManifest.copyTransferId || '') === expectedTransferId
+        && text(durableManifest.copySourceChatId || '') === text(markerState.sourceChatId)
+        && text(durableManifest.copyTargetChatId || '') === expectedTargetChatId
+        && Number(durableManifest.copyExpectedRecordCount || 0) === expectedRecords;
+      const result = {
+        ...targetBase,
+        ok: durable,
+        adopted: cloned?.ok === true,
+        verified: durable,
+        durable,
+        sourceScopeKey,
+        sourceChatId: markerState.sourceChatId,
+        records: durableRecords.inheritedRecords,
+        expectedRecords,
+        copyAdoptionMode: text(durableManifest.copyAdoptionMode || ''),
+        copyAdoptedComplete: durableManifest.copyAdoptedComplete === true,
+        reason: durable
+          ? (cloned?.ok === true ? 'session_handoff_adopted' : 'session_handoff_already_adopted')
+          : 'session_handoff_durable_readback_failed',
+        diagnostics: durableRecords
+      };
+      if (result.adopted) {
+        pushActivityLog('session_handoff_adopted', 'Bridge session history was adopted.', {
+          scopeKey: result.targetScopeKey,
+          sourceScopeKey: result.sourceScopeKey,
+          records: result.records,
+          transferId: result.transferId
+        }, 'success');
+      }
+      return result;
+    } catch (error) {
+      return {
+        ...base,
+        reason: text(error?.code || 'session_handoff_adoption_failed'),
+        error: formatErrorMessage(error, 700)
+      };
+    }
   };
 
   const loadAllRecords = async (scopeOverride = null) => {
@@ -5407,28 +6091,467 @@
     };
   };
 
-  const splitTextIntoChunks = (value, maxChars = DEFAULTS.chunkChars, overlap = DEFAULTS.chunkOverlap) => {
+  const NARRATIVE_SENTENCE_TERMINATORS = new Set(['.', '!', '?', '。', '！', '？', '…']);
+  const NARRATIVE_SENTENCE_CLOSERS = new Set([
+    '"', "'", '”', '’', '»', '›', '」', '』', '】', '〕', '〉', '》', ')', ']', '}'
+  ]);
+  const NARRATIVE_CJK_SENTENCE_CLOSERS = new Set(['」', '』', '】', '〕', '〉', '》']);
+  const NARRATIVE_ROLE_OR_SEPARATOR_LINE_RE = /^(?:User|Assistant)\s*:?\s*$|^---+\s*$/i;
+  const NARRATIVE_DOT_ABBREVIATION_RE = /^(?:[A-Za-z]|(?:[A-Za-z]\.)+[A-Za-z]?|Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|No|Fig|Eq|vs|etc|e\.g|i\.e)$/i;
+  const NARRATIVE_ALWAYS_CONTINUE_ABBREVIATION_RE = /^(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|No|Fig|Eq)$/i;
+  const NARRATIVE_SENTENCE_STARTER_RE = /^(?:I|We|He|She|They|It|The|Then|This|That|These|Those|Meanwhile|However|But|And)\b/i;
+
+  const narrativeProtectedSpans = (value = '') => {
+    const body = text(value);
+    const spans = [];
+    const collect = (pattern, kind) => {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(body))) {
+        const start = Number(match.index || 0);
+        const end = start + text(match[0]).length;
+        if (end > start) {
+          const raw = text(match[0]);
+          const atomic = kind !== 'tag'
+            || /^<\s*(?:img|image|audio|video|source|br|hr|statusData)\b/i.test(raw)
+            || /\/>\s*$/u.test(raw);
+          spans.push({ start, end, kind, atomic });
+        }
+        if (match[0] === '') pattern.lastIndex += 1;
+      }
+    };
+    collect(/```[\s\S]*?(?:```|$)/g, 'fence');
+    collect(/~~~[\s\S]*?(?:~~~|$)/g, 'fence');
+    collect(/\{\{[\s\S]*?(?:\}\}|$)/g, 'annotation');
+    collect(/<[^>\n]*(?:>|$)/g, 'tag');
+    spans.sort((a, b) => a.start - b.start || b.end - a.end);
+    const merged = [];
+    for (const span of spans) {
+      const previous = merged[merged.length - 1];
+      if (!previous || span.start >= previous.end) {
+        merged.push({ ...span });
+        continue;
+      }
+      previous.end = Math.max(previous.end, span.end);
+      if (previous.kind === 'tag' && span.kind !== 'tag') previous.kind = span.kind;
+      previous.atomic = previous.atomic || span.atomic;
+    }
+    return merged;
+  };
+
+  const narrativeStructuralRoleMarkers = (value = '', protectedSpans = null) => {
+    const body = text(value);
+    const spans = Array.isArray(protectedSpans) ? protectedSpans : narrativeProtectedSpans(body);
+    return Array.from(body.matchAll(/(?:^|\n)(User|Assistant):[ \t]*\n?/g))
+      .map(match => {
+        const matchStart = Number(match.index || 0);
+        const start = matchStart + (text(match[0]).startsWith('\n') ? 1 : 0);
+        return {
+          start,
+          end: matchStart + text(match[0]).length,
+          role: text(match[1]).toLowerCase()
+        };
+      })
+      .filter(marker => !spans.some(span => marker.start >= span.start && marker.start < span.end));
+  };
+
+  const stripNarrativeStructuralRoleMarkers = (value = '', roles = null) => {
+    const body = text(value);
+    const allowed = roles instanceof Set ? roles : new Set(Array.isArray(roles) ? roles : ['user', 'assistant']);
+    const markers = narrativeStructuralRoleMarkers(body).filter(marker => allowed.has(marker.role));
+    if (!markers.length) return body;
+    let out = '';
+    let cursor = 0;
+    for (const marker of markers) {
+      out += body.slice(cursor, marker.start);
+      cursor = marker.end;
+    }
+    return out + body.slice(cursor);
+  };
+
+  const stripNarrativeSeparatorLines = (value = '') => {
+    const body = text(value);
+    const protectedSpans = narrativeProtectedSpans(body);
+    const matches = Array.from(body.matchAll(/(?:^|\n)---[ \t]*(?=\n|$)/g))
+      .map(match => {
+        const matchStart = Number(match.index || 0);
+        const start = matchStart + (text(match[0]).startsWith('\n') ? 1 : 0);
+        return { start, end: matchStart + text(match[0]).length };
+      })
+      .filter(marker => !protectedSpans.some(span => marker.start >= span.start && marker.start < span.end));
+    if (!matches.length) return body;
+    let out = '';
+    let cursor = 0;
+    for (const marker of matches) {
+      out += body.slice(cursor, marker.start);
+      cursor = marker.end;
+    }
+    return out + body.slice(cursor);
+  };
+
+  const narrativeDotContinuesToken = (body, dotIndex, lineStart = 0) => {
+    const previous = body[dotIndex - 1] || '';
+    const next = body[dotIndex + 1] || '';
+    if (/\d/.test(previous) && /\d/.test(next)) return true;
+    let tokenStart = dotIndex;
+    while (tokenStart > lineStart && /[\p{L}\p{N}.]/u.test(body[tokenStart - 1] || '')) tokenStart -= 1;
+    const token = body.slice(tokenStart, dotIndex);
+    if (NARRATIVE_DOT_ABBREVIATION_RE.test(token)) {
+      if (NARRATIVE_ALWAYS_CONTINUE_ABBREVIATION_RE.test(token)) return true;
+      const tail = body.slice(dotIndex + 1);
+      if (!tail) return false;
+      if (!/^\s/u.test(tail)) return true;
+      const nextWord = tail.match(/^\s+([^\s]+)/u)?.[1] || '';
+      if (!nextWord) return false;
+      const initialism = /^(?:[A-Za-z]\.)+[A-Za-z]?$/u.test(token);
+      if (initialism) return !NARRATIVE_SENTENCE_STARTER_RE.test(nextWord);
+      return !/^(?:\p{Lu}|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}])/u.test(nextWord);
+    }
+    const linePrefix = body.slice(lineStart, tokenStart);
+    if (/^\s*(?:[-*+]\s*)?$/.test(linePrefix) && /^\d+$/.test(token)) {
+      const after = body.slice(dotIndex + 1).match(/^\s+(\S)/u);
+      if (after?.[1]) return true;
+    }
+    return false;
+  };
+
+  const trimNarrativeSpan = (body, start, end) => {
+    let left = Math.max(0, Number(start || 0) || 0);
+    let right = Math.min(body.length, Math.max(left, Number(end || 0) || 0));
+    while (left < right && /\s/u.test(body[left])) left += 1;
+    while (right > left && /\s/u.test(body[right - 1])) right -= 1;
+    return { start: left, end: right };
+  };
+
+  const previousNarrativeGraphemeBoundary = (body, desired, minimum = 0) => {
+    const min = Math.max(0, Math.min(body.length, Number(minimum || 0) || 0));
+    const target = Math.max(min + 1, Math.min(body.length, Number(desired || 0) || 0));
+    try {
+      if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
+        const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+        let best = min;
+        for (const segment of segmenter.segment(body.slice(min, Math.min(body.length, target + 16)))) {
+          const boundary = min + Number(segment.index || 0);
+          if (boundary > target) break;
+          if (boundary > best) best = boundary;
+        }
+        if (best > min) return best;
+      }
+    } catch (_) {}
+    const codePointAt = index => {
+      const codePoint = body.codePointAt(index);
+      if (!Number.isFinite(codePoint)) return null;
+      return { codePoint, char: String.fromCodePoint(codePoint), length: codePoint > 0xFFFF ? 2 : 1 };
+    };
+    const isRegional = codePoint => codePoint >= 0x1F1E6 && codePoint <= 0x1F1FF;
+    const isExtender = item => !!item && (
+      /\p{M}/u.test(item.char)
+      || item.codePoint === 0xFE0E
+      || item.codePoint === 0xFE0F
+      || (item.codePoint >= 0x1F3FB && item.codePoint <= 0x1F3FF)
+      || (item.codePoint >= 0xE0020 && item.codePoint <= 0xE007F)
+    );
+    let cursor = min;
+    let best = min;
+    while (cursor < body.length) {
+      const first = codePointAt(cursor);
+      if (!first) break;
+      cursor += first.length;
+      if (isRegional(first.codePoint)) {
+        const paired = codePointAt(cursor);
+        if (paired && isRegional(paired.codePoint)) cursor += paired.length;
+      }
+      while (isExtender(codePointAt(cursor))) cursor += codePointAt(cursor).length;
+      while (codePointAt(cursor)?.codePoint === 0x200D) {
+        cursor += codePointAt(cursor).length;
+        const joined = codePointAt(cursor);
+        if (!joined) break;
+        cursor += joined.length;
+        while (isExtender(codePointAt(cursor))) cursor += codePointAt(cursor).length;
+      }
+      if (cursor > target) return best > min ? best : cursor;
+      best = cursor;
+      if (cursor === target) return cursor;
+    }
+    return best > min ? best : Math.min(body.length, min + 1);
+  };
+
+  const scanNarrativeUnits = (value = '') => {
     const body = text(value).replace(/\r\n/g, '\n').trim();
-    if (!body) return [];
+    if (!body) return { body: '', units: [] };
+    const protectedSpans = narrativeProtectedSpans(body);
+    const roleMarkers = narrativeStructuralRoleMarkers(body, protectedSpans);
+    const roleStartMap = new Map(roleMarkers.map(marker => [marker.start, marker.role]));
+    const boundaries = [{ index: 0, type: 'start' }];
+    const addBoundary = (index, type) => {
+      const normalized = Math.max(0, Math.min(body.length, Number(index || 0) || 0));
+      const previous = boundaries[boundaries.length - 1];
+      if (normalized <= Number(previous?.index || 0)) {
+        if (normalized === Number(previous?.index || 0) && previous?.type === 'line' && type === 'paragraph') previous.type = type;
+        return;
+      }
+      boundaries.push({ index: normalized, type });
+    };
+    let spanIndex = 0;
+    let lineStart = 0;
+    let index = 0;
+    while (index < body.length) {
+      if (roleStartMap.has(index)) addBoundary(index, 'role');
+      while (spanIndex < protectedSpans.length && protectedSpans[spanIndex].end <= index) spanIndex += 1;
+      const protectedSpan = protectedSpans[spanIndex];
+      if (protectedSpan && index >= protectedSpan.start && index < protectedSpan.end) {
+        if (protectedSpan.atomic && index === protectedSpan.start) addBoundary(protectedSpan.start, `${protectedSpan.kind}_start`);
+        index = protectedSpan.end;
+        if (protectedSpan.atomic) addBoundary(index, protectedSpan.kind);
+        continue;
+      }
+      const char = body[index];
+      if (char === '\n') {
+        let end = index + 1;
+        while (end < body.length && body[end] === '\n') end += 1;
+        const line = body.slice(lineStart, index).trim();
+        if (!NARRATIVE_ROLE_OR_SEPARATOR_LINE_RE.test(line)) {
+          addBoundary(end, end - index >= 2 ? 'paragraph' : 'line');
+        }
+        lineStart = end;
+        index = end;
+        continue;
+      }
+      if (NARRATIVE_SENTENCE_TERMINATORS.has(char)) {
+        if (char === '.' && narrativeDotContinuesToken(body, index, lineStart)) {
+          index += 1;
+          continue;
+        }
+        let end = index + 1;
+        while (end < body.length && NARRATIVE_SENTENCE_TERMINATORS.has(body[end])) end += 1;
+        let cjkCloser = false;
+        let curvedEastAsianCloser = false;
+        while (end < body.length && NARRATIVE_SENTENCE_CLOSERS.has(body[end])) {
+          if (NARRATIVE_CJK_SENTENCE_CLOSERS.has(body[end])) cjkCloser = true;
+          if (body[end] === '”' || body[end] === '’') curvedEastAsianCloser = true;
+          end += 1;
+        }
+        if (
+          curvedEastAsianCloser
+          && /^(?:\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana})/u.test(body.slice(end))
+        ) cjkCloser = true;
+        const cjkBoundary = ['。', '！', '？'].includes(char) || cjkCloser;
+        if (end >= body.length || /\s/u.test(body[end] || '') || cjkBoundary) addBoundary(end, 'sentence');
+        index = Math.max(index + 1, end);
+        continue;
+      }
+      index += 1;
+    }
+    addBoundary(body.length, 'end');
+    const units = [];
+    let activeRole = '';
+    let roleIndex = 0;
+    for (let i = 1; i < boundaries.length; i += 1) {
+      const rawStart = boundaries[i - 1].index;
+      const rawEnd = boundaries[i].index;
+      while (roleIndex < roleMarkers.length && roleMarkers[roleIndex].start <= rawStart) {
+        activeRole = roleMarkers[roleIndex].role;
+        roleIndex += 1;
+      }
+      if (!body.slice(rawStart, rawEnd).trim()) {
+        // Whitespace is part of the authoritative narrative too. Attach a
+        // separator-only span to the preceding unit so adjacent unit offsets
+        // remain contiguous and overlap=0 can reproduce the source byte-for-byte.
+        const previous = units[units.length - 1];
+        if (previous) {
+          previous.end = rawEnd;
+          previous.boundaryType = boundaries[i].type || previous.boundaryType;
+        }
+        continue;
+      }
+      units.push({
+        start: rawStart,
+        end: rawEnd,
+        boundaryType: boundaries[i].type || 'unknown',
+        hardSplit: false,
+        role: activeRole
+      });
+    }
+    return { body, units };
+  };
+
+  const narrativeFallbackCut = (body, start, desired, minimum, protectedSpans = []) => {
+    const insideProtected = index => protectedSpans.some(span => index > span.start && index < span.end);
+    const find = predicate => {
+      for (let index = desired; index >= minimum; index -= 1) {
+        if (insideProtected(index)) continue;
+        if (predicate(index)) return index;
+      }
+      return 0;
+    };
+    const paragraph = find(index => body.slice(Math.max(start, index - 2), index) === '\n\n');
+    if (paragraph) return { index: paragraph, type: 'hard_paragraph' };
+    const line = find(index => body[index - 1] === '\n');
+    if (line) return { index: line, type: 'hard_line' };
+    const clause = find(index => /[,;:，；：、—–]/u.test(body[index - 1] || ''));
+    if (clause) return { index: clause, type: 'hard_clause' };
+    const whitespace = find(index => /\s/u.test(body[index - 1] || ''));
+    if (whitespace) return { index: whitespace, type: 'hard_space' };
+    return {
+      index: previousNarrativeGraphemeBoundary(body, desired, minimum),
+      type: 'hard_grapheme'
+    };
+  };
+
+  const splitOversizedNarrativeUnit = (body, unit, max) => {
+    if (unit.end - unit.start <= max) return [unit];
+    const protectedSpans = narrativeProtectedSpans(body);
+    const atomicSpan = protectedSpans.find(span => span.atomic && span.start === unit.start && span.end === unit.end);
+    if (atomicSpan && unit.end - unit.start <= 12000) {
+      return [{
+        ...unit,
+        boundaryType: `oversize_${atomicSpan.kind}`,
+        oversizeAtomic: true,
+        hardSplit: false
+      }];
+    }
+    const out = [];
+    let cursor = unit.start;
+    while (unit.end - cursor > max) {
+      const desired = Math.min(unit.end, cursor + max);
+      const minimum = Math.min(desired - 1, cursor + Math.max(1, Math.floor(max * 0.45)));
+      const cut = narrativeFallbackCut(body, cursor, desired, minimum, protectedSpans);
+      const end = Math.max(cursor + 1, Math.min(unit.end, cut.index));
+      if (body.slice(cursor, end).trim()) {
+        out.push({
+          start: cursor,
+          end,
+          boundaryType: cut.type,
+          hardSplit: true,
+          oversizeAtomic: false,
+          role: unit.role || ''
+        });
+      }
+      cursor = end;
+    }
+    if (body.slice(cursor, unit.end).trim()) {
+      out.push({
+        start: cursor,
+        end: unit.end,
+        boundaryType: unit.boundaryType,
+        hardSplit: true,
+        oversizeAtomic: false,
+        role: unit.role || ''
+      });
+    }
+    return out;
+  };
+
+  const splitNarrativeUnits = (value = '', maxChars = DEFAULTS.chunkChars) => {
+    const scanned = scanNarrativeUnits(value);
+    if (!scanned.body) return scanned;
+    const max = clampInt(maxChars, 80, 12000, DEFAULTS.chunkChars);
+    return {
+      body: scanned.body,
+      units: scanned.units.flatMap(unit => splitOversizedNarrativeUnit(scanned.body, unit, max))
+    };
+  };
+
+  const splitTextIntoChunkDescriptors = (value, maxChars = DEFAULTS.chunkChars, overlap = DEFAULTS.chunkOverlap) => {
     const max = clampInt(maxChars, 240, 12000, DEFAULTS.chunkChars);
     const ov = Math.min(clampInt(overlap, 0, Math.floor(max / 2), DEFAULTS.chunkOverlap), Math.floor(max / 2));
-    if (body.length <= max) return [body];
+    const segmented = splitNarrativeUnits(value, max);
+    const body = segmented.body;
+    const units = segmented.units;
+    if (!body || !units.length) return [];
+    if (body.length <= max) {
+      const roles = new Set(units.map(unit => unit.role).filter(Boolean));
+      return [{
+        text: body,
+        sourceStart: 0,
+        sourceEnd: body.length,
+        novelStart: 0,
+        boundaryType: 'end',
+        hardSplit: false,
+        oversizeAtomic: false,
+        overlapUnitCount: 0,
+        chunkRole: roles.size === 1 ? Array.from(roles)[0] : 'turn_pair',
+        chunkSchemaVersion: NARRATIVE_CHUNK_SCHEMA_VERSION
+      }];
+    }
     const chunks = [];
-    let start = 0;
-    while (start < body.length) {
-      let end = Math.min(body.length, start + max);
-      if (end < body.length) {
-        const slice = body.slice(start, end);
-        const paragraph = Math.max(slice.lastIndexOf('\n\n'), slice.lastIndexOf('\n'), slice.lastIndexOf('. '), slice.lastIndexOf('。'), slice.lastIndexOf('다.'));
-        if (paragraph > max * 0.45) end = start + paragraph + 1;
+    let unitIndex = 0;
+    let carriedUnits = 0;
+    let coveredEnd = 0;
+    while (unitIndex < units.length) {
+      const chunkUnitStart = unitIndex;
+      let chunkUnitEnd = unitIndex;
+      let rawStart = units[chunkUnitStart].start;
+      let rawEnd = rawStart;
+      while (chunkUnitEnd < units.length) {
+        const candidateEnd = units[chunkUnitEnd].end;
+        if (
+          chunkUnitEnd > chunkUnitStart
+          && units[chunkUnitEnd].role
+          && units[chunkUnitStart].role
+          && units[chunkUnitEnd].role !== units[chunkUnitStart].role
+        ) break;
+        if (chunkUnitEnd > chunkUnitStart && candidateEnd - rawStart > max) break;
+        rawEnd = candidateEnd;
+        chunkUnitEnd += 1;
+        if (rawEnd - rawStart >= max) break;
       }
-      const chunk = body.slice(start, end).trim();
-      if (chunk) chunks.push(chunk);
-      if (end >= body.length) break;
-      start = Math.max(end - ov, start + 1);
+      if (chunkUnitEnd <= chunkUnitStart) {
+        chunkUnitEnd = chunkUnitStart + 1;
+        rawEnd = units[chunkUnitStart].end;
+      }
+      const chunkUnits = units.slice(chunkUnitStart, chunkUnitEnd);
+      const chunkText = body.slice(rawStart, rawEnd);
+      const madeProgress = rawEnd > coveredEnd;
+      if (chunkText && madeProgress) {
+        chunks.push({
+          text: chunkText,
+          sourceStart: rawStart,
+          sourceEnd: rawEnd,
+          novelStart: Math.max(rawStart, coveredEnd),
+          boundaryType: chunkUnits[chunkUnits.length - 1]?.boundaryType || 'unknown',
+          hardSplit: chunkUnits.some(unit => unit.hardSplit),
+          oversizeAtomic: chunkUnits.some(unit => unit.oversizeAtomic),
+          overlapUnitCount: carriedUnits,
+          chunkRole: chunkUnits[0]?.role || 'turn_pair',
+          chunkSchemaVersion: NARRATIVE_CHUNK_SCHEMA_VERSION
+        });
+        coveredEnd = Math.max(coveredEnd, rawEnd);
+      }
+      if (chunkUnitEnd >= units.length) break;
+      if (!madeProgress) {
+        carriedUnits = 0;
+        unitIndex = chunkUnitEnd;
+        continue;
+      }
+      let overlapStart = chunkUnitEnd;
+      if (ov > 0) {
+        const nextRole = units[chunkUnitEnd]?.role || '';
+        for (let cursor = chunkUnitEnd - 1; cursor > chunkUnitStart; cursor -= 1) {
+          if (nextRole && units[cursor]?.role && units[cursor].role !== nextRole) break;
+          const overlapChars = units[chunkUnitEnd - 1].end - units[cursor].start;
+          if (overlapChars > ov) break;
+          overlapStart = cursor;
+        }
+      }
+      if (overlapStart <= chunkUnitStart || overlapStart >= chunkUnitEnd) {
+        carriedUnits = 0;
+        unitIndex = chunkUnitEnd;
+      } else {
+        carriedUnits = chunkUnitEnd - overlapStart;
+        unitIndex = overlapStart;
+      }
     }
     return chunks;
   };
+
+  const splitTextIntoChunks = (value, maxChars = DEFAULTS.chunkChars, overlap = DEFAULTS.chunkOverlap) =>
+    splitTextIntoChunkDescriptors(value, maxChars, overlap).map(chunk => chunk.text);
+  Object.defineProperties(splitTextIntoChunks, {
+    descriptors: { value: splitTextIntoChunkDescriptors, enumerable: false },
+    units: { value: splitNarrativeUnits, enumerable: false },
+    schemaVersion: { value: NARRATIVE_CHUNK_SCHEMA_VERSION, enumerable: false }
+  });
 
   const makeRecordId = (manifest, index = 0) => `vrm_${(manifest.nextId || 1) + index}`;
 
@@ -5476,7 +6599,8 @@
         recoveredVisibleResponse: sourceMetadata.recoveredVisibleResponse === true || extractedMetadata.recoveredVisibleResponse === true,
         removedHtmlCommentCount: Number(sourceMetadata.removedHtmlCommentCount || 0) + Number(extractedMetadata.removedHtmlCommentCount || 0)
       };
-      const chunks = splitTextIntoChunks(body, cfg.chunkChars, cfg.chunkOverlap);
+      const chunkDescriptors = splitTextIntoChunkDescriptors(body, cfg.chunkChars, cfg.chunkOverlap);
+      const chunks = chunkDescriptors.map(chunk => chunk.text);
       const sourceMessageIds = uniqueTextList(source.sourceMessageIds || source.meta?.sourceMessageIds || [], 32);
       const sourceTurnIndex = Number.isFinite(Number(source.turnIndex ?? source.meta?.turnIndex)) ? Number(source.turnIndex ?? source.meta?.turnIndex) : 0;
       const userMessagePosition = Number.isFinite(Number(source.userMessagePosition ?? source.meta?.userMessagePosition)) ? Number(source.userMessagePosition ?? source.meta?.userMessagePosition) : 0;
@@ -5492,9 +6616,20 @@
         : [];
       for (let i = 0; i < chunks.length; i += 1) {
         const chunk = chunks[i];
-        if (isLowValueMemoryChunk(chunk, source)) continue;
+        const chunkDescriptor = chunkDescriptors[i] || {};
+        const lowValueChunk = isLowValueMemoryChunk(chunk, source);
         const entityAnchors = Array.from(extractEntityAnchors(`${source.title || source.name || ''}\n${Array.isArray(source.tags) ? source.tags.join(' ') : ''}\n${chunk}`, 80));
-        const structuredStateFacts = i === 0 ? sourceStateFacts : [];
+        const chunkSourceStart = Math.max(0, Number(chunkDescriptor.sourceStart || 0) || 0);
+        const chunkSourceEnd = Math.max(chunkSourceStart, Number(chunkDescriptor.sourceEnd || 0) || 0);
+        const chunkNovelStart = Math.max(chunkSourceStart, Math.min(chunkSourceEnd, Number(chunkDescriptor.novelStart ?? chunkSourceStart) || chunkSourceStart));
+        const visibleStateFacts = cfg.structuredStateEnabled
+          ? visibleContinuityFactsFromText(body.slice(chunkNovelStart, chunkSourceEnd), {
+            turn: turnIndex,
+            role: chunkDescriptor.chunkRole || 'turn_pair',
+            sourceStart: chunkNovelStart
+          })
+          : [];
+        const structuredStateFacts = [...(i === 0 ? sourceStateFacts : []), ...visibleStateFacts];
         const structuredStateAnchors = structuredStateFacts.flatMap(fact => [fact.entity, fact.peer]).filter(Boolean);
         for (const anchor of structuredStateAnchors) {
           const normalized = normalizeStateEntity(anchor);
@@ -5517,6 +6652,16 @@
           sourceChars: body.length,
           chunkIndex: i,
           chunkCount: chunks.length,
+          chunkSchemaVersion: NARRATIVE_CHUNK_SCHEMA_VERSION,
+          chunkSourceStart,
+          chunkSourceEnd,
+          chunkNovelStart,
+          chunkBoundaryType: compact(chunkDescriptor.boundaryType || 'unknown', 40),
+          chunkHardSplit: chunkDescriptor.hardSplit === true,
+          chunkOversizeAtomic: chunkDescriptor.oversizeAtomic === true,
+          chunkOverlapUnitCount: Math.max(0, Number(chunkDescriptor.overlapUnitCount || 0) || 0),
+          chunkRole: ['user', 'assistant', 'turn_pair'].includes(chunkDescriptor.chunkRole) ? chunkDescriptor.chunkRole : 'turn_pair',
+          lowValueChunk,
           entityAnchors,
           stateUpdate,
           stateAnchors: stateUpdate ? entityAnchors.slice(0, 32) : [],
@@ -5552,6 +6697,16 @@
       sourceChars: draft.sourceChars,
       chunkIndex: draft.chunkIndex,
       chunkCount: draft.chunkCount,
+      chunkSchemaVersion: draft.chunkSchemaVersion,
+      chunkSourceStart: draft.chunkSourceStart,
+      chunkSourceEnd: draft.chunkSourceEnd,
+      chunkNovelStart: draft.chunkNovelStart,
+      chunkBoundaryType: draft.chunkBoundaryType,
+      chunkHardSplit: !!draft.chunkHardSplit,
+      chunkOversizeAtomic: !!draft.chunkOversizeAtomic,
+      chunkOverlapUnitCount: draft.chunkOverlapUnitCount,
+      chunkRole: draft.chunkRole,
+      lowValueChunk: !!draft.lowValueChunk,
       entityAnchors: draft.entityAnchors,
       stateUpdate: !!draft.stateUpdate,
       stateAnchors: draft.stateAnchors,
@@ -5917,11 +7072,9 @@
     }
     for (const group of groups.values()) {
       group.records.sort((a, b) => Number(a.chunkIndex || 0) - Number(b.chunkIndex || 0) || text(a.id).localeCompare(text(b.id)));
-      let body = '';
-      for (const record of group.records) body = mergeOverlappedText(body, record.text || '');
-      group.text = body;
-      group.userText = userTextFromStoredResponseBody(body);
-      group.assistantText = assistantTextFromStoredResponseBody(body);
+      group.text = reconstructChunkGroupText(group.records);
+      group.userText = userTextFromStoredResponseBody(group.text);
+      group.assistantText = assistantTextFromStoredResponseBody(group.text);
       group.logicalTurnId = text(group.records[0]?.logicalTurnId || '');
       group.variantId = text(group.records[0]?.variantId || '');
       group.turnNodeId = text(group.records[0]?.turnNodeId || '');
@@ -6007,10 +7160,20 @@
     }, scopeKey);
     return { worldline, descriptors };
   };
+  const sameFlashbackWorldlineUserText = (left = '', right = '') => {
+    const normalize = value => canonicalTurnCompareText(canonicalChatUserText(value))
+      .replace(/\s+---\s*$/g, '')
+      .trim();
+    const a = normalize(left);
+    const b = normalize(right);
+    return !!a && !!b && a === b;
+  };
   const flashbackGroupMatchesPair = (group, pair) => {
     if (!group?.assistantText || !pair?.assistantText) return false;
-    const userMatches = !group.userText || !pair.userText || samePairUserText(group.userText, pair.userText);
-    return userMatches && sameTurnText(group.assistantText, pair.assistantText);
+    const userMatches = !group.userText
+      || !pair.userText
+      || sameFlashbackWorldlineUserText(group.userText, pair.userText);
+    return userMatches && sameMaintenanceTurnText(group.assistantText, pair.assistantText);
   };
   const annotateWorldlineRecords = (records, node, status = 'active') => (records || []).map(record => ({
     ...record,
@@ -6027,11 +7190,17 @@
     const normalizedLive = conversationStateWithIndexes(liveState);
     const liveHash = flashbackLiveWorldlineHash(scope.scopeKey, normalizedLive);
     const manifest = await loadScopeManifest(scope.scopeKey);
-    if (manifest.turnWorldlineLiveHash === liveHash) return { changed: false, reason: 'worldline_current', liveHash };
+    if (manifest.turnWorldlineLiveHash === liveHash
+      && manifest.turnWorldlineBindingPolicyVersion >= TURN_WORLDLINE_BINDING_POLICY_VERSION) {
+      return { changed: false, reason: 'worldline_current', liveHash };
+    }
     const cfg = settings || await loadSettings();
     const result = await withScopeWriteLock(scope.scopeKey, async () => {
       const currentManifest = await loadScopeManifest(scope.scopeKey);
-      if (currentManifest.turnWorldlineLiveHash === liveHash) return { changed: false, reason: 'worldline_current', liveHash };
+      if (currentManifest.turnWorldlineLiveHash === liveHash
+        && currentManifest.turnWorldlineBindingPolicyVersion >= TURN_WORLDLINE_BINDING_POLICY_VERSION) {
+        return { changed: false, reason: 'worldline_current', liveHash };
+      }
       const [loaded, storedWorldline] = await Promise.all([loadScopeRecords(scope.scopeKey), loadTurnWorldline(scope.scopeKey)]);
       assertCompleteScopeLoad(loaded, 'turn worldline synchronization');
       const reconciled = reconcileFlashbackTurnWorldline(storedWorldline, scope.scopeKey, normalizedLive);
@@ -6076,12 +7245,23 @@
       const usedActive = new Set();
       const restoredKeys = new Set();
       const nextResponses = [];
+      let activeLineageChanges = 0;
       for (const descriptor of reconciled.descriptors) {
         const pairIndex = descriptor.identity.pairIndex;
         const active = activeGroups.find(group => !usedActive.has(group.key) && group.turnIndex === pairIndex && flashbackGroupMatchesPair(group, descriptor.pair));
         if (active) {
           usedActive.add(active.key);
-          nextResponses.push(...annotateWorldlineRecords(active.records, descriptor.node, 'active'));
+          const annotated = annotateWorldlineRecords(active.records, descriptor.node, 'active');
+          activeLineageChanges += annotated.filter((record, index) => {
+            const previous = active.records[index] || {};
+            return record.turnNodeId !== previous.turnNodeId
+              || record.logicalTurnId !== previous.logicalTurnId
+              || record.variantId !== previous.variantId
+              || record.parentTurnNodeId !== previous.parentTurnNodeId
+              || record.lifecycleStatus !== previous.lifecycleStatus
+              || text(record.retiredAt || '') !== text(previous.retiredAt || '');
+          }).length;
+          nextResponses.push(...annotated);
           continue;
         }
         const retired = retiredGroups.find(group => !restoredKeys.has(group.key) && group.turnIndex === pairIndex && flashbackGroupMatchesPair(group, descriptor.pair));
@@ -6103,10 +7283,15 @@
         ...timelineRetiredRecords.filter(record => !restoredRecordKeys.has(text(record.id || record.hash || ''))),
         ...newlyRetired
       ];
-      const responseChanged = recoveredInheritedRecords > 0 || normalizedInheritedRecords > 0 || newlyRetired.length > 0 || restoredKeys.size > 0 || activeGroups.some(group => {
-        const first = group.records[0] || {};
-        return usedActive.has(group.key) && (!first.turnNodeId || first.lifecycleStatus !== 'active');
-      });
+      const responseChanged = recoveredInheritedRecords > 0
+        || normalizedInheritedRecords > 0
+        || newlyRetired.length > 0
+        || restoredKeys.size > 0
+        || activeLineageChanges > 0
+        || activeGroups.some(group => {
+          const first = group.records[0] || {};
+          return usedActive.has(group.key) && (!first.turnNodeId || first.lifecycleStatus !== 'active');
+        });
       let saved = { manifest: currentManifest, records: loaded.records };
       if (responseChanged) {
         const nonResponse = loaded.records.filter(record => !isResponseMemoryRecord(record) && !(record.autoEpisode || record.sourceType === 'episode_index'));
@@ -6116,7 +7301,8 @@
       const savedManifest = await saveScopeManifest({
         ...saved.manifest,
         turnWorldlineLiveHash: worldline.liveHash,
-        turnWorldlineRevision: worldline.revision
+        turnWorldlineRevision: worldline.revision,
+        turnWorldlineBindingPolicyVersion: TURN_WORLDLINE_BINDING_POLICY_VERSION
       }, scope);
       return {
         changed: true,
@@ -6128,6 +7314,7 @@
         orphanedNodes: worldline.nodes.filter(node => node.status === 'orphaned').length,
         retiredRecords: worldline.retiredRecords.length,
         newlyRetiredRecords: newlyRetired.length,
+        activeLineageChanges,
         restoredRecords: restoredRecordKeys.size,
         recoveredInheritedRecords,
         normalizedInheritedRecords,
@@ -6315,23 +7502,79 @@
     return `${a}\n${b}`;
   };
 
+  const reconstructChunkGroupText = (records = []) => {
+    const ordered = (Array.isArray(records) ? records : [])
+      .slice()
+      .sort((a, b) => Number(a.chunkIndex || 0) - Number(b.chunkIndex || 0) || text(a.id).localeCompare(text(b.id)));
+    const offsetsReady = ordered.length > 0 && ordered.every(record => {
+      const start = Number(record.chunkSourceStart);
+      const end = Number(record.chunkSourceEnd);
+      const novel = Number(record.chunkNovelStart);
+      const body = text(record.text || '');
+      return recordNarrativeChunkVersion(record) >= NARRATIVE_CHUNK_SCHEMA_VERSION
+        && Number.isFinite(start)
+        && Number.isFinite(end)
+        && Number.isFinite(novel)
+        && start >= 0
+        && end >= start
+        && novel >= start
+        && novel <= end
+        && body.length === end - start;
+    });
+    if (offsetsReady) {
+      let body = '';
+      let cursor = 0;
+      let valid = true;
+      for (const record of ordered) {
+        const start = Number(record.chunkSourceStart);
+        const end = Number(record.chunkSourceEnd);
+        const novel = Number(record.chunkNovelStart);
+        if (start > cursor || novel > cursor || end < cursor) {
+          valid = false;
+          break;
+        }
+        if (end === cursor) continue;
+        const appendStart = Math.max(cursor, start, novel);
+        body += text(record.text || '').slice(appendStart - start, end - start);
+        cursor = end;
+      }
+      const expectedChars = Math.max(0, ...ordered.map(record => Number(record.sourceChars || 0) || 0));
+      if (valid && body && (!expectedChars || body.length === expectedChars)) return body;
+    }
+    let fallback = '';
+    for (const record of ordered) fallback = mergeOverlappedText(fallback, record.text || '');
+    return fallback;
+  };
+
   const assistantTextFromStoredResponseBody = (body = '') => {
     const source = text(body || '').replace(/\r\n/g, '\n');
-    const matches = Array.from(source.matchAll(/(?:^|\n)Assistant:\s*\n?/g));
-    if (!matches.length) return canonicalChatResponseText(source);
-    const last = matches[matches.length - 1];
-    return canonicalChatResponseText(source.slice((last.index || 0) + last[0].length));
+    const markers = narrativeStructuralRoleMarkers(source);
+    if (!markers.some(marker => marker.role === 'assistant')) return canonicalChatResponseText(source);
+    const fragments = [];
+    for (let index = 0; index < markers.length; index += 1) {
+      const marker = markers[index];
+      if (marker.role !== 'assistant') continue;
+      const end = index + 1 < markers.length ? markers[index + 1].start : source.length;
+      const fragment = canonicalChatResponseText(source.slice(marker.end, end));
+      if (fragment) fragments.push(fragment);
+    }
+    return fragments.join('\n\n');
   };
 
   const userTextFromStoredResponseBody = (body = '') => {
     const source = text(body || '').replace(/\r\n/g, '\n');
-    const userMatches = Array.from(source.matchAll(/(?:^|\n)User:\s*\n?/g));
-    if (!userMatches.length) return '';
-    const assistantMatches = Array.from(source.matchAll(/(?:^|\n)Assistant:\s*\n?/g));
-    const assistantStart = assistantMatches.length ? Number(assistantMatches[assistantMatches.length - 1].index || 0) : source.length;
-    const user = userMatches.slice().reverse().find(match => Number(match.index || 0) < assistantStart) || userMatches[userMatches.length - 1];
-    const start = Number(user.index || 0) + user[0].length;
-    return canonicalChatUserText(source.slice(start, assistantStart).replace(/(?:^|\n)\s*---\s*$/g, ''));
+    const markers = narrativeStructuralRoleMarkers(source);
+    if (!markers.some(marker => marker.role === 'user')) return '';
+    const firstAssistantStart = markers.find(marker => marker.role === 'assistant')?.start ?? source.length;
+    const fragments = [];
+    for (let index = 0; index < markers.length; index += 1) {
+      const marker = markers[index];
+      if (marker.role !== 'user' || marker.start >= firstAssistantStart) continue;
+      const end = index + 1 < markers.length ? Math.min(markers[index + 1].start, firstAssistantStart) : firstAssistantStart;
+      const fragment = canonicalChatUserText(stripNarrativeSeparatorLines(source.slice(marker.end, end)));
+      if (fragment) fragments.push(fragment);
+    }
+    return fragments.join('\n\n');
   };
 
   const buildResponseTurnGroups = (records = []) => {
@@ -6357,8 +7600,7 @@
     }
     for (const group of groups.values()) {
       group.records.sort((a, b) => Number(a.chunkIndex || 0) - Number(b.chunkIndex || 0) || text(a.id).localeCompare(text(b.id)));
-      let body = '';
-      for (const record of group.records) body = mergeOverlappedText(body, record.text || '');
+      const body = reconstructChunkGroupText(group.records);
       group.userText = userTextFromStoredResponseBody(body);
       group.assistantText = assistantTextFromStoredResponseBody(body);
     }
@@ -6893,12 +8135,14 @@
     if (!records.length) throw new Error('현재 채팅에서 재구축 가능한 응답 기억을 만들지 못했습니다.');
     const previous = await loadScopeRecordsRaw(scope.scopeKey);
     assertNoForeignScopeCollision(previous.manifest, 'full chat rebuild');
+    const protectedHistory = previous.records.filter(isPermanentSessionHistoryRecord);
+    const replacementRecords = [...protectedHistory, ...records];
     const saved = await withScopeWriteLock(scope.scopeKey, async () => {
       // A clean lineage is safe even if the following commit fails: the active
       // live chat can reconstruct it, whereas stale retired branches must not be
       // allowed to re-enter a successful rebuild.
       await saveTurnWorldline(scope.scopeKey, emptyTurnWorldline(scope.scopeKey));
-      const committed = await saveScopeRecords(scope, records, rebuildSettings, scope);
+      const committed = await saveScopeRecords(scope, replacementRecords, rebuildSettings, scope);
       return committed;
     });
     const liveState = liveChatStateFromSnapshot(snapshot);
@@ -6912,6 +8156,7 @@
       liveChatChats: 1,
       liveChatTurns: sources.length,
       chunks: records.length,
+      protectedHistoryRecords: protectedHistory.length,
       replacedRecords: previous.records.length,
       total: saved.records.length,
       episode,
@@ -6962,6 +8207,7 @@
   const responseRecordsForEpisodeIndex = (records = [], settings = Runtime.settings || DEFAULTS) => buildStoredTurnVectorGroups(records
     .filter(record => (record.sourceType === 'chat_turn' ? 'response' : record.sourceType) === 'response')
     .filter(record => !isInheritedScopeMemoryRecord(record))
+    .filter(isRecallIndexableRecord)
     .filter(record => Array.isArray(record.vector) && record.vector.length && sanitizeAssistantForMemory(record.text, { stripRolePrefix: false }) && !isOwnInjection(record.text)))
     .map(group => {
       const first = group.records[0] || {};
@@ -6989,34 +8235,172 @@
     .filter(record => record.vector.length && record.text)
     .sort(responseRecordSort);
 
+  const EPISODE_BOUNDARY_SCHEMA_VERSION = 2;
+
   const episodeSourceDigestForRecords = (records = [], settings = Runtime.settings || DEFAULTS) => stableHash(responseRecordsForEpisodeIndex(records, settings)
     .map(record => [record.id, record.hash, record.sourceHash, finiteTurnIndex(record), record.provider, record.model, record.dim, record.updatedAt || record.createdAt].map(item => text(item || '')).join('\t'))
+    .concat([`boundary-schema:${EPISODE_BOUNDARY_SCHEMA_VERSION}`])
     .join('\n'));
+
+  const sceneHeadingFromText = (value = '') => {
+    const body = sanitizeAssistantForMemory(value, { stripRolePrefix: false });
+    const matches = body.match(/^(?:#{1,4}\s*)?(?:(?:볼륨|챕터|장면|막)\s*[^\r\n]{0,100}|(?:volume|chapter|scene|act)\s*[^\r\n]{0,100}|(?:章|場面|幕)\s*[^\r\n]{0,100})$/gimu);
+    return normalizeForLexical(matches?.[matches.length - 1] || '');
+  };
+
+  const explicitSceneTransitionSignals = (value = '') => {
+    const body = sanitizeAssistantForMemory(value, { stripRolePrefix: false });
+    const reasons = [];
+    if (/(?:몇\s*(?:시간|일|주|달|년)\s*(?:뒤|후)|잠시\s*후|이튿날|다음\s*날|그날\s*(?:밤|아침)|한편[,，]?|meanwhile|(?:hours?|days?|weeks?|months?|years?)\s+later|the\s+next\s+day|翌日|数時間後|数日後|与此同时|几(?:小时|天|周|个月|年)后)/iu.test(body)) reasons.push('explicit_time_jump');
+    if (/(?:회상이?\s*(?:시작|끝나|종료)|과거로\s*(?:돌아|넘어)|현재로\s*(?:돌아|복귀)|flashback|back\s+to\s+the\s+present|回想(?:が)?始|現在に戻|回忆开始|回到现在)/iu.test(body)) reasons.push('flashback_transition');
+    if (/(?:\bPOV\b|시점|視点|视角)\s*(?::|：|전환|변경|change|switch|転換|切替)/iu.test(body)) reasons.push('pov_transition');
+    if (/(?:(?:에|으로)\s*(?:도착했|도착했다|들어섰|들어갔|이동했|향했다)|(?:에서|을|를)\s*(?:떠났|나섰|빠져나왔)|\b(?:arrived\s+(?:at|in)|entered|moved\s+to|left|departed)\b|(?:に|へ)(?:到着した|入った|移動した)|(?:を|から)(?:出た|離れた)|(?:到达|进入|移动到|离开))/iu.test(body)) reasons.push('explicit_location_transition');
+    return reasons;
+  };
+
+  const sceneTransitionSignals = (previous = {}, current = {}, settings = Runtime.settings || DEFAULTS) => {
+    const threshold = clampNumber(settings.episodeBoundarySimilarity, -1, 1, DEFAULTS.episodeBoundarySimilarity);
+    const reasons = explicitSceneTransitionSignals(current.text || '');
+    const previousHeading = sceneHeadingFromText(previous.text || '');
+    const currentHeading = sceneHeadingFromText(current.text || '');
+    if (currentHeading && currentHeading !== previousHeading) reasons.push('heading_changed');
+    const comparable = recordVectorsComparable(previous, current, settings);
+    const similarity = comparable ? dot(previous.vector, current.vector) : null;
+    if (comparable && similarity < threshold) reasons.push('embedding_discontinuity');
+    if (!comparable) reasons.push('embedding_unavailable');
+    const previousEntities = recordEntityAnchorSet(previous);
+    const currentEntities = recordEntityAnchorSet(current);
+    const entityUnion = new Set([...previousEntities, ...currentEntities]);
+    const entityOverlap = entityUnion.size
+      ? Array.from(previousEntities).filter(entity => currentEntities.has(entity)).length / entityUnion.size
+      : 1;
+    if (previousEntities.size >= 2 && currentEntities.size >= 2 && entityOverlap < 0.2) reasons.push('participant_shift');
+    const hardReasons = new Set(['explicit_time_jump', 'flashback_transition', 'pov_transition', 'heading_changed', 'explicit_location_transition']);
+    const hard = reasons.some(reason => hardReasons.has(reason));
+    const narrativeReasons = reasons.filter(reason => !['embedding_discontinuity', 'embedding_unavailable', 'participant_shift'].includes(reason));
+    const soft = (
+      reasons.includes('explicit_location_transition')
+      || (reasons.includes('embedding_discontinuity') && narrativeReasons.length >= 1)
+      || narrativeReasons.length >= 2
+    );
+    return {
+      boundary: hard || soft,
+      hard,
+      soft,
+      reasons: Array.from(new Set(reasons)),
+      similarity,
+      vectorComparable: comparable,
+      entityOverlap
+    };
+  };
+
+  const currentSceneTurnKeysForRecords = (records = [], settings = Runtime.settings || DEFAULTS) => {
+    const responseRecords = (records || []).filter(record => isResponseMemoryRecord(record) && !(record.autoEpisode || record.sourceType === 'episode_index'));
+    const live = responseRecords.filter(record => !isInheritedScopeMemoryRecord(record));
+    let pool = live.length ? live : responseRecords.filter(record => isInheritedScopeMemoryRecord(record));
+    if (!pool.length) return new Set();
+    if (!live.length) {
+      const newest = pool.slice().sort((a, b) => storyOrderValue(b) - storyOrderValue(a))[0];
+      const latestTimeline = storyTimelineKey(newest);
+      pool = pool.filter(record => storyTimelineKey(record) === latestTimeline);
+    }
+    const groups = new Map();
+    for (const record of pool) {
+      const key = text(record.sourceHash || record.sourceId || storyTurnKey(record));
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(record);
+    }
+    const turns = Array.from(groups.values()).map(group => {
+      const ordered = group.slice().sort((a, b) => Number(a.chunkIndex || 0) - Number(b.chunkIndex || 0));
+      const first = ordered[0] || {};
+      const compatible = compatibleRecordVectorGroup(ordered, settings);
+      return {
+        ...first,
+        text: reconstructChunkGroupText(ordered),
+        vector: centroidForVectors(compatible.records.map(record => record.vector)),
+        provider: compatible.provider || first.provider,
+        model: compatible.model || first.model,
+        dim: compatible.dim || Number(first.dim || 0),
+        turnKey: storyTurnKey(first)
+      };
+    }).sort(responseRecordSort);
+    if (!turns.length) return new Set();
+    const maxSceneTurns = clampInt(
+      Math.max(
+        Number(settings.currentSceneTailTurns || DEFAULTS.currentSceneTailTurns),
+        Number(settings.currentSceneTailLimit || DEFAULTS.currentSceneTailLimit)
+      ),
+      1,
+      Math.max(1, Number(settings.episodeMaxRecords || DEFAULTS.episodeMaxRecords)),
+      DEFAULTS.currentSceneTailLimit
+    );
+    const selected = [turns[turns.length - 1]];
+    for (let index = turns.length - 2; index >= 0 && selected.length < maxSceneTurns; index -= 1) {
+      const previous = turns[index];
+      const current = turns[index + 1];
+      if (sceneTransitionSignals(previous, current, settings).boundary) break;
+      selected.unshift(previous);
+    }
+    return new Set(selected.map(turn => turn.turnKey));
+  };
 
   const detectEpisodeBoundaries = (turnRecords = [], settings = Runtime.settings || DEFAULTS) => {
     if (!turnRecords.length) return [];
-    const threshold = clampNumber(settings.episodeBoundarySimilarity, -1, 1, DEFAULTS.episodeBoundarySimilarity);
+    const minRecords = clampInt(settings.episodeMinRecords, 1, 40, DEFAULTS.episodeMinRecords);
     const maxRecords = clampInt(settings.episodeMaxRecords, 2, 120, DEFAULTS.episodeMaxRecords);
     const boundaries = [0];
+    const diagnostics = new Map([[0, { reasons: ['start'], hard: true }]]);
     let spanStart = 0;
     for (let i = 1; i < turnRecords.length; i += 1) {
       const prev = turnRecords[i - 1];
       const curr = turnRecords[i];
-      const sameVectorSpace = recordVectorsComparable(prev, curr, settings);
-      const sim = sameVectorSpace ? dot(prev.vector, curr.vector) : -1;
-      if (!sameVectorSpace || sim < threshold || (i - spanStart) >= maxRecords) {
+      const transition = sceneTransitionSignals(prev, curr, settings);
+      const forcedMax = (i - spanStart) >= maxRecords;
+      const softAllowed = transition.hard || (i - spanStart) >= minRecords;
+      if (forcedMax || (transition.boundary && softAllowed)) {
         boundaries.push(i);
+        diagnostics.set(i, {
+          reasons: forcedMax ? [...transition.reasons, 'max_records'] : transition.reasons,
+          hard: forcedMax || transition.hard,
+          similarity: transition.similarity,
+          vectorComparable: transition.vectorComparable
+        });
         spanStart = i;
       }
     }
     boundaries.push(turnRecords.length);
+    try { Object.defineProperty(boundaries, 'diagnostics', { value: diagnostics, enumerable: false, configurable: true }); } catch (_) {}
     return boundaries;
   };
 
+  const joinNarrativeItemsWithinBudget = (items = [], maxChars = 0, separator = '\n') => {
+    const max = Math.max(1, Number(maxChars || 0) || 1);
+    const out = [];
+    let length = 0;
+    for (const raw of items || []) {
+      const item = text(raw || '').trim();
+      if (!item) continue;
+      const added = (out.length ? separator.length : 0) + item.length;
+      if (length + added > max) {
+        if (!out.length) {
+          const fitted = fitNarrativeTextToBudget(item, max);
+          if (fitted) out.push(fitted);
+        }
+        break;
+      }
+      out.push(item);
+      length += added;
+    }
+    return out.join(separator);
+  };
+
   const firstSnippet = (value = '') => {
-    const clean = sanitizeAssistantForMemory(value, { stripRolePrefix: true }).replace(/^(?:User|Assistant):\s*/gim, '').trim();
-    const sentence = clean.split(/(?<=[.!?。！？…])\s+|\n+/u).map(part => part.trim()).find(Boolean) || clean;
-    return compact(sentence, 220);
+    const clean = stripNarrativeSeparatorLines(stripNarrativeStructuralRoleMarkers(
+      sanitizeAssistantForMemory(value, { stripRolePrefix: false })
+    )).trim();
+    const segmented = splitNarrativeUnits(clean, 220);
+    const sentence = segmented.units.map(unit => segmented.body.slice(unit.start, unit.end).trim()).find(Boolean) || clean;
+    return fitNarrativeTextToBudget(sentence, 220);
   };
 
   const isEpisodeMetaSentence = (sentence = '') => /<statusData|Thoughts|Reasoning|HAYAKU|schema|prompt|template|metadata|statusData|chain[_ -]?of[_ -]?thought/i.test(sentence);
@@ -7034,17 +8418,19 @@
   };
 
   const bestEpisodeSnippet = (record = {}) => {
-    const clean = sanitizeAssistantForMemory(record.text, { stripRolePrefix: true }).replace(/^(?:User|Assistant):\s*/gim, '').trim();
+    const clean = stripNarrativeSeparatorLines(stripNarrativeStructuralRoleMarkers(
+      sanitizeAssistantForMemory(record.text, { stripRolePrefix: false })
+    )).trim();
     if (!clean) return '';
-    const sentences = clean
-      .split(/(?<=[.!?。！？…])\s+|\n+/u)
-      .map(part => part.trim())
+    const segmented = splitNarrativeUnits(clean, 260);
+    const sentences = segmented.units
+      .map(unit => segmented.body.slice(unit.start, unit.end).trim())
       .filter(part => part && !isEpisodeMetaSentence(part));
     const anchors = Array.from(recordEntityAnchorSet(record));
     const best = (sentences.length ? sentences : [clean])
       .map(sentence => ({ sentence, score: scoreSentenceForEpisode(sentence, anchors) }))
       .sort((a, b) => b.score - a.score || b.sentence.length - a.sentence.length)[0];
-    return compact(best?.sentence || firstSnippet(clean), 260);
+    return fitNarrativeTextToBudget(best?.sentence || firstSnippet(clean), 260);
   };
 
   const averageRecordVector = (records = [], settings = Runtime.settings || DEFAULTS) => {
@@ -7071,7 +8457,13 @@
       const start = boundaries[i];
       const end = boundaries[i + 1];
       const children = turns.slice(start, end);
-      if (children.length < minRecords) continue;
+      const boundaryInfo = boundaries.diagnostics instanceof Map ? boundaries.diagnostics.get(start) : null;
+      const endBoundaryInfo = boundaries.diagnostics instanceof Map ? boundaries.diagnostics.get(end) : null;
+      const hardBoundedShortScene = (
+        (start > 0 && boundaryInfo?.hard === true)
+        || (end < turns.length && endBoundaryInfo?.hard === true)
+      );
+      if (children.length < minRecords && !hardBoundedShortScene) continue;
       const vector = averageRecordVector(children, settings);
       if (!vector.length) continue;
       const vectorSpace = recordVectorSpace(children[0], settings);
@@ -7082,7 +8474,11 @@
       const turnStart = finiteTurnIndex(children[0]);
       const turnEnd = finiteTurnIndex(children[children.length - 1]) || turnStart;
       const importance = clampNumber(children.reduce((max, record) => Math.max(max, Number(record.importanceScore ?? computeImportanceDensity(sanitizeAssistantForMemory(record.text, { stripRolePrefix: false }))) || 0), 0), 0, 1, 0);
-      const body = compact(snippets.join(' / ') || children.map(record => firstSnippet(record.title || record.text)).filter(Boolean).join(' / '), 2400);
+      const body = joinNarrativeItemsWithinBudget(
+        snippets.length ? snippets : children.map(record => firstSnippet(record.title || record.text)).filter(Boolean),
+        2400,
+        ' / '
+      );
       out.push({
         schema: 'vector_rag_memory.record.v2',
         id: `episode_${stableHash(`${scope.scopeKey}\n${sourceHash}`)}`,
@@ -7095,6 +8491,11 @@
         tags: ['episode_index', 'response_centroid'],
         autoEpisode: true,
         episodeLevel: 'scene',
+        sceneId: `scene_${stableHash(`${scope.scopeKey}\n${sourceHash}\n${turnStart}`)}`,
+        episodeBoundarySchemaVersion: EPISODE_BOUNDARY_SCHEMA_VERSION,
+        boundaryBeforeReasons: Array.isArray(boundaryInfo?.reasons) ? boundaryInfo.reasons.slice(0, 12) : (start === 0 ? ['start'] : []),
+        boundaryConfidence: boundaryInfo?.hard ? 1 : (boundaryInfo ? 0.72 : 0),
+        forcedBoundary: boundaryInfo?.hard === true,
         episodeIndex: out.length + 1,
         turnRange: { start: turnStart, end: turnEnd },
         childIds,
@@ -7136,7 +8537,7 @@
         const lastTurn = Number(children[children.length - 1]?.turnRange?.end || 0) || firstTurn;
         const childIds = children.map(record => record.id).filter(Boolean);
         const sourceHash = stableHash(children.map(record => record.sourceHash || record.hash || record.id).join('\n'));
-        const body = compact(children.map(record => record.text).filter(Boolean).join(' || '), 3200);
+        const body = joinNarrativeItemsWithinBudget(children.map(record => record.text).filter(Boolean), 3200, ' || ');
         const importance = clampNumber(children.reduce((max, record) => Math.max(max, Number(record.importanceScore || 0) || 0), 0), 0, 1, 0);
         out.push({
           schema: 'vector_rag_memory.record.v2',
@@ -7150,6 +8551,7 @@
           tags: ['episode_index', 'session_centroid', 'extractive_hierarchy'],
           autoEpisode: true,
           episodeLevel: 'session',
+          episodeBoundarySchemaVersion: EPISODE_BOUNDARY_SCHEMA_VERSION,
           episodeIndex: parentNo,
           turnRange: { start: firstTurn, end: lastTurn },
           childIds,
@@ -7316,18 +8718,154 @@
     const property = normalizeStateProperty(fact.property ?? fact.propertyKey ?? fact.predicate ?? fallback.property ?? '');
     const value = stateFactText(fact.value ?? fact.object ?? fact.text ?? fallback.value, 280);
     if (!entity || !property || !value) return null;
+    const evidenceText = text(fact.evidenceText ?? fact.evidence ?? fallback.evidenceText ?? '')
+      .replace(/\r\n/g, '\n')
+      .trim()
+      .slice(0, 1400);
+    const authority = compact(fact.authority || fallback.authority || 'SOURCE_EVIDENCE', 60);
+    const evidenceOffsetsInvalidated = fact.evidenceOffsetsInvalidated === true || fallback.evidenceOffsetsInvalidated === true;
     return {
       entity,
       property,
       value,
       turn: Math.max(0, Number(fact.turn ?? fact.turnIndex ?? fallback.turn ?? 0) || 0),
       confidence: clampNumber(fact.confidence ?? fallback.confidence, 0, 1, 0.8),
-      authority: compact(fact.authority || fallback.authority || 'SOURCE_EVIDENCE', 60),
+      authority,
       evidenceType: compact(fact.evidenceType || fallback.evidenceType || 'structured_metadata', 80),
+      operation: normalizeChoice(fact.operation || fallback.operation, ['set', 'clear'], 'set'),
+      evidenceText,
+      renderable: !evidenceOffsetsInvalidated
+        && (fact.renderable === true || (fact.renderable !== false && !!evidenceText && authority !== 'CURRENT_USER_OVERLAY')),
+      evidenceStart: Math.max(0, Number(fact.evidenceStart ?? fallback.evidenceStart ?? 0) || 0),
+      evidenceEnd: Math.max(0, Number(fact.evidenceEnd ?? fallback.evidenceEnd ?? 0) || 0),
+      evidenceOffsetsInvalidated,
       ...(fact.peer || fact.relatedEntity ? { peer: normalizeStateEntity(fact.peer || fact.relatedEntity) } : {})
     };
   };
 
+  const visibleContinuityFactsFromText = (value = '', options = {}) => {
+    const rawSource = text(value);
+    if (!rawSource.trim() || text(options.role || '').toLowerCase() === 'user') return [];
+    // State evidence offsets must address the authoritative stored U+A text.
+    // Normalize CRLF for sentence scanning while keeping a boundary map back to
+    // the original JavaScript string offsets.
+    let source = '';
+    const normalizedToRaw = [0];
+    for (let rawIndex = 0; rawIndex < rawSource.length;) {
+      if (rawSource[rawIndex] === '\r' && rawSource[rawIndex + 1] === '\n') {
+        source += '\n';
+        rawIndex += 2;
+      } else {
+        source += rawSource[rawIndex];
+        rawIndex += 1;
+      }
+      normalizedToRaw.push(rawIndex);
+    }
+    const requestedRole = text(options.role || '').toLowerCase();
+    const protectedSpans = narrativeProtectedSpans(source);
+    const nonNarrativeStateSpans = protectedSpans.filter(span => span.kind === 'fence' || span.kind === 'annotation');
+    const structuralMarkers = narrativeStructuralRoleMarkers(source, protectedSpans);
+    const assistantRanges = [];
+    if (requestedRole === 'assistant') {
+      const leadingMarker = structuralMarkers.find(marker => (
+        marker.role === 'assistant'
+        && !source.slice(0, marker.start).trim()
+      ));
+      assistantRanges.push({ start: leadingMarker ? leadingMarker.end : 0, end: source.length });
+    } else if (structuralMarkers.length) {
+      let activeRole = '';
+      let cursor = 0;
+      for (const marker of structuralMarkers) {
+        if (activeRole === 'assistant' && marker.start > cursor) assistantRanges.push({ start: cursor, end: marker.start });
+        activeRole = marker.role;
+        cursor = marker.end;
+      }
+      if (activeRole === 'assistant' && cursor < source.length) assistantRanges.push({ start: cursor, end: source.length });
+    } else {
+      assistantRanges.push({ start: 0, end: source.length });
+    }
+    if (!assistantRanges.length) return [];
+    const out = [];
+    let activeEntity = '';
+    const activeEntityByProperty = new Map();
+    const resolveActor = (candidate = '', property = '') => {
+      const explicit = normalizeStateEntity(candidate);
+      const normalizedProperty = normalizeStateProperty(property || '__generic__');
+      if (explicit && !explicit.startsWith('@')) {
+        activeEntity = explicit;
+        activeEntityByProperty.set(normalizedProperty, explicit);
+      }
+      const resolved = explicit || activeEntityByProperty.get(normalizedProperty) || activeEntity || '@narrative';
+      if (resolved && !resolved.startsWith('@')) activeEntityByProperty.set(normalizedProperty, resolved);
+      return resolved;
+    };
+    const add = (entity, property, valueText, evidenceText, unit, extra = {}) => {
+      const fact = normalizeStructuredStateFact({
+        entity: entity || '@narrative',
+        property,
+        value: valueText || evidenceText,
+        turn: Number(options.turn || 0) || 0,
+        confidence: extra.confidence ?? 0.9,
+        authority: 'VISIBLE_UA',
+        evidenceType: 'visible_u+a',
+        evidenceText,
+        renderable: true,
+        operation: extra.operation || 'set',
+        evidenceStart: Math.max(0, Number(options.sourceStart || 0) + unit.rawStart),
+        evidenceEnd: Math.max(0, Number(options.sourceStart || 0) + unit.rawEnd),
+        ...(extra.peer ? { peer: extra.peer } : {})
+      });
+      if (fact) out.push(fact);
+    };
+    const processAssistantRange = ({ start: rangeStart, end: rangeEnd }) => {
+      const rawBody = source.slice(rangeStart, rangeEnd);
+      const bodyLeadingWhitespace = rawBody.length - rawBody.trimStart().length;
+      const body = rawBody.trim();
+      const bodyAbsoluteStart = rangeStart + bodyLeadingWhitespace;
+      if (!body) return;
+      const segmented = splitNarrativeUnits(body, 700);
+      for (const unit of segmented.units) {
+      const rawUnit = segmented.body.slice(unit.start, unit.end);
+      const unitLeadingWhitespace = rawUnit.length - rawUnit.trimStart().length;
+      const unitTrailingWhitespace = rawUnit.length - rawUnit.trimEnd().length;
+      const normalizedStart = bodyAbsoluteStart + unit.start + unitLeadingWhitespace;
+      const normalizedEnd = Math.max(normalizedStart, bodyAbsoluteStart + unit.end - unitTrailingWhitespace);
+      if (nonNarrativeStateSpans.some(span => normalizedStart < span.end && normalizedEnd > span.start)) continue;
+      const evidenceUnit = {
+        ...unit,
+        rawStart: Number(normalizedToRaw[normalizedStart] ?? rawSource.length),
+        rawEnd: Number(normalizedToRaw[normalizedEnd] ?? rawSource.length)
+      };
+      const sentence = rawSource.slice(evidenceUnit.rawStart, evidenceUnit.rawEnd);
+      if (!sentence || /(?:system\s*prompt|developer\s*message|chain[_ -]?of[_ -]?thought|시스템\s*프롬프트|개발자\s*메시지|메타\s*프롬프트)/iu.test(sentence)) continue;
+      let match = sentence.match(/(?:(?<entity>[\p{L}\p{N}_-]{2,24})(?:은|는|이|가)\s*)?(?<place>[\p{L}\p{N}_ -]{1,36}?)(?:에|으로)\s*(?:도착했|도착했다|들어섰|들어갔|돌아왔|왔다|향했다|이동했다)/u);
+      if (match?.groups?.place) add(resolveActor(match.groups.entity, 'location'), 'location', match.groups.place.trim(), sentence, evidenceUnit);
+      match = sentence.match(/(?:(?<entity>[A-Z][\p{L}\p{N}_-]{1,30})\s+)?(?:arrived\s+(?:at|in)|entered|moved\s+to|went\s+to|returned\s+to)\s+(?<place>[^.!?\n]{1,60})/iu);
+      if (match?.groups?.place) add(resolveActor(match.groups.entity, 'location'), 'location', match.groups.place.trim(), sentence, evidenceUnit);
+      match = sentence.match(/(?:(?<entity>[\p{L}\p{N}_-]{2,24})(?:은|는|이|가)\s*)?(?<item>[\p{L}\p{N}_ -]{1,36}?)(?:을|를)\s*(?:들고|쥐고|챙기고|가지고|껴안고)/u);
+      if (match?.groups?.item) add(resolveActor(match.groups.entity, 'carrying'), 'carrying', match.groups.item.trim(), sentence, evidenceUnit);
+      match = sentence.match(/(?:(?<entity>[\p{L}\p{N}_-]{2,24})(?:은|는|이|가)\s*)?(?<item>[\p{L}\p{N}_ -]{1,36}?)(?:을|를)\s*(?:내려놓았|내려놨|버렸|놓고\s*왔|떨어뜨렸)/u);
+      if (match?.groups?.item) add(resolveActor(match.groups.entity, 'carrying'), 'carrying', match.groups.item.trim(), sentence, evidenceUnit, { operation: 'clear' });
+      match = sentence.match(/(?:(?<entity>[\p{L}\p{N}_-]{2,24})(?:은|는|이|가)\s*)?(?<posture>앉았|일어섰|누웠|무릎을\s*꿇었|기대어\s*섰)/u);
+      if (match?.groups?.posture) add(resolveActor(match.groups.entity, 'posture'), 'posture', match.groups.posture, sentence, evidenceUnit);
+      match = sentence.match(/(?:(?<entity>[\p{L}\p{N}_-]{2,24})(?:은|는|이|가)\s*)?(?<condition>다쳤|부상을\s*입었|피를\s*흘렸|의식을\s*잃었|기절했)/u);
+      if (match?.groups?.condition) add(resolveActor(match.groups.entity, 'condition'), 'condition', match.groups.condition, sentence, evidenceUnit);
+      match = sentence.match(/(?<object>문|창문|서랍|상자|병|컵|잔|유리|자물쇠)(?:은|는|이|가)\s*(?<state>열렸|닫혔|깨졌|잠겼|넘어졌|엎질러졌)/u);
+      if (match?.groups?.object && match?.groups?.state) add(match.groups.object, 'object_state', match.groups.state, sentence, evidenceUnit);
+      if (/(?:아직|여전히|계속).{0,80}(?:못했|않았|남아\s*있|기다리고\s*있|열린\s*채|닫힌\s*채|들고\s*있)/u.test(sentence)) {
+        add('@narrative', 'open_thread', sentence, sentence, evidenceUnit, { confidence: 0.86 });
+      }
+      }
+    };
+    for (const range of assistantRanges) processAssistantRange(range);
+    const seen = new Set();
+    return out.filter(fact => {
+      const key = `${fact.entity}\u0000${fact.property}\u0000${fact.operation}\u0000${normalizeForLexical(fact.value)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 48);
+  };
   const localStructuredStateFactsFromObject = (source = {}, options = {}) => {
     if (!source || typeof source !== 'object') return [];
     const out = [];
@@ -7414,6 +8952,22 @@
       seen.add(key);
       return true;
     }).slice(0, 120);
+  };
+  Object.defineProperty(structuredStateFactsFromMetadata, 'visible', {
+    value: visibleContinuityFactsFromText,
+    enumerable: false
+  });
+
+  const structuredStateFactsForRecord = (record = {}) => {
+    const turn = finiteTurnIndex(record);
+    if (Array.isArray(record?.structuredStateFacts)) {
+      return record.structuredStateFacts
+        .map(fact => normalizeStructuredStateFact(fact, { turn }))
+        .filter(Boolean)
+        .slice(0, 120);
+    }
+    if (Number(record?.chunkIndex || 0) > 0) return [];
+    return structuredStateFactsFromMetadata(record?.metadata || {}, { turn });
   };
 
   const extractQueryStateProperties = (query = '') => new Set(
@@ -7608,7 +9162,7 @@
     const state = collectVisibleClauses(clauses, /(?:현재|지금|위치|도착|떠났|이동|감정|기분|상태|부상|건강|복장|옷|소지|들고|가지고|now|current|location|arrived|left|mood|emotion|condition|health|wearing|carrying|現在|位置|場所|状態|感情|服装|所持|现在|位置|状态|情绪|穿着|携带)/i, 100);
     const event = collectVisibleClauses(clauses, /(?:일어났|발생|도착|떠났|만났|싸웠|공격|구출|발견|잃었|얻었|죽었|살해|약속|취소|결정|변했|event|happened|arrived|left|met|fought|attacked|rescued|found|lost|gained|died|killed|promised|cancelled|decided|changed|事件|到着|出発|会った|発見|死亡|约定|发生|到达|离开|发现|死亡)/i, 120);
     const temporal = collectVisibleClauses(clauses, /(?:현재|지금|방금|오늘|어제|내일|과거|예전|당시|이전|처음|이후|그날|몇\s*(?:시|분|일)|\d{1,4}[년월일시분]|now|today|yesterday|tomorrow|past|before|after|first|then|\d{1,4}[/-]\d{1,2}|現在|今日|昨日|明日|過去|以前|之后|现在|今天|昨天|明天|过去|以前)/i, 80);
-    const visibleFacts = structuredStateFactsFromMetadata(record?.metadata || {}, { turn: finiteTurnIndex(record) });
+    const visibleFacts = structuredStateFactsForRecord(record);
     const factIdentity = visibleFacts.flatMap(fact => [fact.entity, fact.peer]).filter(Boolean);
     const factRelation = visibleFacts.filter(fact => fact.property.startsWith('relationship.')).flatMap(fact => [fact.entity, fact.peer, fact.value]);
     const factState = visibleFacts.filter(fact => !fact.property.startsWith('relationship.')).flatMap(fact => [fact.entity, fact.property, fact.value]);
@@ -7812,9 +9366,34 @@
   // Branch and privacy are pre-score hard gates because they depend only on
   // canonical record metadata. Temporal supersession depends on scoring
   // components and must run after scoreRecordForRecall() has populated them.
+  const recallRecordConflictsWithWorldline = (record = {}, context = {}) => {
+    if (!isResponseMemoryRecord(record)
+      || isInheritedScopeMemoryRecord(record, context.scopeKey)
+      || !text(record.turnNodeId || '').trim()) return false;
+    const worldline = context.worldline?.version === TURN_WORLDLINE_VERSION
+      ? context.worldline
+      : null;
+    if (!worldline || !Array.isArray(worldline.nodes) || !worldline.nodes.length) return false;
+    const turnNodeId = text(record.turnNodeId || '').trim();
+    const node = worldline.nodes.find(candidate => candidate.turnNodeId === turnNodeId) || null;
+    if (!node) {
+      const turnIndex = finiteTurnIndex(record);
+      return turnIndex > 0 && worldline.nodes.some(candidate => Number(candidate.pairIndex || 0) === turnIndex);
+    }
+    if (node.status !== 'active') return true;
+    if (record.logicalTurnId && node.logicalTurnId && record.logicalTurnId !== node.logicalTurnId) return true;
+    if (record.variantId && node.variantId && record.variantId !== node.variantId) return true;
+    if (record.parentTurnNodeId && node.parentTurnNodeId && record.parentTurnNodeId !== node.parentTurnNodeId) return true;
+    return false;
+  };
   const applyRecallHardGates = (items = [], context = {}) => {
     const out = [];
-    const diagnostics = { inactiveBranchFiltered: 0, privacyFiltered: 0, timeFiltered: 0 };
+    const diagnostics = {
+      inactiveBranchFiltered: 0,
+      worldlineMismatchFiltered: 0,
+      privacyFiltered: 0,
+      timeFiltered: 0
+    };
     for (const raw of items || []) {
       const record = raw?.record || raw;
       const lifecycle = text(record?.lifecycleStatus || 'active').trim().toLowerCase();
@@ -7822,13 +9401,11 @@
         diagnostics.inactiveBranchFiltered += 1;
         continue;
       }
-      const restrictedOnly = record?.restrictedOnly === true
-        || record?.privacyRestricted === true
-        || record?.metadata?.restrictedOnly === true
-        || /private[_ -]?thought|secret|internal|hidden|sealed|denied/i.test(text(record?.metadata?.privacy || record?.metadata?.visibility || ''))
-        || flattenMetadataItems(record?.metadata?.deniedToEntityIds || record?.metadata?.denied_to_entity_ids).length > 0
-        || /^(?:restricted|secret|private)(?:_|$)/i.test(text(record?.sourceType || ''));
-      if (restrictedOnly) {
+      if (recallRecordConflictsWithWorldline(record, context)) {
+        diagnostics.worldlineMismatchFiltered += 1;
+        continue;
+      }
+      if (!isRecallIndexableRecord(record)) {
         diagnostics.privacyFiltered += 1;
         continue;
       }
@@ -7855,14 +9432,44 @@
     return out;
   };
 
+  const storyTimelineKey = (record = {}) => {
+    if (isInheritedScopeMemoryRecord(record)) {
+      // permanentHistoryId identifies one durable record/chunk, not the
+      // predecessor timeline. Group inherited turns by their original scope so
+      // the latest predecessor scene can span more than one record.
+      return `inherited:${text(record.inheritedFromScopeKey || record.clonedFromScopeKey || record.inheritedViaScopeKey || 'unknown')}`;
+    }
+    return `live:${text(record.scopeKey || '')}:${text(record.turnNodeId || record.variantId || 'active')}`;
+  };
+
+  const storyTurnKey = (record = {}) => `${storyTimelineKey(record)}:${finiteTurnIndex(record)}`;
+
+  const contextPreviousTurnMatchesRecord = (record = {}, context = {}) => {
+    const sourceHash = text(context.previousTurnSourceHash || context.previousTurn?.sourceHash || '');
+    if (sourceHash) return text(record.sourceHash || '') === sourceHash;
+    return !isInheritedScopeMemoryRecord(record)
+      && Number(context.previousTurnNumber || 0) > 0
+      && finiteTurnIndex(record) === Number(context.previousTurnNumber || 0);
+  };
+
+  const contextExcludedPreviousTurnMatchesRecord = (record = {}, context = {}) => {
+    const sourceHash = text(context.excludedPreviousTurnSourceHash || '');
+    if (sourceHash) return text(record.sourceHash || '') === sourceHash;
+    return !isInheritedScopeMemoryRecord(record)
+      && Number(context.excludedPreviousTurnNumber || 0) > 0
+      && finiteTurnIndex(record) === Number(context.excludedPreviousTurnNumber || 0);
+  };
+
   const resolveRecallLane = (record = {}, context = {}) => {
     const latestTurn = Math.max(0, Number(context.latestTurn || 0) || 0);
     const turn = finiteTurnIndex(record);
-    const ageTurns = turn > 0 && latestTurn > 0 ? Math.max(0, latestTurn - turn) : Number.POSITIVE_INFINITY;
+    const ageTurns = !isInheritedScopeMemoryRecord(record) && turn > 0 && latestTurn > 0
+      ? Math.max(0, latestTurn - turn)
+      : Number.POSITIVE_INFINITY;
     const sparse = buildSparseFieldsForRecord(record, Runtime.settings || DEFAULTS);
     const facts = recordStructuredStateFacts(record);
     if (
-      context.previousTurnNumber > 0 && turn === context.previousTurnNumber
+      contextPreviousTurnMatchesRecord(record, context)
       || context.components?.currentSceneTail > 0
       || context.components?.currentStateEvidence > 0
       || ageTurns <= 3
@@ -8005,7 +9612,7 @@
       for (const current of ordered) {
         const currentOrder = storyOrderValue(current.record);
         const pastCandidates = ordered
-          .filter(item => finiteTurnIndex(item.record) !== finiteTurnIndex(current.record))
+          .filter(item => storyTurnKey(item.record) !== storyTurnKey(current.record))
           .filter(item => storyOrderValue(item.record) < currentOrder)
           .filter(item => semanticallyRelated(current, item))
           .sort((a, b) => storyOrderValue(a.record) - storyOrderValue(b.record)
@@ -8024,7 +9631,7 @@
         for (let rightIndex = leftIndex + 1; rightIndex < eligible.length; rightIndex += 1) {
           const left = eligible[leftIndex];
           const right = eligible[rightIndex];
-          if (finiteTurnIndex(left.record) === finiteTurnIndex(right.record)) continue;
+          if (storyTurnKey(left.record) === storyTurnKey(right.record)) continue;
           if (actuallyConflicts(left, right)) {
             pair = [left, right];
             break;
@@ -8049,7 +9656,9 @@
     const inactiveState = INACTIVE_RECALL_LIFECYCLES.has(lifecycle);
     const latestTurn = Math.max(0, Number(context.latestTurn || 0) || 0);
     const turn = finiteTurnIndex(record);
-    const ageTurns = turn > 0 && latestTurn > 0 ? Math.max(0, latestTurn - turn) : 9999;
+    const ageTurns = !isInheritedScopeMemoryRecord(record) && turn > 0 && latestTurn > 0
+      ? Math.max(0, latestTurn - turn)
+      : 9999;
     const sparse = buildSparseFieldsForRecord(record, context.settings || Runtime.settings || DEFAULTS);
     const durableText = `${sparse.event}\n${record.text || ''}`;
     const durableEvent = record?.durableEvent === true
@@ -8121,7 +9730,9 @@
         turn: Number.MAX_SAFE_INTEGER,
         confidence: 0.98,
         authority: 'CURRENT_USER_OVERLAY',
-        evidenceType: 'request_local_overlay'
+        evidenceType: 'request_local_overlay',
+        evidenceText: clause,
+        renderable: false
       });
       if (!fact) return;
       result.facts.push(fact);
@@ -8211,16 +9822,17 @@
         if (!existing.reasons.includes(reason)) existing.reasons.push(reason);
       }
     };
-    const latestTurn = Math.max(0, Number(context.latestResponseTurn || context.latestTurn || 0) || latestResponseTurnIndex(responseRecords));
+    const latestTurn = Math.max(0, Number(context.latestResponseTurn || context.latestTurn || 0) || latestLiveResponseTurnIndex(responseRecords));
     const previousTurnNumber = Math.max(0, Number(context.previousTurnNumber || 0) || 0);
+    const currentSceneTurnKeys = currentSceneTurnKeysForRecords(responseRecords, settings);
     for (const record of responseRecords) {
-      const turn = finiteTurnIndex(record);
-      if (previousTurnNumber > 0 && turn === previousTurnNumber) force(record, 'previous_turn_bridge', 1);
+      if (contextPreviousTurnMatchesRecord(record, {
+        previousTurnNumber,
+        previousTurnSourceHash: context.previousTurn?.sourceHash || context.previousTurnSourceHash || ''
+      })) force(record, 'previous_turn_bridge', 1);
       if (
         settings.currentSceneTailEnabled !== false
-        && turn > 0
-        && latestTurn > 0
-        && latestTurn - turn < Math.max(1, Number(settings.currentSceneTailTurns || DEFAULTS.currentSceneTailTurns))
+        && currentSceneTurnKeys.has(storyTurnKey(record))
       ) force(record, 'current_scene_tail', 0.92);
       if (
         settings.entityFocusedRecallEnabled !== false
@@ -8574,11 +10186,9 @@
     }
     for (const group of groups.values()) {
       group.records.sort((a, b) => Number(a.chunkIndex || 0) - Number(b.chunkIndex || 0) || text(a.id).localeCompare(text(b.id)));
-      let body = '';
-      for (const record of group.records) body = mergeOverlappedText(body, record.text || '');
-      group.text = body;
-      group.userText = userTextFromStoredResponseBody(body);
-      group.assistantText = assistantTextFromStoredResponseBody(body);
+      group.text = reconstructChunkGroupText(group.records);
+      group.userText = userTextFromStoredResponseBody(group.text);
+      group.assistantText = assistantTextFromStoredResponseBody(group.text);
     }
     return Array.from(groups.values());
   };
@@ -8604,17 +10214,14 @@
   const selectPreviousTurnVectorContext = (records = [], options = {}) => {
     const targetTurn = previousTurnTargetNumber(options, records);
     if (!targetTurn) return { available: false, active: false, reason: 'no_previous_turn', targetTurn: 0, vector: [], recordIds: [] };
-    const groups = buildStoredTurnVectorGroups(records).filter(group => group.turnIndex === targetTurn);
+    const groups = buildStoredTurnVectorGroups(records.filter(isRecallIndexableRecord)).filter(group => group.turnIndex === targetTurn);
     if (!groups.length) return { available: false, active: false, reason: 'previous_turn_not_loaded', targetTurn, vector: [], recordIds: [] };
     const liveState = liveChatStateFromNormalized(Array.isArray(options.liveMessages) ? options.liveMessages : []);
     const livePair = liveState.pairByIndex instanceof Map ? liveState.pairByIndex.get(targetTurn) : null;
     let candidates = groups;
     let liveMatched = false;
     if (livePair?.assistantText) {
-      const matched = groups.filter(group => {
-        const userMatches = !livePair.userText || !group.userText || samePairUserText(group.userText, livePair.userText);
-        return userMatches && sameTurnText(group.assistantText, livePair.assistantText);
-      });
+      const matched = groups.filter(group => flashbackGroupMatchesPair(group, livePair));
       if (!matched.length) return { available: false, active: false, reason: 'previous_turn_live_mismatch', targetTurn, vector: [], recordIds: [] };
       candidates = matched;
       liveMatched = true;
@@ -8660,6 +10267,7 @@
 
   const responseTurnIndexes = (records = []) => records
     .filter(record => (record.sourceType === 'chat_turn' ? 'response' : record.sourceType) === 'response')
+    .filter(isRecallIndexableRecord)
     .map(finiteTurnIndex)
     .filter(Boolean);
 
@@ -8723,6 +10331,7 @@
     const out = new Map();
     records
       .filter(record => (record.sourceType === 'chat_turn' ? 'response' : record.sourceType) === 'response')
+      .filter(isRecallIndexableRecord)
       .sort((a, b) => storyOrderValue(b) - storyOrderValue(a)
         || text(b.id || b.hash).localeCompare(text(a.id || a.hash)))
       .forEach((record, index) => out.set(record.id || record.hash, index + 1));
@@ -8740,14 +10349,17 @@
 
   const stateFactMapKey = (entity = '', property = '', peer = '') => `${normalizeStateEntity(entity)}\u0000${normalizeStateProperty(property || '__generic__')}\u0000${normalizeStateEntity(peer)}`;
 
-  const recordStructuredStateFacts = (record = {}) => structuredStateFactsFromMetadata(
-    record?.metadata || {},
-    { turn: finiteTurnIndex(record) }
-  );
+  const recordStructuredStateFacts = (record = {}) => structuredStateFactsForRecord(record);
 
   const buildLatestStateByEntity = (records = [], externalFacts = []) => {
     const out = new Map();
-    for (const record of records) {
+    const orderedRecords = (records || []).slice().sort((a, b) => (
+      storyOrderValue(a) - storyOrderValue(b)
+      || finiteTurnIndex(a) - finiteTurnIndex(b)
+      || Number(a?.chunkIndex || 0) - Number(b?.chunkIndex || 0)
+      || text(a?.id || a?.hash || '').localeCompare(text(b?.id || b?.hash || ''))
+    ));
+    for (const record of orderedRecords) {
       if (!recordStateUpdateFlag(record)) continue;
       const group = sourceGroup(record.sourceType);
       if (!['response', 'local'].includes(group)) continue;
@@ -8755,9 +10367,39 @@
       if (structuredFacts.length) {
         const time = storyOrderValue(record);
         for (const fact of structuredFacts) {
-          const key = stateFactMapKey(fact.entity, fact.property, fact.peer || '');
+          let key = stateFactMapKey(fact.entity, fact.property, fact.peer || '');
+          let effectiveClearFact = fact;
+          // A natural continuation can omit the actor ("컵을 내려놓았다").
+          // Resolve that clear only when the same carried item has exactly one
+          // active named owner; ambiguity is left unresolved instead of guessed.
+          if (
+            fact.operation === 'clear'
+            && fact.entity === '@narrative'
+            && normalizeStateProperty(fact.property) === 'carrying'
+            && normalizeForLexical(fact.value)
+          ) {
+            const matching = Array.from(out.entries()).filter(([, entry]) => (
+              entry?.fact
+              && !entry.suppressed
+              && entry.fact.entity !== '@narrative'
+              && normalizeStateProperty(entry.fact.property) === 'carrying'
+              && normalizeStateEntity(entry.fact.peer || '') === normalizeStateEntity(fact.peer || '')
+              && normalizeForLexical(entry.fact.value) === normalizeForLexical(fact.value)
+            ));
+            const matchingEntities = new Set(matching.map(([, entry]) => normalizeStateEntity(entry.fact.entity)));
+            if (matching.length && matchingEntities.size === 1) {
+              key = matching[0][0];
+              effectiveClearFact = { ...fact, entity: matching[0][1].fact.entity };
+            }
+          }
           const prev = out.get(key);
-          if (!prev || time >= prev.time) out.set(key, { time, id: record.id || record.hash || '', record, fact, structured: true });
+          if (!prev || time >= prev.time) {
+            if (fact.operation === 'clear') {
+              out.set(key, { time, id: record.id || record.hash || '', record, fact: null, structured: false, suppressed: true, clearedBy: effectiveClearFact });
+            } else {
+              out.set(key, { time, id: record.id || record.hash || '', record, fact, structured: true });
+            }
+          }
         }
         continue;
       }
@@ -8830,7 +10472,15 @@
       const sig = `${fact.entity}\u0000${fact.property}\u0000${fact.peer || ''}\u0000${normalizeForLexical(fact.value)}`;
       if (seen.has(sig)) continue;
       seen.add(sig);
-      rows.push({ ...fact, key, time: entry.time, external: !!entry.external });
+      rows.push({
+        ...fact,
+        key,
+        time: entry.time,
+        external: !!entry.external,
+        recordId: text(entry.record?.id || entry.record?.hash || ''),
+        sourceHash: text(entry.record?.sourceHash || ''),
+        storyOrder: entry.time
+      });
     }
     return rows.sort((a, b) => b.time - a.time || Number(b.confidence || 0) - Number(a.confidence || 0)).slice(0, Math.max(1, Number(limit) || 14));
   };
@@ -8876,7 +10526,7 @@
   };
 
   const scoreRecordForRecall = (record, query, queryVector, queryAnchors, settings, context = {}) => {
-    if (context.excludedPreviousTurnNumber > 0 && isResponseMemoryRecord(record) && finiteTurnIndex(record) === context.excludedPreviousTurnNumber) return null;
+    if (isResponseMemoryRecord(record) && contextExcludedPreviousTurnMatchesRecord(record, context)) return null;
     const semantic = recallSemanticSignals(record, queryVector, settings, context);
     const { vectorComparable, cosine } = semantic;
     if (!vectorComparable && !context.allowLexicalFallback) return null;
@@ -8918,7 +10568,11 @@
       : clampNumber(strategy.recencyWeight, 0.2, 3, 1);
     const recency = clampNumber(recencyBase * temporalRecencyWeight, 0, 1, recencyBase);
     const storyRecency = sourceGroup(record.sourceType) === 'response' && finiteTurnIndex(record) > 0 ? recencyBase : 0;
-    const latestTurn = context.latestResponseTurn && finiteTurnIndex(record) === context.latestResponseTurn ? clampNumber(settings.latestTurnBoost, 0, 0.4, DEFAULTS.latestTurnBoost) : 0;
+    const latestTurn = !isInheritedScopeMemoryRecord(record)
+      && context.latestResponseTurn
+      && finiteTurnIndex(record) === context.latestResponseTurn
+      ? clampNumber(settings.latestTurnBoost, 0, 0.4, DEFAULTS.latestTurnBoost)
+      : 0;
     const latestAfterRequest = ['afterRequest', 'finalized_live_chat'].includes(record.origin) ? 0.04 : 0;
     const recentRank = context.recentResponseRanks?.get(record.id || record.hash) || 0;
     const continuationRecent = queryAnchors.continuation && recentRank > 0 && recentRank <= settings.continuationRecentItems
@@ -9098,8 +10752,8 @@
       if (bestIndex < 0) break;
       if (selected.length > 0 && bestScore < minimumNovelty) {
         const candidate = pool[bestIndex];
-        const candidateTurn = finiteTurnIndex(candidate?.record || {});
-        const distinctTurn = candidateTurn > 0 && selected.every(item => finiteTurnIndex(item.record) !== candidateTurn);
+        const candidateTurn = storyTurnKey(candidate?.record || {});
+        const distinctTurn = !!candidateTurn && selected.every(item => storyTurnKey(item.record) !== candidateTurn);
         const strongDirectEvidence = Number(candidate?.components?.exactArm || 0) >= 0.7
           || candidate?.components?.forcedReasons?.includes('episode_child')
           || candidate?.components?.forcedReasons?.includes('previous_turn_bridge');
@@ -9218,12 +10872,11 @@
     if (![QUERY_TYPES.CONTINUATION, QUERY_TYPES.STATE, QUERY_TYPES.RELATION, QUERY_TYPES.EMOTION].includes(queryType)) return [];
     const responseItems = items
       .filter(item => item?.record && sourceGroup(item.record.sourceType) === 'response' && finiteTurnIndex(item.record))
-      .sort((a, b) => finiteTurnIndex(b.record) - finiteTurnIndex(a.record) || Number(b.record.chunkIndex || 0) - Number(a.record.chunkIndex || 0));
+      .sort((a, b) => storyOrderValue(b.record) - storyOrderValue(a.record) || Number(b.record.chunkIndex || 0) - Number(a.record.chunkIndex || 0));
     if (!responseItems.length) return [];
-    const maxTurn = Math.max(...responseItems.map(item => finiteTurnIndex(item.record)));
-    const minTurn = maxTurn - Math.max(0, Number(settings.currentSceneTailTurns || DEFAULTS.currentSceneTailTurns)) + 1;
+    const sceneTurnKeys = currentSceneTurnKeysForRecords(responseItems.map(item => item.record), settings);
     return responseItems
-      .filter(item => finiteTurnIndex(item.record) >= minTurn)
+      .filter(item => sceneTurnKeys.has(storyTurnKey(item.record)))
       .slice(0, clampInt(settings.currentSceneTailLimit, 0, 20, DEFAULTS.currentSceneTailLimit))
       .map(item => markForcedRecallItem(item, 'current_scene_tail', 0.08, 0.2))
       .filter(Boolean);
@@ -9299,7 +10952,7 @@
       const r = item.record || item;
       const hashKey = text(r.sourceHash || r.hash || r.sourceId || '');
       const turn = finiteTurnIndex(r);
-      const turnKey = turn ? `${r.sourceType || 'source'}:${turn}` : '';
+      const turnKey = turn ? `${r.sourceType || 'source'}:${storyTurnKey(r)}` : '';
       const reasons = item.forcedReasons || [];
       const bypass = (reasons.includes('current_scene_tail') && forcedKept.current_scene_tail < Math.max(1, settings.currentSceneTailMinKeep || 0))
         || (reasons.includes('entity_focused_anchor') && forcedKept.entity_focused_anchor < 1);
@@ -9420,7 +11073,10 @@
     const primaryQueryText = text(options.currentUser || requestedQueryText).trim() || requestedQueryText;
     const queryText = primaryQueryText;
     const storageStageStartedAt = Date.now();
-    const manifest = await loadScopeManifest(scope.scopeKey);
+    const [manifest, recallWorldline] = await Promise.all([
+      loadScopeManifest(scope.scopeKey),
+      loadTurnWorldline(scope.scopeKey)
+    ]);
     stageElapsed.scopeStorageLoad += Date.now() - storageStageStartedAt;
     if (!queryText) return { records: [], total: 0, storedTotal: manifest.count || 0, externalSuppressed: 0, queryDim: 0, queryText: '', scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, storageManifestCorrupt: manifest.manifestCorrupt === true, storageForeignScopeKey: text(manifest.foreignScopeKey || '') };
     const embeddingStageStartedAt = Date.now();
@@ -9461,9 +11117,13 @@
     const currentPairIndex = Number(options.currentPairIndex || 0) || 0;
     const previousTurnHint = currentPairIndex === 1 ? 0 : (currentPairIndex > 1 ? currentPairIndex - 1 : Number(manifest.responseTurnMax || 0) || 0);
     const sourceShardIndexes = retirementPending ? [] : previousTurnSourceShardIndexes(manifest, previousTurnHint);
+    const currentSceneShardIndexes = retirementPending ? [] : currentSceneSourceShardIndexes(manifest, currentPairIndex, cfg);
     let shardSelection = mergeRecallShardSelections(manifest, baseShardSelection, {
       indexes: sourceShardIndexes,
       reason: sourceShardIndexes.length ? 'previous_turn_source' : ''
+    }, {
+      indexes: currentSceneShardIndexes,
+      reason: currentSceneShardIndexes.length ? 'current_scene_sources' : ''
     });
     const recordLoadStartedAt = Date.now();
     const loaded = await loadScopeRecordsForRecall(scope.scopeKey, shardSelection);
@@ -9475,6 +11135,14 @@
     const storageManifestCorrupt = loaded.manifest?.manifestCorrupt === true;
     const storageForeignScopeKey = text(loaded.manifest?.foreignScopeKey || '').trim();
     let storageRecordCountMismatch = loaded.manifest?.recordCountMismatch === true;
+    const recallHardGateContext = {
+      temporalIntent,
+      truthIntent,
+      scopeKey: scope.scopeKey,
+      worldline: recallWorldline
+    };
+    let branchGate = applyRecallHardGates(storedRecords, recallHardGateContext);
+    storedRecords = branchGate;
     let previousTurn = selectPreviousTurnVectorContext(storedRecords, {
       currentPairIndex,
       liveMessages: options.liveMessages,
@@ -9494,6 +11162,8 @@
         const additional = await loadScopeRecordsForRecall(scope.scopeKey, { indexes: additionalIndexes, reason: 'previous_turn_context', shardCount: manifest.shardCount });
         stageElapsed.scopeStorageLoad += Date.now() - additionalLoadStartedAt;
         storedRecords = mergeRecallRecordLists(storedRecords, additional.records || []);
+        branchGate = applyRecallHardGates(storedRecords, recallHardGateContext);
+        storedRecords = branchGate;
         externalSuppressed += Number(additional.manifest?.externalRetirementPending || 0) || 0;
         storageMissingShards += Number(additional.manifest?.missingShards || 0) || 0;
         storageCorruptShards += Number(additional.manifest?.corruptShards || 0) || 0;
@@ -9512,9 +11182,8 @@
       }
     }
     let records = storedRecords;
-    const branchGate = applyRecallHardGates(records, { temporalIntent, truthIntent });
-    records = branchGate;
     const inactiveBranchFiltered = Number(branchGate.diagnostics?.inactiveBranchFiltered || 0) || 0;
+    const worldlineMismatchFiltered = Number(branchGate.diagnostics?.worldlineMismatchFiltered || 0) || 0;
     const privacyFiltered = Number(branchGate.diagnostics?.privacyFiltered || 0) || 0;
     const queryAnchors = buildDiscriminativeRecallAnchors(rawQueryAnchors, records);
     const strategy = recallStrategyForQueryType(queryType);
@@ -9533,6 +11202,7 @@
     const currentStateFacts = cfg.structuredStateEnabled ? collectCurrentStateFacts(latestStateByEntity, rawQueryAnchors, queryStateProperties, 14) : [];
     const previousTurnNumber = Number(previousTurn.targetTurn || previousTurn.turnIndex || 0) || 0;
     const excludedPreviousTurnNumber = previousTurn.requestMatched === true ? previousTurnNumber : 0;
+    const excludedPreviousTurnSourceHash = previousTurn.requestMatched === true ? text(previousTurn.sourceHash || '') : '';
     const previousTurnRecall = {
       available: previousTurn.available === true,
       active: previousTurn.active === true && previousTurnProfile.active === true,
@@ -9550,9 +11220,9 @@
       addedShards: previousTurnShardAdds,
       excludedFromInjection: excludedPreviousTurnNumber > 0
     };
-    if (!records.length) return { records: [], currentStateFacts, total: 0, storedTotal: manifest.count || 0, loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, privacyFiltered, stageElapsed };
+    if (!records.length) return { records: [], currentStateFacts, total: 0, storedTotal: manifest.count || 0, loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, worldlineMismatchFiltered, privacyFiltered, stageElapsed };
     const latestResponseTurn = Math.max(latestLiveResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
-    const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber };
+    const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber, excludedPreviousTurnSourceHash };
     const candidateLimit = Math.max(effectiveTopK, Math.min(records.length, Math.ceil(Number(cfg.candidateLimit || DEFAULTS.candidateLimit) * topKMultiplier)));
     const sparseStageStartedAt = Date.now();
     let arms = await generateRecallCandidateArms({
@@ -9598,7 +11268,7 @@
     const fusedSelected = Array.from(fusedSelectedMap.values())
       .sort((a, b) => b.rrfScore - a.rrfScore || text(a.record?.id || a.record?.hash).localeCompare(text(b.record?.id || b.record?.hash)))
       .slice(0, candidateLimit + effectiveTopK);
-    const candidateHardGate = applyRecallHardGates(fusedSelected, { temporalIntent, truthIntent });
+    const candidateHardGate = applyRecallHardGates(fusedSelected, recallHardGateContext);
     const hardGateDiagnostics = candidateHardGate.diagnostics || {};
     const candidateMeta = new Map(candidateHardGate.map(item => [text(item.record?.id || item.record?.hash || item.record?.sourceId || ''), item]));
     recallContext.candidateMeta = candidateMeta;
@@ -9617,6 +11287,7 @@
       union: fusedAll.length,
       afterHardGates: candidateHardGate.length,
       inactiveBranchFiltered: Number(hardGateDiagnostics.inactiveBranchFiltered || 0),
+      worldlineMismatchFiltered: Number(hardGateDiagnostics.worldlineMismatchFiltered || 0),
       privacyFiltered: Number(hardGateDiagnostics.privacyFiltered || 0)
     }, 'debug');
     if (Number(hardGateDiagnostics.privacyFiltered || 0) > 0) {
@@ -9637,7 +11308,7 @@
       const item = cfg.heuristicRecall
         ? scoreRecordForRecall(record, primaryQueryText, queryVector, queryAnchors, cfg, recallContext)
         : (() => {
-            if (excludedPreviousTurnNumber > 0 && isResponseMemoryRecord(record) && finiteTurnIndex(record) === excludedPreviousTurnNumber) return null;
+            if (isResponseMemoryRecord(record) && contextExcludedPreviousTurnMatchesRecord(record, recallContext)) return null;
             if (!Array.isArray(record.vector) || record.vector.length !== queryVector.length) return null;
             const semantic = recallSemanticSignals(record, queryVector, cfg, recallContext);
             if (!semantic.vectorComparable) return null;
@@ -9682,6 +11353,7 @@
     const laneEligible = selectRecallByLanes(gated, strategySettings, {
       latestTurn: latestResponseTurn,
       previousTurnNumber,
+      previousTurnSourceHash: previousTurn?.sourceHash || '',
       temporalIntent,
       truthIntent,
       recallAlignment: Runtime.recallAlignment
@@ -9720,6 +11392,7 @@
     stageElapsed.total = Date.now() - recallStartedAt;
     const filteredDiagnostics = {
       inactiveBranch: inactiveBranchFiltered + Number(hardGateDiagnostics.inactiveBranchFiltered || 0),
+      worldlineMismatch: worldlineMismatchFiltered + Number(hardGateDiagnostics.worldlineMismatchFiltered || 0),
       privacy: privacyFiltered + Number(hardGateDiagnostics.privacyFiltered || 0),
       time: Number(temporalHardGate.diagnostics?.timeFiltered || 0)
     };
@@ -9752,6 +11425,7 @@
       candidateArms: candidateArmDiagnostics,
       rrfUnionCount: fusedAll.length,
       inactiveBranchFiltered: filteredDiagnostics.inactiveBranch,
+      worldlineMismatchFiltered: filteredDiagnostics.worldlineMismatch,
       privacyFiltered: filteredDiagnostics.privacy,
       gateRejected,
       scoreRejected,
@@ -9823,25 +11497,53 @@
 
   const budgetGroupForRecord = (record) => sourceGroup(record?.sourceType || 'other');
 
-  const splitRecallSentences = (value) => {
+  const recallNarrativeUnits = (value, maxUnitChars = 700, options = {}) => {
     const src = sanitizeAssistantForMemory(value, { stripRolePrefix: false })
       .replace(/\n{3,}/g, '\n\n')
       .trim();
-    if (!src) return [];
-    const rough = src
-      .split(/(?<=[.!?。！？…])\s+|\n+/gu)
-      .map(part => part.trim())
-      .filter(Boolean);
-    const out = [];
-    for (const part of rough.length ? rough : [src]) {
-      if (part.length <= 700) {
-        out.push(part);
-        continue;
+    if (!src) return { body: '', units: [] };
+    const max = clampInt(maxUnitChars, 80, 2000, 700);
+    const segmented = options.preserveWholeUnits === true
+      ? scanNarrativeUnits(src)
+      : splitNarrativeUnits(src, max);
+    return {
+      body: segmented.body,
+      units: segmented.units
+        .map(unit => ({
+          ...unit,
+          text: segmented.body.slice(unit.start, unit.end).trim()
+        }))
+        .filter(unit => unit.text)
+    };
+  };
+
+  const splitRecallSentences = (value, maxUnitChars = 700) =>
+    recallNarrativeUnits(value, maxUnitChars).units.map(unit => unit.text);
+
+  const fitNarrativeTextToBudget = (value, maxChars = 700, options = {}) => {
+    const body = text(value).replace(/\r\n/g, '\n').trim();
+    const max = Math.max(0, Number(maxChars || 0) || 0);
+    if (!body || !max) return '';
+    if (body.length <= max) return body;
+    const segmented = recallNarrativeUnits(body, max, { preserveWholeUnits: true });
+    const units = segmented.units;
+    if (!units.length) return '';
+    if (options.fromEnd === true) {
+      const end = units[units.length - 1].end;
+      let start = end;
+      for (let index = units.length - 1; index >= 0; index -= 1) {
+        if (end - units[index].start > max) break;
+        start = units[index].start;
       }
-      const chunks = part.match(/[\s\S]{1,700}(?:\s+|$)/g) || [part];
-      chunks.map(chunk => chunk.trim()).filter(Boolean).forEach(chunk => out.push(chunk));
+      return segmented.body.slice(start, end).trim();
     }
-    return out.slice(0, 240);
+    const start = units[0].start;
+    let end = start;
+    for (const unit of units) {
+      if (unit.end - start > max) break;
+      end = unit.end;
+    }
+    return segmented.body.slice(start, end).trim();
   };
 
   const scoreRecallSegment = (segment, queryAnchors) => {
@@ -9859,17 +11561,20 @@
     const max = Math.max(0, Number(budget) || 0);
     if (!safe || !max) return { text: '', mode: 'empty', startSentence: 0, endSentence: 0, sentenceCount: 0 };
     if ((settings.rawExcerptMode || DEFAULTS.rawExcerptMode) === 'record') {
-      return { text: compact(safe, max), mode: 'record', startSentence: 1, endSentence: 1, sentenceCount: 1 };
+      const recordUnits = recallNarrativeUnits(safe, max, { preserveWholeUnits: true }).units;
+      const body = fitNarrativeTextToBudget(safe, max);
+      return { text: body || recordUnits[0]?.text || '', mode: 'record', startSentence: 1, endSentence: Math.max(1, recordUnits.length), sentenceCount: recordUnits.length || 1 };
     }
-    const sentences = splitRecallSentences(safe);
+    const segmented = recallNarrativeUnits(safe, max, { preserveWholeUnits: true });
+    const sentences = segmented.units;
     if (sentences.length <= 1) {
-      return { text: compact(safe, max), mode: 'record_fallback', startSentence: 1, endSentence: 1, sentenceCount: sentences.length || 1 };
+      return { text: sentences[0]?.text || '', mode: 'record_fallback', startSentence: 1, endSentence: 1, sentenceCount: sentences.length || 1 };
     }
 
     let bestIndex = 0;
     let bestScore = -1;
     sentences.forEach((sentence, index) => {
-      const score = scoreRecallSegment(sentence, queryAnchors);
+      const score = scoreRecallSegment(sentence.text, queryAnchors);
       if (score > bestScore) {
         bestScore = score;
         bestIndex = index;
@@ -9879,19 +11584,28 @@
     const radius = clampInt(settings.rawSentenceWindow, 0, 5, DEFAULTS.rawSentenceWindow);
     let start = Math.max(0, bestIndex - radius);
     let end = Math.min(sentences.length - 1, bestIndex + radius);
-    let body = sentences.slice(start, end + 1).join('\n');
+    let body = segmented.body.slice(sentences[start].start, sentences[end].end).trim();
     while (body.length > max && (start < bestIndex || end > bestIndex)) {
       const leftDistance = bestIndex - start;
       const rightDistance = end - bestIndex;
       if (rightDistance >= leftDistance && end > bestIndex) end -= 1;
       else if (start < bestIndex) start += 1;
       else break;
-      body = sentences.slice(start, end + 1).join('\n');
+      body = segmented.body.slice(sentences[start].start, sentences[end].end).trim();
     }
-    const prefix = start > 0 ? '...\n' : '';
-    const suffix = end < sentences.length - 1 ? '\n...' : '';
+    if (body.length > max) {
+      return {
+        text: '',
+        mode: 'oversize_unit_omitted',
+        startSentence: bestIndex + 1,
+        endSentence: bestIndex + 1,
+        sentenceCount: sentences.length,
+        focusSentence: bestIndex + 1,
+        focusScore: Number(bestScore.toFixed(3))
+      };
+    }
     return {
-      text: compact(`${prefix}${body}${suffix}`, max),
+      text: body,
       mode: 'sentence_window',
       startSentence: start + 1,
       endSentence: end + 1,
@@ -9960,9 +11674,8 @@
     let body = normalizedRole === 'user'
       ? canonicalChatUserText(value)
       : canonicalChatResponseText(value);
-    body = body
-      .replace(/(?:^|\n)\s*(?:User|Assistant|사용자|유저|어시스턴트|AI)\s*:\s*/gi, '\n')
-      .replace(/(?:^|\n)\s*---\s*(?=\n|$)/g, '\n')
+    body = stripNarrativeSeparatorLines(stripNarrativeStructuralRoleMarkers(body))
+      .replace(/^(?:사용자|유저|어시스턴트|AI)\s*:\s*/i, '')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
     if (!body || looksLikeOutOfWorldPromptFragment(body)) return '';
@@ -9976,44 +11689,28 @@
   const diegeticRecallSourceText = (record = {}) => {
     const raw = text(record?.text || '');
     if (!raw) return '';
-    const markers = Array.from(raw.matchAll(/(?:^|\n)(User|Assistant):\s*\n?/g));
-    if (!markers.length) return cleanDiegeticFragment(raw, text(record?.role).toLowerCase() === 'user' ? 'user' : 'assistant');
+    const markers = narrativeStructuralRoleMarkers(raw);
+    if (!markers.length) {
+      const chunkRole = text(record?.chunkRole || '').toLowerCase();
+      const role = chunkRole === 'user'
+        ? 'user'
+        : (chunkRole === 'assistant' ? 'assistant' : (text(record?.role).toLowerCase() === 'user' ? 'user' : 'assistant'));
+      return cleanDiegeticFragment(raw, role);
+    }
     const fragments = [];
     for (let i = 0; i < markers.length; i += 1) {
       const marker = markers[i];
-      const start = Number(marker.index || 0) + marker[0].length;
-      const end = i + 1 < markers.length ? Number(markers[i + 1].index || raw.length) : raw.length;
-      const role = text(marker[1]).toLowerCase();
-      const cleaned = cleanDiegeticFragment(raw.slice(start, end), role);
+      const end = i + 1 < markers.length ? markers[i + 1].start : raw.length;
+      const cleaned = cleanDiegeticFragment(raw.slice(marker.end, end), marker.role);
       if (cleaned) fragments.push(cleaned);
     }
     return fragments.join('\n\n');
   };
 
   const structuredStateSentence = fact => {
-    const entityLabels = {
-      '@world': '주변',
-      '@narrative': '이어지는 상황',
-      '@planner': '아직 끝나지 않은 일',
-      '@user': '현재 인물'
-    };
-    const propertyLabels = {
-      location: '위치',
-      time: '시간',
-      emotion: '감정',
-      condition: '상태',
-      attire: '복장',
-      carrying: '소지',
-      current_state: '현재 상태',
-      scene_phase: '장면 단계',
-      constraint: '남은 조건'
-    };
-    const entity = entityLabels[fact.entity] || compact(fact.entity, 80);
-    const peer = fact.peer ? `와(과) ${compact(fact.peer, 80)}` : '';
-    const property = propertyLabels[fact.property] || compact(text(fact.property).replace(/[._]+/g, ' '), 80);
-    const value = cleanDiegeticFragment(fact.value, 'assistant');
-    if (!value) return '';
-    return `${entity}${peer}의 ${property}: ${compact(value, 260)}.`;
+    if (fact?.renderable !== true || !text(fact?.evidenceText || '').trim()) return '';
+    const evidence = cleanDiegeticFragment(fact.evidenceText, 'assistant');
+    return fitNarrativeTextToBudget(evidence, 320);
   };
 
   const chronologicalRecallItems = (items = []) => (Array.isArray(items) ? items : [])
@@ -10046,14 +11743,6 @@
     return out;
   };
 
-  const chronologicalQualifier = (index, total, temporalIntent) => {
-    if (![TEMPORAL_INTENTS.TIMELINE, TEMPORAL_INTENTS.COMPARE].includes(temporalIntent)) return '';
-    if (total <= 1) return '그때 — ';
-    if (index === 0) return '먼저 — ';
-    if (index === total - 1) return '가장 최근에는 — ';
-    return '그 뒤 — ';
-  };
-
   const formatFlashbackDynamicEvidenceBlock = (recall, settings = Runtime.settings || DEFAULTS) => {
     const items = Array.isArray(recall?.records) ? recall.records : [];
     const stateFacts = Array.isArray(recall?.currentStateFacts) ? recall.currentStateFacts : [];
@@ -10062,10 +11751,26 @@
     const queryAnchors = extractRecallAnchors(recall?.queryText || '');
     const truthIntent = recall?.truthIntent || TRUTH_INTENTS.NORMAL;
     const temporalIntent = recall?.temporalIntent || TEMPORAL_INTENTS.UNSPECIFIED;
-    const stateLines = stateFacts.slice(0, 14)
-      .map(structuredStateSentence)
-      .filter(Boolean)
-      .map(sentence => `- ${sentence}`);
+    const evidenceKey = value => text(value).normalize('NFKC').replace(/\s+/g, ' ').trim();
+    const rawStateLines = [];
+    const seenStateEvidence = new Set();
+    for (const fact of stateFacts.slice(0, 14)) {
+      const sentence = structuredStateSentence(fact);
+      const key = evidenceKey(sentence);
+      if (!sentence || !key || seenStateEvidence.has(key)) continue;
+      seenStateEvidence.add(key);
+      rawStateLines.push(`- ${sentence}`);
+    }
+    const stateBudget = items.length ? Math.max(120, Math.floor(max * 0.35)) : Math.max(120, max - 40);
+    const stateLines = [];
+    let stateChars = 0;
+    for (const line of rawStateLines) {
+      const remaining = stateBudget - stateChars - (stateLines.length ? 1 : 0);
+      if (remaining < 40) break;
+      if (line.length > remaining) continue;
+      stateLines.push(line);
+      stateChars += line.length + (stateLines.length > 1 ? 1 : 0);
+    }
     const orderedItems = chronologicalRecallItems(items);
     const fixedChars = stateLines.join('\n').length + 180;
     const availableForEvents = Math.max(120, max - fixedChars);
@@ -10074,29 +11779,97 @@
     const renderItems = evenlySampleChronologicalItems(orderedItems, renderCapacity);
     const perItemBudget = Math.max(120, Math.min(1100, Math.floor(availableForEvents / Math.max(1, renderItems.length)) - 12));
     const renderedEvents = [];
+    const seenEventUnitsBySource = new Map();
     for (let index = 0; index < renderItems.length; index += 1) {
       const item = renderItems[index];
-      const sourceText = diegeticRecallSourceText(item?.record || item);
+      const record = item?.record || item;
+      const sourceText = diegeticRecallSourceText(record);
       if (!sourceText) continue;
       const excerpt = bestRecallExcerpt(sourceText, queryAnchors, settings, perItemBudget);
       if (!excerpt.text) continue;
-      renderedEvents.push({
-        excerpt: excerpt.text,
-        disputed: truthIntent === TRUTH_INTENTS.DISPUTED || item.components?.heat?.tier === 'disputed'
-      });
+      const sourceKey = text(record?.sourceHash || record?.sourceId || record?.id || record?.hash || `item:${index}`);
+      if (!seenEventUnitsBySource.has(sourceKey)) seenEventUnitsBySource.set(sourceKey, new Set());
+      const seenUnits = seenEventUnitsBySource.get(sourceKey);
+      const segmented = recallNarrativeUnits(excerpt.text, 2000, { preserveWholeUnits: true });
+      let runStart = null;
+      let runEnd = null;
+      const currentItemUnitKeys = [];
+      const flushRun = () => {
+        if (runStart == null || runEnd == null || runEnd <= runStart) return;
+        const exactRun = segmented.body.slice(runStart, runEnd).trim();
+        if (exactRun) {
+          renderedEvents.push({
+            excerpt: exactRun,
+            disputed: truthIntent === TRUTH_INTENTS.DISPUTED || item.components?.heat?.tier === 'disputed'
+          });
+        }
+        runStart = null;
+        runEnd = null;
+      };
+      for (const unit of segmented.units) {
+        const key = evidenceKey(unit.text);
+        if (!key || seenUnits.has(key)) {
+          flushRun();
+          continue;
+        }
+        currentItemUnitKeys.push(key);
+        if (runStart == null) runStart = unit.start;
+        runEnd = unit.end;
+      }
+      flushRun();
+      for (const key of currentItemUnitKeys) seenUnits.add(key);
     }
-    const eventLines = renderedEvents.map((entry, index) => {
-      const qualifier = chronologicalQualifier(index, renderedEvents.length, temporalIntent);
-      const circumstance = entry.disputed ? '엇갈리는 정황 속에서 — ' : '';
-      return `- ${qualifier}${circumstance}${entry.excerpt.replace(/\n/g, '\n  ')}`;
-    });
-    const sections = [];
-    if (eventLines.length) sections.push(`${truthIntent === TRUTH_INTENTS.DISPUTED ? '엇갈리는 지난 일의 흐름' : '지난 일의 흐름'}:\n${eventLines.join('\n')}`);
-    if (stateLines.length) sections.push(`지금의 모습:\n${stateLines.join('\n')}`);
-    if (!sections.length) return '';
-    const body = sections.join('\n\n');
+    // Relevance, chronology and dispute handling stay internal. The model sees
+    // only ordered, exact narrative excerpts—not an interpretation invented by
+    // the memory tool.
+    const eventLines = renderedEvents.map(entry => `- ${entry.excerpt.replace(/\n/g, '\n  ')}`);
+    const stateLinePool = stateLines.slice();
+    const removedStateLines = new Set();
+    const refreshStateLines = () => {
+      const eventEvidenceKeys = new Set();
+      for (const line of eventLines) {
+        const excerpt = line.replace(/^\-\s*/, '').replace(/\n  /g, '\n');
+        const fullKey = evidenceKey(excerpt);
+        if (fullKey) eventEvidenceKeys.add(fullKey);
+        for (const sentence of splitRecallSentences(excerpt, 2000)) {
+          const sentenceKey = evidenceKey(sentence);
+          if (sentenceKey) eventEvidenceKeys.add(sentenceKey);
+        }
+      }
+      const visibleStateLines = stateLinePool.filter(line => (
+        !removedStateLines.has(line)
+        && !eventEvidenceKeys.has(evidenceKey(line.replace(/^\-\s*/, '')))
+      ));
+      stateLines.splice(0, stateLines.length, ...visibleStateLines);
+    };
+    refreshStateLines();
+    const renderBody = () => {
+      const sections = [];
+      if (eventLines.length) sections.push(eventLines.join('\n'));
+      if (stateLines.length) sections.push(stateLines.join('\n'));
+      return sections.join('\n\n');
+    };
+    let body = renderBody();
+    while (body.length > max && (eventLines.length > 1 || stateLines.length > 1)) {
+      if (eventLines.length > 1) {
+        const timeline = [TEMPORAL_INTENTS.TIMELINE, TEMPORAL_INTENTS.COMPARE].includes(temporalIntent);
+        eventLines.splice(timeline && eventLines.length > 2 ? 1 : 0, 1);
+        refreshStateLines();
+      } else {
+        removedStateLines.add(stateLines[stateLines.length - 1]);
+        refreshStateLines();
+      }
+      body = renderBody();
+    }
+    if (!body) return '';
     if (body.length <= max) return body;
-    return compact(body, max);
+    if (eventLines.length && stateLines.length) {
+      stateLines.length = 0;
+      body = renderBody();
+      if (body.length <= max) return body;
+    }
+    const bareEvidence = [...eventLines, ...stateLines].join('\n\n');
+    return bareEvidence && bareEvidence.length <= max ? bareEvidence : '';
   };
 
   // 레거시 호환: 기존 formatRecallBlock 호출자를 위해 동적 블록만 반환.
@@ -11287,6 +13060,7 @@
     const expectedPairIndex = continuesExistingAssistant
       ? Number(lastPair.pairIndex || liveState.pairCount || 1)
       : Number(liveState.pairCount || 0) + 1;
+    const baselineAssistantText = continuesExistingAssistant ? canonicalChatResponseText(lastPair.assistantText || '') : '';
     const pending = enqueuePendingTurn({
       latestUser,
       retrievalQuery,
@@ -11304,12 +13078,23 @@
       expectedAssistantPosition,
       turnIndex: expectedPairIndex,
       baselineAssistantPosition: continuesExistingAssistant ? expectedAssistantPosition : 0,
-      baselineAssistantText: continuesExistingAssistant ? canonicalChatResponseText(lastPair.assistantText || '') : '',
+      baselineAssistantText,
+      baselineAssistantHash: baselineAssistantText ? stableHash(baselineAssistantText) : '',
       at: Date.now()
     });
+    let journal = { saved: false, reason: pending ? 'not_attempted' : 'not_queued' };
+    if (pending) {
+      try {
+        journal = await persistPendingCaptureJournalEntry(pending);
+      } catch (error) {
+        journal = { saved: false, reason: 'storage_write_failed', error: formatErrorMessage(error, 320) };
+        warn('pending capture journal save failed', error);
+      }
+    }
     return {
       queued: !!pending,
       pending,
+      journal,
       latestUser,
       retrievalQuery,
       normalizedMessages,
@@ -11337,6 +13122,7 @@
     const expected = Number(pending.expectedAssistantPosition || pending.turnIndex || 0) || 0;
     const baselinePosition = Number(pending.baselineAssistantPosition || 0) || 0;
     const baselineText = canonicalChatResponseText(pending.baselineAssistantText || '');
+    const baselineHash = text(pending.baselineAssistantHash || '').trim();
     const assistants = messages
       .filter(message => message?.role === 'assistant')
       .map(message => ({
@@ -11369,7 +13155,10 @@
       resolverMismatch = !!(pending.latestUser && !sameTurnText(pair.userText, pending.latestUser));
     }
     const finalizedPairText = canonicalChatResponseText(pair?.assistantText || candidate.body);
-    if (baselinePosition === candidate.position && baselineText && sameTurnText(finalizedPairText, baselineText)) return null;
+    if (baselinePosition === candidate.position) {
+      if (baselineHash && stableHash(finalizedPairText) === baselineHash) return null;
+      if (baselineText && sameTurnText(finalizedPairText, baselineText)) return null;
+    }
     return {
       ...candidate,
       authoritativePair: pair || null,
@@ -11399,6 +13188,130 @@
     return derived?.scopeKey === scope.scopeKey;
   };
 
+  const recoverPendingCapturesFromJournal = async (settings = Runtime.settings || DEFAULTS, options = {}) => {
+    const startedAt = Date.now();
+    const entries = await loadPendingCaptureJournalEntries();
+    if (!entries.length) {
+      const result = { at: startedAt, entries: 0, recovered: 0, discarded: 0, deferred: 0, reason: 'journal_empty' };
+      Runtime.lastPendingCaptureRecovery = result;
+      return result;
+    }
+    const snapshot = options.snapshot || await loadRisuSnapshot(false);
+    const scope = resolveScopeFromSnapshot(snapshot);
+    if (!scope?.scopeKey) {
+      const result = { at: startedAt, entries: entries.length, recovered: 0, discarded: 0, deferred: entries.length, reason: 'scope_unavailable' };
+      Runtime.lastPendingCaptureRecovery = result;
+      return result;
+    }
+    applyCurrentScope(scope);
+    const live = liveChatReadState(snapshot.chat || {});
+    if (!live.known) {
+      const result = { at: startedAt, scopeKey: scope.scopeKey, entries: entries.length, recovered: 0, discarded: 0, deferred: entries.length, reason: 'live_chat_unavailable' };
+      Runtime.lastPendingCaptureRecovery = result;
+      return result;
+    }
+    const currentEntries = entries.filter(entry => entry.scopeKey === scope.scopeKey);
+    if (settings.mode === 'off' || !settings.captureAfterRequest) {
+      await removePendingCaptureJournalEntries(currentEntries.map(entry => entry.pendingId));
+      const result = {
+        at: startedAt,
+        scopeKey: scope.scopeKey,
+        entries: entries.length,
+        recovered: 0,
+        discarded: currentEntries.length,
+        deferred: entries.length - currentEntries.length,
+        reason: 'capture_disabled'
+      };
+      Runtime.lastPendingCaptureRecovery = result;
+      return result;
+    }
+    const liveState = liveChatStateFromNormalized(live.normalized);
+    const discardedIds = [];
+    const recovered = [];
+    for (const entry of currentEntries) {
+      const expectedUserIndex = Math.max(0, Number(entry.userMessagePosition || 0) - 1);
+      const directUser = live.normalized[expectedUserIndex];
+      const directUserText = directUser?.role === 'user'
+        ? canonicalChatUserText(directUser.contentText || directUser.content || '')
+        : '';
+      let userMessage = directUserText && stableHash(directUserText) === entry.userTextHash
+        ? { message: directUser, body: directUserText, position: expectedUserIndex + 1 }
+        : null;
+      if (!userMessage) {
+        const matchingUsers = live.normalized
+          .filter(message => message?.role === 'user')
+          .map(message => ({
+            message,
+            body: canonicalChatUserText(message.contentText || message.content || ''),
+            position: Number(message.index || 0) + 1
+          }))
+          .filter(item => item.body && stableHash(item.body) === entry.userTextHash);
+        userMessage = matchingUsers.length ? matchingUsers[matchingUsers.length - 1] : null;
+      }
+      if (!userMessage) {
+        discardedIds.push(entry.pendingId);
+        continue;
+      }
+      let pair = liveState.pairByIndex instanceof Map ? liveState.pairByIndex.get(Number(entry.pairIndex || 0)) : null;
+      if (pair?.userText && stableHash(canonicalChatUserText(pair.userText)) !== entry.userTextHash) pair = null;
+      if (!pair) {
+        pair = (liveState.pairs || []).find(candidate =>
+          candidate?.userText
+          && stableHash(canonicalChatUserText(candidate.userText)) === entry.userTextHash
+          && (!entry.userMessagePosition || Number(candidate.userPosition || 0) === Number(userMessage.position || 0))
+        ) || null;
+      }
+      const pending = enqueuePendingTurn({
+        pendingId: entry.pendingId,
+        latestUser: userMessage.body,
+        retrievalQuery: buildRecallQuery(userMessage.body, live.normalized, settings),
+        messageHash: entry.messageHash,
+        userTextHash: entry.userTextHash,
+        requestUserIndex: entry.requestUserIndex,
+        resolutionSource: entry.resolutionSource || 'pending_journal',
+        resolutionConfidence: entry.resolutionConfidence || 'hash_verified',
+        terminalPrefillIndex: entry.terminalPrefillIndex,
+        scope,
+        requestType: entry.requestType || 'model',
+        requestMessageCount: entry.requestMessageCount,
+        pairIndex: Number(pair?.pairIndex || entry.pairIndex || 0) || inferPairIndexFromAssistantPosition(entry.expectedAssistantPosition),
+        userMessagePosition: Number(pair?.userPosition || userMessage.position || entry.userMessagePosition || 0) || 0,
+        expectedAssistantPosition: Number(pair?.assistantPosition || entry.expectedAssistantPosition || 0) || 0,
+        turnIndex: Number(pair?.pairIndex || entry.pairIndex || 0) || 0,
+        baselineAssistantPosition: entry.baselineAssistantPosition,
+        baselineAssistantText: '',
+        baselineAssistantHash: entry.baselineAssistantHash,
+        recoveredFromJournal: true,
+        at: entry.at
+      });
+      if (!pending) {
+        discardedIds.push(entry.pendingId);
+        continue;
+      }
+      recovered.push(pending);
+      scheduleFinalizedCaptureMonitor(pending, settings);
+    }
+    if (discardedIds.length) await removePendingCaptureJournalEntries(discardedIds);
+    const result = {
+      at: startedAt,
+      scopeKey: scope.scopeKey,
+      entries: entries.length,
+      activeScopeEntries: currentEntries.length,
+      recovered: recovered.length,
+      discarded: discardedIds.length,
+      deferred: entries.length - currentEntries.length,
+      reason: recovered.length ? 'monitor_resumed' : (currentEntries.length ? 'no_recoverable_turn' : 'other_scope_only')
+    };
+    Runtime.lastPendingCaptureRecovery = result;
+    if (recovered.length) {
+      pushActivityLog('capture_recovered_after_reload', '새로고침 전에 대기 중이던 응답 캡처를 다시 확인합니다.', {
+        scopeKey: scope.scopeKey,
+        recovered: recovered.length
+      }, 'info');
+    }
+    return result;
+  };
+
   const saveFinalizedChatCapture = async (pending, candidate, snapshot, settings) => {
     const pendingId = text(pending?.pendingId || '');
     if (!pendingId || Runtime.finalizedCaptureInFlight.has(pendingId)) return false;
@@ -11419,7 +13332,7 @@
       const assistantPosition = Number(pair?.assistantPosition || candidate.position || 0) || candidate.position;
       const assistantRaw = candidate.raw || pair?.assistantText || candidate.body || '';
       const assistant = sanitizeAssistantForMemory(assistantRaw).trim();
-      if (assistant.length < settings.minCaptureChars) return false;
+      if (!assistant) return false;
       const userMessagePosition = Number(pair?.userPosition || pending.userMessagePosition || 0) || Math.max(0, candidate.position - 1);
       const latestUser = pair?.userText || candidate?.authoritativeUserText || pending.latestUser;
       if (!canonicalChatUserText(latestUser || '')) return false;
@@ -11532,19 +13445,6 @@
             state.pollDelayMs = Math.min(FINALIZED_CAPTURE_IDLE_POLL_MS, Number(state.pollDelayMs || FINALIZED_CAPTURE_POLL_MS) + 300);
             const stableFor = Date.now() - Number(state.stableSince || Date.now());
             const requestQuietFor = Date.now() - requestAt;
-            if (candidate.body.length < settings.minCaptureChars && stableFor >= FINALIZED_CAPTURE_SHORT_GRACE_MS) {
-              removePendingTurnById(pendingId);
-              Runtime.lastCapture = { at: Date.now(), skipped: true, reason: 'finalized_assistant_too_short', scopeKey: current.scope?.scopeKey || '', chars: candidate.body.length };
-              pushActivityLog('capture_skipped', '최종 응답이 최소 캡처 길이보다 짧아 저장하지 않았습니다.', {
-                scopeKey: current.scope?.scopeKey || '',
-                pairIndex: Number(current.pairIndex || 0) || 0,
-                chars: candidate.body.length,
-                minCaptureChars: settings.minCaptureChars,
-                reason: 'finalized_assistant_too_short'
-              }, 'warn');
-              stopFinalizedCaptureMonitor(pendingId);
-              return;
-            }
             if (stableFor >= FINALIZED_CAPTURE_STABLE_MS && requestQuietFor >= FINALIZED_CAPTURE_STABLE_MS) {
               const saved = await saveFinalizedChatCapture(current, candidate, snapshot, settings);
               if (saved) {
@@ -11832,6 +13732,7 @@
         rrfUnionCount: recall.rrfUnionCount || 0,
         laneDiagnostics: recall.laneDiagnostics || null,
         inactiveBranchFiltered: recall.inactiveBranchFiltered || 0,
+        worldlineMismatchFiltered: recall.worldlineMismatchFiltered || 0,
         privacyFiltered: recall.privacyFiltered || 0,
         sparseCache: recall.sparseCache || null,
         stageElapsed: recall.stageElapsed || null,
@@ -12013,7 +13914,9 @@
   };
 
   const debugRecordsSnapshot = async (scopeOverride = null, options = {}) => {
-    const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false));
+    const scope = scopeOverride?.scopeKey
+      ? scopeOverride
+      : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScopeForGui());
     const limit = clampInt(options.limit, 0, 1000000, 0);
     const includeRecords = options.includeRecords !== false;
     const loaded = await loadScopeRecords(scope.scopeKey);
@@ -12044,9 +13947,80 @@
     return {
       schema: 'flashback_memory_ledger_inspection_v1',
       readOnly: true,
+      recordsIncluded: options?.includeRecords !== false,
       version: PLUGIN_VERSION,
       ...snapshot
     };
+  };
+
+  let memoryBridgeIpcRegistered = false;
+  const registerMemoryBridgeIpc = async () => {
+    if (memoryBridgeIpcRegistered) return true;
+    const api = getLiveApi(['addPluginChannelListener', 'postPluginChannelMessage']);
+    if (typeof api?.addPluginChannelListener !== 'function'
+      || typeof api?.postPluginChannelMessage !== 'function') return false;
+    await api.addPluginChannelListener(
+      MEMORY_SESSION_BRIDGE_REQUEST_CHANNEL,
+      async (message, metadata = {}) => {
+        const request = message && typeof message === 'object' && !Array.isArray(message)
+          ? message
+          : {};
+        const requestId = text(request.requestId || '').trim();
+        const action = text(request.action || '').trim();
+        if (request.schema !== MEMORY_SESSION_BRIDGE_IPC_SCHEMA
+          || request.kind !== 'request'
+          || !requestId
+          || !action) return;
+        const sender = text(metadata?.sender || '').trim();
+        if (sender && sender !== MEMORY_SESSION_BRIDGE_PLUGIN_ID) return;
+        let result = null;
+        let errorText = '';
+        try {
+          if (action === 'inspect') {
+            const includeRecords = request.payload?.includeRecords === true;
+            const inspected = await inspectMemoryLedger(null, {
+              includeRecords,
+              limit: request.payload?.limit
+            });
+            if (includeRecords) {
+              result = inspected;
+            } else {
+              const { shardSummaries: _omittedShardSummaries, ...compactManifest } = inspected.manifest || {};
+              result = {
+                ...inspected,
+                manifest: compactManifest,
+                records: []
+              };
+            }
+          } else if (action === 'adopt_session_handoff') {
+            result = await adoptSessionHandoff(request.payload || {});
+          } else {
+            throw new Error(`Unsupported Flashback bridge IPC action: ${action}`);
+          }
+        } catch (error) {
+          errorText = formatErrorMessage(error, 900);
+        }
+        try {
+          await api.postPluginChannelMessage(
+            MEMORY_SESSION_BRIDGE_PLUGIN_ID,
+            MEMORY_SESSION_BRIDGE_RESPONSE_CHANNEL,
+            {
+              schema: MEMORY_SESSION_BRIDGE_IPC_SCHEMA,
+              kind: 'response',
+              requestId,
+              action,
+              ok: !errorText,
+              result: errorText ? null : result,
+              error: errorText
+            }
+          );
+        } catch (error) {
+          warn('Memory Bridge IPC response failed', error);
+        }
+      }
+    );
+    memoryBridgeIpcRegistered = true;
+    return true;
   };
 
   const debugScopeStatsSnapshot = async (scope) => debugRecordsSnapshot(scope, { includeRecords: false });
@@ -12099,6 +14073,11 @@
     return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
   };
 
+  const recordNarrativeChunkVersion = (record = {}) => {
+    const value = Number(record?.chunkSchemaVersion || record?.metadata?.chunkSchemaVersion || 0);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+  };
+
   const recordNeedsLiveSanitizerRebuild = (record = {}) => {
     if (!isResponseMemoryRecord(record) || record.autoEpisode || record.sourceType === 'episode_index') return false;
     if (containsPeerPacketInjectionArtifact(record.text || '')) return true;
@@ -12119,6 +14098,7 @@
     const nextSanitizerVersion = options.authoritativeSource === true || locallyPromotable
       ? MEMORY_SANITIZER_VERSION
       : previousSanitizerVersion;
+    const textChanged = cleanedText !== originalText;
     const metadata = {
       ...previousMetadata,
       ...artifacts,
@@ -12139,7 +14119,23 @@
       // v3 peer-derived metadata is detached locally without re-embedding.
       memorySanitizerVersion: nextSanitizerVersion
     };
-    const structuredStateFacts = structuredStateFactsFromMetadata(metadata, { turn: finiteTurnIndex(record) });
+    const structuredStateFacts = (Array.isArray(record?.structuredStateFacts)
+      ? recordStructuredStateFacts(record)
+      : structuredStateFactsFromMetadata(metadata, { turn: finiteTurnIndex(record) }))
+      .map(fact => {
+        const hasStoredOffsets = Number(fact.evidenceStart || 0) !== 0 || Number(fact.evidenceEnd || 0) !== 0;
+        if (textChanged || (!fact.evidenceText && hasStoredOffsets) || (fact.evidenceText && !cleanedText.includes(fact.evidenceText))) {
+          return {
+            ...fact,
+            renderable: false,
+            evidenceStart: 0,
+            evidenceEnd: 0,
+            evidenceOffsetsInvalidated: true
+          };
+        }
+        if (!fact.evidenceText) return fact;
+        return fact;
+      });
     const entityAnchors = Array.from(new Set([
       ...extractEntityAnchors(`${record.title || ''}
 ${Array.isArray(record.tags) ? record.tags.join(' ') : ''}
@@ -12156,6 +14152,9 @@ ${cleanedText}`, 80),
     const next = {
       ...record,
       ...(hash ? { hash } : {}),
+      ...(cleanedText !== originalText && recordNarrativeChunkVersion(record) >= NARRATIVE_CHUNK_SCHEMA_VERSION
+        ? { chunkSchemaVersion: 0, chunkOffsetsInvalidated: true }
+        : {}),
       text: cleanedText,
       metadata,
       entityAnchors,
@@ -12165,7 +14164,6 @@ ${cleanedText}`, 80),
       tokenEstimate: estimateTokens(cleanedText),
       importanceScore: computeImportanceDensity(cleanedText)
     };
-    const textChanged = cleanedText !== originalText;
     const anchorsChanged = !arraysEqual(entityAnchors, Array.isArray(record.entityAnchors) ? record.entityAnchors.map(normalizeEntityAnchor).filter(Boolean) : []);
     const metadataChanged = nextSanitizerVersion !== previousSanitizerVersion
       || hadLegacyPeerMetadata
@@ -12190,6 +14188,7 @@ ${cleanedText}`, 80),
       reembedChanged: true,
       rebuildEpisodes: true,
       retireExternal: true,
+      forceIndexRebuild: false,
       dryRun: false,
       ...options
     };
@@ -12224,7 +14223,9 @@ ${cleanedText}`, 80),
       reembedRequired: 0,
       episodeIndexesPresent: records.filter(record => record.autoEpisode || record.sourceType === 'episode_index').length,
       episodeIndexesRemoved: 0,
-      episodeRebuildRequested: !!opts.rebuildEpisodes
+      episodeRebuildRequested: !!opts.rebuildEpisodes,
+      indexRebuildRequested: !!opts.forceIndexRebuild,
+      indexRebuilt: false
     };
     const baseRecords = records.filter(record => !(record.autoEpisode || record.sourceType === 'episode_index'));
     const next = [];
@@ -12280,10 +14281,13 @@ ${cleanedText}`, 80),
         }
       }
     }
-    const requiresBaseSave = result.changed > 0 || (opts.reembedChanged && result.reembedRequired > 0);
+    const requiresBaseSave = result.changed > 0
+      || (opts.reembedChanged && result.reembedRequired > 0)
+      || opts.forceIndexRebuild === true;
     const saved = requiresBaseSave
       ? await withScopeWriteLock(scope.scopeKey, () => saveScopeRecords(scope, next, settings, scope))
       : loaded;
+    result.indexRebuilt = opts.forceIndexRebuild === true && requiresBaseSave;
     result.episodeIndexesRemoved = requiresBaseSave ? result.episodeIndexesPresent : 0;
     let episode = { rebuilt: false, reason: 'skipped' };
     if (opts.rebuildEpisodes) episode = await maybeRebuildEpisodeIndex(scope, settings, null, {
@@ -12308,7 +14312,6 @@ ${cleanedText}`, 80),
     for (const source of sources || []) {
       const body = sanitizeAssistantForMemory(source?.text || source?.content || '', { stripRolePrefix: false });
       for (const chunk of splitTextIntoChunks(body, settings.chunkChars, settings.chunkOverlap)) {
-        if (isLowValueMemoryChunk(chunk, source)) continue;
         chunks += 1;
         tokens += estimateTokens(chunk);
       }
@@ -12321,7 +14324,7 @@ ${cleanedText}`, 80),
     if (text(plan.storageForeignScopeKey || '').trim()) {
       return { strategy: 'scope_collision', stages: [], blocked: true, reason: 'storage_scope_collision' };
     }
-    if ((Number(plan.legacySanitizerRecords || 0) > 0 || Number(plan.storageMissingShards || 0) > 0 || plan.storageManifestCorrupt === true || plan.storageRecordCountMismatch === true) && !Number(plan.liveTurns || 0)) {
+    if ((Number(plan.legacySanitizerRecords || 0) > 0 || Number(plan.liveChunkSchemaMismatch || 0) > 0 || Number(plan.storageMissingShards || 0) > 0 || plan.storageManifestCorrupt === true || plan.storageRecordCountMismatch === true) && !Number(plan.liveTurns || 0)) {
       return { strategy: 'live_source_required', stages: [], blocked: true };
     }
     if (plan.requiresFullRebuild) {
@@ -12341,12 +14344,13 @@ ${cleanedText}`, 80),
       || Number(plan.dimensionMismatch || 0) > 0;
     const needsCleanup = needsContentSync || needsVectorRepair || Number(plan.dirtyRecords || 0) > 0
       || Number(plan.externalRecords || 0) > 0
-      || plan.episodeStale === true;
+      || plan.episodeStale === true
+      || plan.shardIndexMismatch === true;
     const stages = [];
     if (needsSync) stages.push('sync');
     if (needsCleanup) stages.push('cleanup');
     if (needsVectorRepair) stages.push('reembed');
-    if (needsContentSync || needsVectorRepair || plan.episodeStale) stages.push('episode_rebuild');
+    if (needsContentSync || needsVectorRepair || plan.episodeStale || plan.shardIndexMismatch) stages.push('episode_rebuild');
     return { strategy: stages.length ? 'targeted_repair' : 'no_action', stages };
   };
 
@@ -12361,6 +14365,10 @@ ${cleanedText}`, 80),
     const storageManifestCorrupt = rawLoaded.manifest?.manifestCorrupt === true;
     const storageForeignScopeKey = text(rawLoaded.manifest?.foreignScopeKey || '').trim();
     const storageRecordCountMismatch = rawLoaded.manifest?.recordCountMismatch === true;
+    const shardIndexVersion = Math.max(0, Number(rawLoaded.manifest?.shardIndexVersion || 0) || 0);
+    const shardIndexMismatch = shardIndexVersion < FLASHBACK_SHARD_INDEX_VERSION
+      || (Array.isArray(rawLoaded.manifest?.shardSummaries)
+        && rawLoaded.manifest.shardSummaries.length !== Math.max(0, Number(rawLoaded.manifest?.shardCount || 0) || 0));
     const records = rawLoaded.records.filter(isRetainedMemoryRecord);
     const responseRecords = records.filter(record => isResponseMemoryRecord(record) && !(record.autoEpisode || record.sourceType === 'episode_index'));
     const episodeRecords = records.filter(record => record.autoEpisode || record.sourceType === 'episode_index');
@@ -12375,6 +14383,8 @@ ${cleanedText}`, 80),
     let sanitizerVersionMismatch = 0;
     let legacySanitizerRecords = 0;
     let targetedSanitizerRecords = 0;
+    let liveChunkSchemaMismatch = 0;
+    let inheritedChunkSchemaMismatch = 0;
     let recordsNeedingEmbedding = 0;
     let repairTokens = 0;
     for (const record of responseRecords) {
@@ -12393,6 +14403,7 @@ ${cleanedText}`, 80),
       const dimBad = Number(record.dim || 0) !== (Array.isArray(record.vector) ? record.vector.length : 0)
         || (settings.embeddingProvider === 'hash' && Array.isArray(record.vector) && record.vector.length !== settings.hashDimensions);
       const sanitizerVersionBad = recordNeedsLiveSanitizerRebuild(record);
+      const chunkVersionBad = recordNarrativeChunkVersion(record) < NARRATIVE_CHUNK_SCHEMA_VERSION;
       if (dirty) dirtyRecords += 1;
       if (providerBad) providerMismatch += 1;
       if (vectorMissing) missingVectors += 1;
@@ -12402,6 +14413,10 @@ ${cleanedText}`, 80),
         if (recordMemorySanitizerVersion(record) < 2) legacySanitizerRecords += 1;
         else targetedSanitizerRecords += 1;
       }
+      if (chunkVersionBad) {
+        if (isInheritedScopeMemoryRecord(record, scope.scopeKey)) inheritedChunkSchemaMismatch += 1;
+        else liveChunkSchemaMismatch += 1;
+      }
       if (cleaned.textChanged || providerBad || vectorMissing || dimBad) {
         recordsNeedingEmbedding += 1;
         repairTokens += estimateTokens(cleaned.record.text || record.text || '');
@@ -12409,7 +14424,7 @@ ${cleanedText}`, 80),
     }
     const requiresFullRebuild = !storageForeignScopeKey
       && sources.length > 0
-      && (legacySanitizerRecords > 0 || storageMissingShards > 0 || storageManifestCorrupt || storageRecordCountMismatch);
+      && (legacySanitizerRecords > 0 || liveChunkSchemaMismatch > 0 || storageMissingShards > 0 || storageManifestCorrupt || storageRecordCountMismatch);
     const syncEstimate = maintenanceSourceEmbeddingEstimate(requiresFullRebuild ? sources : diff.selected, settings);
     const baseDigest = episodeSourceDigestForRecords(responseRecords, settings);
     const episodeStale = settings.episodeIndexEnabled
@@ -12437,11 +14452,17 @@ ${cleanedText}`, 80),
       dimensionMismatch,
       legacySanitizerRecords,
       targetedSanitizerRecords,
+      liveChunkSchemaMismatch,
+      inheritedChunkSchemaMismatch,
+      narrativeChunkSchemaVersion: NARRATIVE_CHUNK_SCHEMA_VERSION,
       storageMissingShards,
       storageCorruptShards,
       storageManifestCorrupt,
       storageForeignScopeKey,
       storageRecordCountMismatch,
+      shardIndexVersion,
+      shardIndexExpectedVersion: FLASHBACK_SHARD_INDEX_VERSION,
+      shardIndexMismatch,
       sanitizerVersionMismatch,
       requiresFullRebuild,
       recordsNeedingEmbedding,
@@ -12463,7 +14484,9 @@ ${cleanedText}`, 80),
       && !plan.storageManifestCorrupt
       && !plan.storageForeignScopeKey
       && !plan.storageRecordCountMismatch
+      && !plan.shardIndexMismatch
       && !plan.sanitizerVersionMismatch
+      && !plan.liveChunkSchemaMismatch
       && !plan.episodeStale;
     plan.automatic = automaticMaintenanceStrategyForPlan(plan);
     return plan;
@@ -12507,7 +14530,9 @@ ${cleanedText}`, 80),
             ? 'storage_manifest_corrupt'
             : (before.storageRecordCountMismatch === true
               ? 'storage_record_count_mismatch'
-              : (Number(before.storageMissingShards || 0) > 0 ? 'storage_shards_missing' : 'memory_sanitizer_revision_mismatch')),
+              : (Number(before.storageMissingShards || 0) > 0
+                ? 'storage_shards_missing'
+                : (Number(before.liveChunkSchemaMismatch || 0) > 0 ? 'narrative_chunk_schema_mismatch' : 'memory_sanitizer_revision_mismatch'))),
           rebuild
         };
       } else {
@@ -12526,11 +14551,12 @@ ${cleanedText}`, 80),
         if (needsCleanup) {
           stages.push('cleanup');
           if (needsVectorRepair) stages.push('reembed');
-          if (needsSync || needsVectorRepair || before.episodeStale) stages.push('episode_rebuild');
+          if (needsSync || needsVectorRepair || before.episodeStale || before.shardIndexMismatch) stages.push('episode_rebuild');
           cleanup = await cleanAndReembedAllRecords(null, {
             retireExternal: true,
             rebuildEpisodes: true,
-            forceEpisodeRebuild: needsSync || needsVectorRepair || before.episodeStale,
+            forceEpisodeRebuild: needsSync || needsVectorRepair || before.episodeStale || before.shardIndexMismatch,
+            forceIndexRebuild: before.shardIndexMismatch === true,
             reembedChanged: true
           });
         }
@@ -12629,6 +14655,8 @@ ${cleanedText}`, 80),
     `누락 ${formatNumber(plan.missingTurns)} · 변경 ${formatNumber(plan.changedTurns)} · 오래된/고아 ${formatNumber(plan.staleStoredTurns)}`,
     `정제 필요 ${formatNumber(plan.dirtyRecords)} · 외부 구형 데이터 ${formatNumber(plan.externalRecords)}`,
     `정제기 버전 불일치 ${formatNumber(plan.sanitizerVersionMismatch)}${plan.requiresFullRebuild ? ' · 전체 재구축 필요' : ''}`,
+    `문장 청크 v${formatNumber(plan.narrativeChunkSchemaVersion || NARRATIVE_CHUNK_SCHEMA_VERSION)} · 현재 채팅 구형 청크 ${formatNumber(plan.liveChunkSchemaMismatch)} · 인계 기록 구형 청크 ${formatNumber(plan.inheritedChunkSchemaMismatch)}`,
+    `리콜 샤드 인덱스 v${formatNumber(plan.shardIndexVersion)} / v${formatNumber(plan.shardIndexExpectedVersion || FLASHBACK_SHARD_INDEX_VERSION)} · ${plan.shardIndexMismatch ? '재구축 필요' : '정상'}`,
     `저장 무결성: 매니페스트 ${plan.storageManifestCorrupt ? '손상' : '정상'} · 누락 샤드 ${formatNumber(plan.storageMissingShards)} · 손상 샤드 ${formatNumber(plan.storageCorruptShards)} · 개수 불일치 ${plan.storageRecordCountMismatch ? '예' : '아니오'} · 범위 충돌 ${plan.storageForeignScopeKey ? '예' : '아니오'}`,
     `벡터 복구 ${formatNumber(plan.recordsNeedingEmbedding)} · 프로바이더 불일치 ${formatNumber(plan.providerMismatch)}`,
     `에피소드 인덱스 ${plan.episodeStale ? '갱신 필요' : '정상'}`,
@@ -13254,6 +15282,7 @@ ${cleanedText}`, 80),
       recall.laneDiagnostics ? `lane ${formatNumber(laneSelected.short || 0)}/${formatNumber(laneSelected.medium || 0)}/${formatNumber(laneSelected.long || 0)}` : '',
       alignmentLabel ? `align=${alignmentLabel}` : '',
       recall.inactiveBranchFiltered ? `branch-${formatNumber(recall.inactiveBranchFiltered)}` : '',
+      recall.worldlineMismatchFiltered ? `worldline-${formatNumber(recall.worldlineMismatchFiltered)}` : '',
       recall.privacyFiltered ? `privacy-${formatNumber(recall.privacyFiltered)}` : '',
       recall.sparseCache ? `cache ${formatNumber(recall.sparseCache.hits || 0)}/${formatNumber(recall.sparseCache.misses || 0)}` : '',
       recall.stageElapsed?.total != null ? `${formatNumber(recall.stageElapsed.total)}ms` : '',
@@ -14824,6 +16853,12 @@ ${cleanedText}`, 80),
         queued: pruneRequestDecisionQueue().length,
         activeBarrier: Runtime.pendingCaptureBarrier
       },
+      pendingCapture: {
+        runtimeCount: Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns.length : 0,
+        monitorCount: Runtime.finalizedCaptureMonitors.size,
+        journalWritePending: !!Runtime.pendingCaptureJournalWrite,
+        lastRecovery: Runtime.lastPendingCaptureRecovery
+      },
       lastImport: Runtime.lastImport,
       lastClone: Runtime.lastClone,
       lastExternalRetirement: Runtime.lastExternalRetirement,
@@ -14878,9 +16913,11 @@ ${cleanedText}`, 80),
     loadSettings,
     saveSettings,
     memory: Object.freeze({
-      inspect: inspectMemoryLedger
+      inspect: inspectMemoryLedger,
+      adoptSessionHandoff
     }),
     inspectMemoryLedger,
+    adoptSessionHandoff,
     inspectMemoryMaintenance,
     runMemoryMaintenance,
     ingestLiveChatColdStart,
@@ -14910,8 +16947,9 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
+  publicApi._test.currentSceneSourceShardIndexes = currentSceneSourceShardIndexes;
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
 
@@ -14919,6 +16957,7 @@ ${cleanedText}`, 80),
     Runtime.settings = await loadSettings(true);
     Runtime.effectiveSettings = Runtime.settings;
     syncFlashbackRuntimeState(Runtime.settings, Runtime.currentScope || null);
+    await registerMemoryBridgeIpc().catch(error => warn('Memory Bridge IPC registration failed', error));
     pushActivityLog('plugin_started', `${PLUGIN_NAME}가 시작되었습니다.`, {
       version: PLUGIN_VERSION,
       mode: Runtime.settings.mode,
@@ -14942,6 +16981,18 @@ ${cleanedText}`, 80),
       retireExternalRecordsAcrossKnownScopes({ reason: 'startup_response_only_upgrade' })
         .catch(error => warn('external source retirement sweep failed', error));
     }, 1800);
+    scheduleTimer(() => {
+      recoverPendingCapturesFromJournal(Runtime.settings)
+        .catch(error => {
+          Runtime.lastPendingCaptureRecovery = {
+            at: Date.now(),
+            recovered: 0,
+            reason: 'recovery_failed',
+            error: formatErrorMessage(error, 500)
+          };
+          warn('pending capture recovery failed', error);
+        });
+    }, 2600);
     scheduleTimer(() => {
       Promise.resolve().then(async () => {
         const snapshot = await loadRisuSnapshot(false);
