@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.9.20
+//@display-name ⚡ FLASHBACK Memory v0.9.22
 //@api 3.0
-//@version 0.9.20
+//@version 0.9.22
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -69,7 +69,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.20
+ * ⚡ FLASHBACK Memory v0.9.22
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -314,7 +314,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.9.20';
+  const PLUGIN_VERSION = '0.9.22';
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const MEMORY_SESSION_BRIDGE_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
   const MEMORY_SESSION_BRIDGE_PLUGIN_ID = 'flashback_hayaku_bridge';
@@ -355,6 +355,7 @@
     settings: `${PLUGIN_STORAGE_ID}:settings:v2`,
     registry: `${PLUGIN_STORAGE_ID}:scope_registry:v2`,
     operationLog: `${PLUGIN_STORAGE_ID}:operation_log:v1`,
+    maintenanceJournal: `${PLUGIN_STORAGE_ID}:maintenance_journal:v1`,
     pendingCaptureJournal: `${PLUGIN_STORAGE_ID}:pending_capture_journal:v1`,
     localSecret: `${PLUGIN_STORAGE_ID}:embedding_secret:v2`,
     legacyManifest: `${PLUGIN_STORAGE_ID}:manifest:v1`,
@@ -598,6 +599,8 @@
     lastOperationLogError: '',
     activityLogSeq: 0,
     activityLog: [],
+    maintenanceJournal: null,
+    maintenanceActiveOperationId: '',
     sessionEmbeddingKey: '',
     embeddingKeyPersistence: Object.freeze({
       requested: false,
@@ -1006,6 +1009,11 @@
   const OPERATION_LOG_MAX_EVENTS_PER_TURN = 40;
   const OPERATION_LOG_MAX_STORED_CHARS = 70000;
   const ACTIVITY_LOG_MAX_ENTRIES = 30;
+  const MAINTENANCE_JOURNAL_VERSION = 1;
+  const MAINTENANCE_JOURNAL_WRITE_TIMEOUT_MS = 1500;
+  const MAINTENANCE_JOURNAL_STALE_MS = 30 * 60 * 1000;
+  const STORAGE_IO_TIMEOUT_MS = 60000;
+  const REMOTE_EMBEDDING_CONCURRENCY = 2;
 
   const operationLogTurnKey = (data = {}) => {
     const scopeKey = text(data.scopeKey || data.scope?.scopeKey || data.pending?.scope?.scopeKey || Runtime.currentScope?.scopeKey || 'unknown');
@@ -1077,16 +1085,18 @@
 
   const sanitizeOperationLogData = (data = {}) => {
     const out = {};
-    const copyText = ['hook', 'type', 'requestType', 'normalizedType', 'reason', 'oldScopeKey', 'newScopeKey', 'injectionPosition', 'turnHash', 'error', 'mode', 'version'];
+    const copyText = ['hook', 'type', 'requestType', 'normalizedType', 'reason', 'oldScopeKey', 'newScopeKey', 'injectionPosition', 'turnHash', 'error', 'mode', 'version', 'operationId', 'maintenanceMode', 'strategy', 'stage'];
     const copyNumber = [
       'seq', 'timeoutMs', 'messageCount', 'blockChars', 'chars', 'minCaptureChars', 'assistantChars',
       'pairIndex', 'turnIndex', 'stored', 'storedRecords', 'totalRecords', 'candidates', 'selected',
-      'chunks', 'inserted', 'updated', 'deduped', 'attempts'
+      'chunks', 'inserted', 'updated', 'deduped', 'attempts', 'sources', 'liveChatTurns', 'embeddedTurns',
+      'embeddedBatches', 'embeddedChunks', 'embeddedVectors', 'reusedVectors', 'savedShards', 'durationMs'
     ];
-    const copyBool = ['pendingQueued', 'cancelled', 'operationLogEnabled', 'captureAfterRequest', 'injected'];
+    const copyBool = ['pendingQueued', 'cancelled', 'operationLogEnabled', 'captureAfterRequest', 'injected', 'healthy'];
     for (const key of copyText) if (data[key] != null && data[key] !== '') out[key] = compact(data[key], key === 'error' ? 700 : 180);
     for (const key of copyNumber) if (data[key] != null) out[key] = Number(data[key] || 0) || 0;
     for (const key of copyBool) if (data[key] != null) out[key] = !!data[key];
+    if (Array.isArray(data.stages)) out.stages = data.stages.map(stage => compact(stage, 80)).filter(Boolean).slice(0, 16);
     if (data.latestUser) out.latestUser = compact(data.latestUser, 220);
     if (data.retrievalQuery) out.retrievalQuery = compact(data.retrievalQuery, 260);
     if (data.assistant) out.assistant = compact(data.assistant, 220);
@@ -1305,6 +1315,134 @@
     Runtime.activityLogSeq = 0;
     refreshActivityLogPanelIfVisible();
     return true;
+  };
+
+  const normalizeMaintenanceJournal = (value = {}, now = Date.now()) => {
+    if (!value || typeof value !== 'object') return null;
+    const status = ['running', 'completed', 'failed', 'abandoned'].includes(text(value.status || '').trim())
+      ? text(value.status || '').trim()
+      : '';
+    const operationId = compact(value.operationId || '', 120);
+    if (!operationId || !status) return null;
+    const startedAt = Math.max(0, Number(value.startedAt || 0) || 0);
+    const updatedAt = Math.max(startedAt, Number(value.updatedAt || 0) || 0);
+    if (!startedAt || !updatedAt) return null;
+    const progress = value.progress && typeof value.progress === 'object' ? value.progress : {};
+    return {
+      version: MAINTENANCE_JOURNAL_VERSION,
+      operationId,
+      mode: normalizeChoice(value.mode || 'auto', ['auto', 'sync', 'rebuild', 'reembed'], 'auto'),
+      status,
+      stage: compact(value.stage || 'unknown', 80),
+      scopeKey: compact(value.scopeKey || '', 240),
+      strategy: compact(value.strategy || '', 80),
+      stages: Array.isArray(value.stages) ? value.stages.map(stage => compact(stage, 80)).filter(Boolean).slice(0, 16) : [],
+      startedAt,
+      updatedAt,
+      durationMs: Math.max(0, Number(value.durationMs || (status === 'running' ? now - startedAt : 0)) || 0),
+      progress: {
+        sources: Math.max(0, Number(progress.sources || 0) || 0),
+        chunks: Math.max(0, Number(progress.chunks || 0) || 0),
+        embeddedBatches: Math.max(0, Number(progress.embeddedBatches || 0) || 0),
+        embeddedChunks: Math.max(0, Number(progress.embeddedChunks || 0) || 0),
+        embeddedVectors: Math.max(0, Number(progress.embeddedVectors || 0) || 0),
+        reusedVectors: Math.max(0, Number(progress.reusedVectors || 0) || 0),
+        savedShards: Math.max(0, Number(progress.savedShards || 0) || 0)
+      },
+      error: compact(value.error || '', 800),
+      result: value.result && typeof value.result === 'object' ? sanitizeOperationLogData(value.result) : null
+    };
+  };
+
+  const persistMaintenanceJournal = async (patch = {}) => {
+    const now = Date.now();
+    const current = Runtime.maintenanceJournal && typeof Runtime.maintenanceJournal === 'object'
+      ? Runtime.maintenanceJournal
+      : {};
+    const next = normalizeMaintenanceJournal({ ...current, ...patch, updatedAt: now }, now);
+    if (!next) return null;
+    Runtime.maintenanceJournal = next;
+    try {
+      await withDeadline(
+        RisuCompat.setItem(STORAGE.maintenanceJournal, safeStringify(next, '{}')),
+        MAINTENANCE_JOURNAL_WRITE_TIMEOUT_MS,
+        'maintenance journal write'
+      );
+    } catch (error) {
+      warn('maintenance journal write failed', error);
+    }
+    return next;
+  };
+
+  const updateMaintenanceProgress = (operationId, patch = {}) => {
+    const current = Runtime.maintenanceJournal;
+    if (!current || current.status !== 'running' || current.operationId !== operationId) return null;
+    const now = Date.now();
+    const progress = { ...(current.progress || {}), ...(patch.progress || {}) };
+    const next = normalizeMaintenanceJournal({
+      ...current,
+      ...patch,
+      progress,
+      updatedAt: now,
+      durationMs: Math.max(0, now - current.startedAt)
+    }, now);
+    if (!next) return null;
+    Runtime.maintenanceJournal = next;
+    if (patch.busyLabel && Runtime.guiBusyDepth > 0) Runtime.guiBusyLabel = compact(patch.busyLabel, 120);
+    try { applyBusyState(); } catch (_) {}
+    return next;
+  };
+
+  const maintenanceEmbeddingProgressCallback = (operationId, stage = 'embedding') => {
+    if (!operationId) return null;
+    const initial = Runtime.maintenanceJournal?.operationId === operationId
+      ? Runtime.maintenanceJournal.progress || {}
+      : {};
+    const baseBatches = Math.max(0, Number(initial.embeddedBatches || 0) || 0);
+    const baseChunks = Math.max(0, Number(initial.embeddedChunks || 0) || 0);
+    return progress => {
+      const completedBatches = Math.max(0, Number(progress?.completedBatches || 0) || 0);
+      const totalBatches = Math.max(completedBatches, Number(progress?.totalBatches || 0) || 0);
+      const completedTexts = Math.max(0, Number(progress?.completedTexts || 0) || 0);
+      const totalTexts = Math.max(completedTexts, Number(progress?.totalTexts || 0) || 0);
+      updateMaintenanceProgress(operationId, {
+        stage,
+        progress: {
+          ...initial,
+          embeddedBatches: baseBatches + completedBatches,
+          embeddedChunks: baseChunks + completedTexts
+        },
+        busyLabel: `${stage} ${completedBatches}/${totalBatches} 배치 · ${completedTexts}/${totalTexts} 청크`
+      });
+    };
+  };
+
+  const recoverMaintenanceJournal = async () => {
+    try {
+      const stored = await withDeadline(
+        RisuCompat.getItem(STORAGE.maintenanceJournal),
+        MAINTENANCE_JOURNAL_WRITE_TIMEOUT_MS,
+        'maintenance journal read'
+      );
+      const parsed = typeof stored === 'string' ? JSON.parse(stored) : stored;
+      const journal = normalizeMaintenanceJournal(parsed);
+      if (!journal) return null;
+      if (journal.status === 'running') {
+        const stale = Date.now() - journal.updatedAt >= MAINTENANCE_JOURNAL_STALE_MS;
+        return await persistMaintenanceJournal({
+          ...journal,
+          status: 'abandoned',
+          stage: stale ? 'plugin_reloaded_stale' : 'plugin_reloaded',
+          durationMs: Math.max(0, Date.now() - journal.startedAt),
+          error: stale ? 'plugin_reloaded_after_stale_maintenance' : 'plugin_reloaded_during_maintenance'
+        });
+      }
+      Runtime.maintenanceJournal = journal;
+      return journal;
+    } catch (error) {
+      warn('maintenance journal recovery failed', error);
+      return null;
+    }
   };
 
   const pruneRuntimeEphemera = () => {
@@ -2060,7 +2198,9 @@
     const getItem = async (key) => {
       try {
         const storeApi = getLiveApi();
-        if (storeApi?.pluginStorage?.getItem) return await storeApi.pluginStorage.getItem(key);
+        if (storeApi?.pluginStorage?.getItem) {
+          return await withDeadline(storeApi.pluginStorage.getItem(key), STORAGE_IO_TIMEOUT_MS, `pluginStorage read: ${compact(key, 120)}`);
+        }
       } catch (error) { warn('pluginStorage.getItem failed', key, error); }
       return null;
     };
@@ -2069,7 +2209,7 @@
       try {
         const storeApi = getLiveApi();
         if (storeApi?.pluginStorage?.setItem) {
-          await storeApi.pluginStorage.setItem(key, value);
+          await withDeadline(storeApi.pluginStorage.setItem(key, value), STORAGE_IO_TIMEOUT_MS, `pluginStorage write: ${compact(key, 120)}`);
           return true;
         }
       } catch (error) { warn('pluginStorage.setItem failed', key, error); }
@@ -2080,11 +2220,11 @@
       try {
         const storeApi = getLiveApi();
         if (storeApi?.pluginStorage?.removeItem) {
-          await storeApi.pluginStorage.removeItem(key);
+          await withDeadline(storeApi.pluginStorage.removeItem(key), STORAGE_IO_TIMEOUT_MS, `pluginStorage remove: ${compact(key, 120)}`);
           return true;
         }
         if (storeApi?.pluginStorage?.setItem) {
-          await storeApi.pluginStorage.setItem(key, null);
+          await withDeadline(storeApi.pluginStorage.setItem(key, null), STORAGE_IO_TIMEOUT_MS, `pluginStorage clear: ${compact(key, 120)}`);
           return true;
         }
       } catch (error) { warn('pluginStorage.removeItem failed', key, error); }
@@ -2094,7 +2234,7 @@
     const keys = async () => {
       try {
         const storeApi = getLiveApi();
-        if (storeApi?.pluginStorage?.keys) return await storeApi.pluginStorage.keys();
+        if (storeApi?.pluginStorage?.keys) return await withDeadline(storeApi.pluginStorage.keys(), STORAGE_IO_TIMEOUT_MS, 'pluginStorage keys');
       } catch (error) { warn('pluginStorage.keys failed', error); }
       return [];
     };
@@ -2181,10 +2321,12 @@
           timer = setTimeout(() => controller.abort(), timeoutMs);
         }
         const fetchApi = getLiveApi(['nativeFetch']) || getLiveApi(['risuFetch']) || getLiveApi();
-        if (typeof fetchApi?.nativeFetch === 'function') return await fetchApi.nativeFetch(url, requestInit);
-        if (typeof fetchApi?.risuFetch === 'function') return await fetchApi.risuFetch(url, requestInit);
-        if (typeof fetch === 'function') return await fetch(url, requestInit);
-        throw new Error('No fetch API is available for embedding request.');
+        let request;
+        if (typeof fetchApi?.nativeFetch === 'function') request = fetchApi.nativeFetch(url, requestInit);
+        else if (typeof fetchApi?.risuFetch === 'function') request = fetchApi.risuFetch(url, requestInit);
+        else if (typeof fetch === 'function') request = fetch(url, requestInit);
+        else throw new Error('No fetch API is available for embedding request.');
+        return await withDeadline(request, timeoutMs, 'embedding request');
       } finally {
         if (timer) clearTimeout(timer);
       }
@@ -2194,13 +2336,13 @@
   })();
 
   const requireStorageWrite = async (key, value, label = 'pluginStorage write') => {
-    const ok = await RisuCompat.setItem(key, value);
+    const ok = await withDeadline(RisuCompat.setItem(key, value), STORAGE_IO_TIMEOUT_MS, label);
     if (!ok) throw new Error(`${label} failed: ${key}`);
     return true;
   };
 
   const requireStorageRemove = async (key, label = 'pluginStorage remove') => {
-    const ok = await RisuCompat.removeItem(key);
+    const ok = await withDeadline(RisuCompat.removeItem(key), STORAGE_IO_TIMEOUT_MS, label);
     if (!ok) throw new Error(`${label} failed: ${key}`);
     return true;
   };
@@ -3186,13 +3328,17 @@
     return out;
   };
 
-  const responseToJsonOrText = async (response) => {
+  const responseToJsonOrText = async (response, timeoutMs = DEFAULTS.embeddingTimeoutMs) => {
     if (!response) throw new Error('Empty embedding response.');
     if (typeof response.json === 'function') {
-      try { return await response.json(); } catch (_) {}
+      try {
+        return await withDeadline(response.json(), timeoutMs, 'embedding response JSON');
+      } catch (error) {
+        if (error?.code === 'FLASHBACK_DEADLINE') throw error;
+      }
     }
     if (typeof response.text === 'function') {
-      const raw = await response.text();
+      const raw = await withDeadline(response.text(), timeoutMs, 'embedding response text');
       return tryJsonParse(raw, raw);
     }
     return response;
@@ -3226,7 +3372,7 @@
     const model = settings.embeddingModel || defaultModelForProvider('ollama');
     const url = joinUrl(base, 'api/embed');
     const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify({ model, input: texts }) }, settings.embeddingTimeoutMs);
-    const data = await responseToJsonOrText(response);
+    const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
     let embeddings = Array.isArray(data?.embeddings) ? data.embeddings : null;
     if (!embeddings && Array.isArray(data?.embedding)) embeddings = [data.embedding];
     if (!Array.isArray(embeddings) || !Array.isArray(embeddings[0])) {
@@ -3234,7 +3380,7 @@
       const out = [];
       for (const prompt of texts) {
         const fallbackResponse = await RisuCompat.nativeFetch(fallbackUrl, { method: 'POST', headers, body: JSON.stringify({ model, prompt }) }, settings.embeddingTimeoutMs);
-        const fallbackData = await responseToJsonOrText(fallbackResponse);
+        const fallbackData = await responseToJsonOrText(fallbackResponse, settings.embeddingTimeoutMs);
         if (!Array.isArray(fallbackData?.embedding)) throw new Error(`No embeddings in Ollama response: ${compact(data, 500)}`);
         out.push(normalizeVector(fallbackData.embedding));
       }
@@ -3254,7 +3400,7 @@
       ? { model: settings.embeddingModel || defaultModelForProvider('voyageai'), input: texts, input_type: options.taskType === 'query' ? 'query' : 'document' }
       : { model: settings.embeddingModel, input: texts };
     const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify(body) }, settings.embeddingTimeoutMs);
-    const data = await responseToJsonOrText(response);
+    const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
     let embeddings;
     if (Array.isArray(data?.data)) {
       let rows = data.data.slice();
@@ -3290,7 +3436,7 @@
       requests: texts.map(input => ({ model: cleanModel, content: { parts: [{ text: input }] }, taskType: options.taskType === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT' }))
     };
     const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify(body) }, settings.embeddingTimeoutMs);
-    const data = await responseToJsonOrText(response);
+    const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
     const embeddings = Array.isArray(data?.embeddings) ? data.embeddings.map(item => item.values || item.embedding || item) : null;
     if (!Array.isArray(embeddings) || !Array.isArray(embeddings[0])) throw new Error(`No embeddings in Gemini response: ${compact(data, 500)}`);
     return embeddings.map(normalizeVector);
@@ -3322,7 +3468,7 @@
         parameters: { autoTruncate: true }
       };
       const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify(body) }, settings.embeddingTimeoutMs);
-      const data = await responseToJsonOrText(response);
+      const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
       const prediction = Array.isArray(data?.predictions) ? data.predictions[0] : null;
       const vector = prediction?.embeddings?.values || prediction?.embedding?.values || prediction?.values;
       if (!Array.isArray(vector)) throw new Error(`No embeddings in Vertex response: ${compact(data, 500)}`);
@@ -3353,21 +3499,70 @@
     if (!list.length) return tagEmbeddingVectors([], false);
     Runtime.lastEmbedUsedFallback = false;
     Runtime.lastEmbedError = '';
-    if (cfg.embeddingProvider === 'hash') return tagEmbeddingVectors(await hashEmbeddingBatch(list, cfg.hashDimensions), false);
+    if (cfg.embeddingProvider === 'hash') {
+      try { options.onProgress?.({ completedBatches: 0, totalBatches: 1, completedTexts: 0, totalTexts: list.length }); } catch (_) {}
+      const hashed = await hashEmbeddingBatch(list, cfg.hashDimensions);
+      try { options.onProgress?.({ completedBatches: 1, totalBatches: 1, completedTexts: list.length, totalTexts: list.length }); } catch (_) {}
+      return tagEmbeddingVectors(hashed, false);
+    }
     const chunks = [];
     let remoteDim = 0;
     const batchSize = clampInt(cfg.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
     try {
-      for (let i = 0; i < list.length; i += batchSize) {
-        const batch = list.slice(i, i + batchSize);
-        let vectors;
-        const provider = normalizeProvider(cfg.embeddingProvider);
-        if (provider === 'ollama') vectors = await embedTextsRemoteOllama(batch, cfg);
-        else if (provider === 'gemini' || provider === 'gemini-embedding') vectors = await embedTextsRemoteGemini(batch, cfg, options);
-        else if (provider === 'vertex' || provider === 'vertex-embedding') vectors = await embedTextsRemoteVertex(batch, cfg, options);
-        else vectors = await embedTextsRemoteOpenAICompat(batch, cfg, options);
-        remoteDim = validateRemoteEmbeddingBatch(vectors, batch.length, remoteDim);
-        chunks.push(...vectors);
+      const batches = [];
+      for (let i = 0; i < list.length; i += batchSize) batches.push(list.slice(i, i + batchSize));
+      const provider = normalizeProvider(cfg.embeddingProvider);
+      let completedBatches = 0;
+      let completedTexts = 0;
+      const reportProgress = () => {
+        if (typeof options.onProgress !== 'function') return;
+        try {
+          options.onProgress({
+            completedBatches,
+            totalBatches: batches.length,
+            completedTexts,
+            totalTexts: list.length
+          });
+        } catch (error) {
+          warn('embedding progress callback failed', error);
+        }
+      };
+      const fetchBatch = async batch => {
+        if (provider === 'ollama') return await embedTextsRemoteOllama(batch, cfg);
+        if (provider === 'gemini' || provider === 'gemini-embedding') return await embedTextsRemoteGemini(batch, cfg, options);
+        if (provider === 'vertex' || provider === 'vertex-embedding') return await embedTextsRemoteVertex(batch, cfg, options);
+        return await embedTextsRemoteOpenAICompat(batch, cfg, options);
+      };
+      const concurrency = clampInt(options.concurrency, 1, 4, 1);
+      reportProgress();
+      if (concurrency <= 1 || batches.length <= 1) {
+        for (const batch of batches) {
+          const vectors = await fetchBatch(batch);
+          remoteDim = validateRemoteEmbeddingBatch(vectors, batch.length, remoteDim);
+          chunks.push(...vectors);
+          completedBatches += 1;
+          completedTexts += batch.length;
+          reportProgress();
+        }
+      } else {
+        const batchVectors = new Array(batches.length);
+        let nextBatch = 0;
+        const worker = async () => {
+          while (true) {
+            const index = nextBatch++;
+            if (index >= batches.length) return;
+            batchVectors[index] = await fetchBatch(batches[index]);
+            completedBatches += 1;
+            completedTexts += batches[index].length;
+            reportProgress();
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, worker));
+        for (let index = 0; index < batches.length; index += 1) {
+          const vectors = batchVectors[index];
+          remoteDim = validateRemoteEmbeddingBatch(vectors, batches[index].length, remoteDim);
+          chunks.push(...vectors);
+        }
       }
       return tagEmbeddingVectors(chunks, false);
     } catch (error) {
@@ -6568,7 +6763,28 @@
     return false;
   };
 
-  const buildRecordsFromSources = async (sources, settings = null, scopeOverride = null) => {
+  const vectorReuseKey = (record = {}) => [
+    text(record.sourceHash || ''),
+    Number(record.pairIndex || record.turnIndex || 0) || 0,
+    Number(record.chunkIndex || 0) || 0,
+    text(record.text || '').trim()
+  ].join('\u0000');
+
+  const reusableVectorRecord = (record, settings = Runtime.settings || DEFAULTS) => {
+    if (!record || !Array.isArray(record.vector) || !record.vector.length) return false;
+    if (record.autoEpisode || record.sourceType === 'episode_index') return false;
+    if (Number(record.dim || record.vector.length) !== record.vector.length) return false;
+    if (!text(record.provider || '').trim() || !text(record.model || '').trim()) return false;
+    const expectedProvider = normalizeProvider(settings.embeddingProvider);
+    if (normalizeProvider(record.provider || '') !== expectedProvider) return false;
+    const expectedModel = expectedProvider === 'hash' ? `hash-${settings.hashDimensions}` : text(settings.embeddingModel || '');
+    if (text(record.model || '') !== expectedModel) return false;
+    if (expectedProvider === 'hash' && record.vector.length !== settings.hashDimensions) return false;
+    return record.vector.every(value => Number.isFinite(Number(value)))
+      && record.vector.some(value => Number(value) !== 0);
+  };
+
+  const buildRecordsFromSources = async (sources, settings = null, scopeOverride = null, options = {}) => {
     const cfg = settings || await loadSettings();
     const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false));
     const drafts = [];
@@ -6672,11 +6888,40 @@
       }
     }
     if (!drafts.length) return [];
-    const vectors = await embedTexts(drafts.map(d => d.text), cfg);
-    const fallbackUsed = vectors.flashbackFallbackUsed === true;
+    const reuseBuckets = new Map();
+    for (const record of (Array.isArray(options.reuseRecords) ? options.reuseRecords : [])) {
+      if (!reusableVectorRecord(record, cfg)) continue;
+      const key = vectorReuseKey(record);
+      if (!reuseBuckets.has(key)) reuseBuckets.set(key, []);
+      reuseBuckets.get(key).push(record);
+    }
+    const reused = new Array(drafts.length).fill(null);
+    const missingIndexes = [];
+    for (let index = 0; index < drafts.length; index += 1) {
+      const bucket = reuseBuckets.get(vectorReuseKey(drafts[index])) || [];
+      const record = bucket.shift() || null;
+      if (record) reused[index] = record;
+      else missingIndexes.push(index);
+    }
+    const embedded = missingIndexes.length
+      ? await embedTexts(missingIndexes.map(index => drafts[index].text), cfg, {
+        concurrency: cfg.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+        onProgress: options.onProgress
+      })
+      : tagEmbeddingVectors([], false);
+    const fallbackUsed = embedded.flashbackFallbackUsed === true;
+    const vectors = new Array(drafts.length);
+    for (let index = 0; index < drafts.length; index += 1) {
+      if (reused[index]) vectors[index] = reused[index].vector.slice();
+    }
+    missingIndexes.forEach((draftIndex, embeddedIndex) => { vectors[draftIndex] = embedded[embeddedIndex] || []; });
     const createdAt = nowIso();
-    return drafts.map((draft, index) => {
+    const records = drafts.map((draft, index) => {
       const recordHash = stableHash(`${scope.scopeKey}\n${draft.sourceType}\n${draft.sourceId}\n${draft.sourceHash}\n${draft.chunkIndex}\n${draft.text}`);
+      const reusedRecord = reused[index];
+      const embeddedVector = vectors[index] || hashEmbedding(draft.text, cfg.hashDimensions);
+      const provider = reusedRecord?.provider || (fallbackUsed ? 'hash' : cfg.embeddingProvider);
+      const model = reusedRecord?.model || ((fallbackUsed || cfg.embeddingProvider === 'hash') ? `hash-${cfg.hashDimensions}` : cfg.embeddingModel);
       return {
       schema: 'vector_rag_memory.record.v2',
       id: `vrm_${recordHash.slice(0, 20)}`,
@@ -6714,15 +6959,29 @@
       metadata: draft.metadata,
       text: draft.text,
       importanceScore: computeImportanceDensity(draft.text),
-      vector: vectors[index] || hashEmbedding(draft.text, cfg.hashDimensions),
-      dim: (vectors[index] || []).length || cfg.hashDimensions,
-      provider: fallbackUsed ? 'hash' : cfg.embeddingProvider,
-      model: (fallbackUsed || cfg.embeddingProvider === 'hash') ? `hash-${cfg.hashDimensions}` : cfg.embeddingModel,
+      vector: embeddedVector,
+      dim: embeddedVector.length || cfg.hashDimensions,
+      provider,
+      model,
       tokenEstimate: estimateTokens(draft.text),
-      createdAt,
+      createdAt: reusedRecord?.createdAt || createdAt,
       updatedAt: createdAt
       };
     });
+    const batchSize = clampInt(cfg.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
+    Object.defineProperty(records, 'flashbackEmbeddingStats', {
+      value: Object.freeze({
+        totalVectors: records.length,
+        reusedVectors: records.length - missingIndexes.length,
+        embeddedVectors: missingIndexes.length,
+        embeddedBatches: missingIndexes.length ? Math.ceil(missingIndexes.length / batchSize) : 0,
+        embeddedTokens: missingIndexes.reduce((sum, index) => sum + estimateTokens(drafts[index]?.text || ''), 0),
+        fallbackUsed
+      }),
+      enumerable: false,
+      configurable: true
+    });
+    return records;
   };
 
   const upsertRecords = async (incoming, settings = null, scopeOverride = null, options = {}) => {
@@ -7985,12 +8244,34 @@
       return Runtime.lastImport;
     }
     const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(true));
-    const records = await buildRecordsFromSources(sourceList, cfg, scope);
+    const records = await buildRecordsFromSources(sourceList, cfg, scope, {
+      reuseRecords: options.reuseRecords,
+      onProgress: options.onProgress
+    });
+    const embeddingStats = records.flashbackEmbeddingStats || {};
     const result = await upsertRecords(records, cfg, scope, { replaceTurnPair: options.replaceTurnPair === true });
     if (!options.skipEpisodeRebuild && records.some(record => (record.sourceType === 'chat_turn' ? 'response' : record.sourceType) === 'response')) {
       scheduleEpisodeIndexRebuild(scope, cfg, { reason: 'ingestSources' });
     }
-    Runtime.lastImport = { at: Date.now(), sources: sourceList.length, requestedSources: requestedSources.length, chunks: records.length, embeddingCost: estimateEmbeddingCostForRecords(records, cfg), ...result };
+    const embeddedTokenCost = estimateEmbeddingCostForTokens(Number(embeddingStats.embeddedTokens || 0) || 0, cfg);
+    const actualEmbeddingCost = {
+      ...embeddedTokenCost,
+      groups: embeddedTokenCost.tokens > 0 ? [embeddedTokenCost] : [],
+      knownEstimatedUsd: embeddedTokenCost.supported ? embeddedTokenCost.estimatedUsd : 0,
+      unknownTokens: embeddedTokenCost.supported ? 0 : embeddedTokenCost.tokens,
+      unsupportedGroups: embeddedTokenCost.supported || embeddedTokenCost.tokens === 0 ? 0 : 1
+    };
+    Runtime.lastImport = {
+      at: Date.now(),
+      sources: sourceList.length,
+      requestedSources: requestedSources.length,
+      chunks: records.length,
+      reusedVectors: Number(embeddingStats.reusedVectors || 0) || 0,
+      embeddedVectors: Number(embeddingStats.embeddedVectors || 0) || 0,
+      embeddedBatches: Number(embeddingStats.embeddedBatches || 0) || 0,
+      embeddingCost: actualEmbeddingCost,
+      ...result
+    };
     if (!options.skipGuiRefresh) refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
     return Runtime.lastImport;
   };
@@ -7998,12 +8279,13 @@
   const ingestLiveChatColdStart = async (options = {}) => {
     pushActivityLog('cold_start_started', '콜드스타트가 시작되었습니다.', {
       requestedScope: text(options.scope || options.coldStartScope || 'current'),
-      incremental: options.incremental !== false
+      incremental: options.incremental !== false,
+      operationId: text(options.maintenanceOperationId || '')
     }, 'info');
     try {
-    const settings = await loadSettings();
+    const settings = options.settings || await loadSettings();
     const cold = normalizeColdStartOptions(settings, options);
-    const snapshot = await loadRisuSnapshot(true);
+    const snapshot = options.snapshot || await loadRisuSnapshot(true);
     const currentScope = resolveScopeFromSnapshot(snapshot);
     await ensureScopeStorageReady(currentScope, settings);
     const chatSnapshots = await loadLiveChatSnapshotsForColdStart(snapshot, cold);
@@ -8054,7 +8336,9 @@
         ? await ingestSources(selectedSources, coldStartSettings, itemScope, {
           skipEpisodeRebuild: true,
           skipGuiRefresh: true,
-          replaceTurnPair: true
+          replaceTurnPair: true,
+          reuseRecords: loadedAfterSync.records,
+          onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '동기화')
         })
         : { sources: 0, chunks: 0, inserted: 0, updated: 0, deduped: 0, total: loadedAfterSync.records.length, embeddingCost: null };
       // The pre-ingest pass retires rollback/reroll branches. A second pass is
@@ -8075,6 +8359,9 @@
       result.metadataDetachedTurns += Number(metadataUpdate.updatedTurns || 0);
       result.staleStoredTurns += diff.staleGroups.length;
       result.embeddedTurns += selectedSources.length;
+      result.reusedVectors = Number(result.reusedVectors || 0) + Number(batch.reusedVectors || 0);
+      result.embeddedVectors = Number(result.embeddedVectors || 0) + Number(batch.embeddedVectors || 0);
+      result.embeddedBatches = Number(result.embeddedBatches || 0) + Number(batch.embeddedBatches || 0);
       result.embeddingCost = mergeEmbeddingCostSummaries(result.embeddingCost, batch.embeddingCost || null);
       touchedScopes.set(itemScope.scopeKey, itemScope);
     }
@@ -8102,18 +8389,23 @@
     refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
     pushActivityLog('cold_start_completed', '콜드스타트가 완료되었습니다.', {
       scopeKey: currentScope.scopeKey,
+      operationId: text(options.maintenanceOperationId || ''),
       scopes: Runtime.lastImport.scopes,
       liveChatTurns: Runtime.lastImport.liveChatTurns,
       embeddedTurns: Runtime.lastImport.embeddedTurns,
       chunks: Runtime.lastImport.chunks,
       inserted: Runtime.lastImport.inserted,
       updated: Runtime.lastImport.updated,
-      deduped: Runtime.lastImport.deduped
+      deduped: Runtime.lastImport.deduped,
+      embeddedBatches: Runtime.lastImport.embeddedBatches,
+      embeddedVectors: Runtime.lastImport.embeddedVectors,
+      reusedVectors: Runtime.lastImport.reusedVectors
     }, 'success');
     return Runtime.lastImport;
     } catch (error) {
       pushActivityLog('cold_start_failed', '콜드스타트에 실패했습니다.', {
         requestedScope: text(options.scope || options.coldStartScope || 'current'),
+        operationId: text(options.maintenanceOperationId || ''),
         error: formatErrorMessage(error, 500)
       }, 'error');
       throw error;
@@ -8121,20 +8413,24 @@
   };
 
   const rebuildCurrentChatMemory = async (options = {}) => {
-    const settings = await loadSettings(true);
-    const snapshot = await loadRisuSnapshot(true);
+    const settings = options.settings || await loadSettings(true);
+    const snapshot = options.snapshot || await loadRisuSnapshot(true);
     const scope = resolveScopeFromSnapshot(snapshot);
     await ensureScopeStorageReady(scope, settings);
     const cold = normalizeColdStartOptions(settings, { scope: 'current', historyLimit: 0, ...options });
     const sources = collectLiveChatSourcesFromSnapshot(snapshot, cold);
     if (!sources.length) throw new Error('현재 채팅에서 완성된 유저+AI 응답 턴을 찾지 못해 전체 재구축을 중단했습니다.');
+    const previous = await loadScopeRecordsRaw(scope.scopeKey);
+    assertNoForeignScopeCollision(previous.manifest, 'full chat rebuild');
     // Build and embed the replacement first. If embedding fails, the existing
     // committed scope remains untouched.
     const rebuildSettings = { ...settings, maxResponseItems: Number.MAX_SAFE_INTEGER };
-    const records = await buildRecordsFromSources(sources, rebuildSettings, scope);
+    const records = await buildRecordsFromSources(sources, rebuildSettings, scope, {
+      reuseRecords: previous.records,
+      onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '재구축')
+    });
     if (!records.length) throw new Error('현재 채팅에서 재구축 가능한 응답 기억을 만들지 못했습니다.');
-    const previous = await loadScopeRecordsRaw(scope.scopeKey);
-    assertNoForeignScopeCollision(previous.manifest, 'full chat rebuild');
+    const embeddingStats = records.flashbackEmbeddingStats || {};
     const protectedHistory = previous.records.filter(isPermanentSessionHistoryRecord);
     const replacementRecords = [...protectedHistory, ...records];
     const saved = await withScopeWriteLock(scope.scopeKey, async () => {
@@ -8156,11 +8452,14 @@
       liveChatChats: 1,
       liveChatTurns: sources.length,
       chunks: records.length,
+      reusedVectors: Number(embeddingStats.reusedVectors || 0) || 0,
+      embeddedVectors: Number(embeddingStats.embeddedVectors || 0) || 0,
+      embeddedBatches: Number(embeddingStats.embeddedBatches || 0) || 0,
       protectedHistoryRecords: protectedHistory.length,
       replacedRecords: previous.records.length,
       total: saved.records.length,
       episode,
-      embeddingCost: estimateEmbeddingCostForRecords(records, rebuildSettings)
+      embeddingCost: estimateEmbeddingCostForTokens(Number(embeddingStats.embeddedTokens || 0) || 0, rebuildSettings)
     };
     invalidateGuiDataCache('all');
     refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
@@ -9912,7 +10211,14 @@
     const raw = normalizeForLexical(value);
     if (!raw || RECALL_STOPWORDS.has(raw) || MEMORY_META_ANCHOR_STOPWORDS.has(raw)) return '';
     if (/^[가-힣]{2,12}$/.test(raw)) {
-      const stripped = stripKoreanEntityParticle(raw);
+      let stripped = raw;
+      // Stored anchors are normalized again during maintenance. Strip stacked
+      // particles to a fixed point so normalize(normalize(x)) === normalize(x).
+      for (let i = 0; i < 6; i += 1) {
+        const next = stripKoreanEntityParticle(stripped);
+        if (!next || next === stripped) break;
+        stripped = next;
+      }
       if (!stripped || RECALL_STOPWORDS.has(stripped) || MEMORY_META_ANCHOR_STOPWORDS.has(stripped)) return '';
       return stripped;
     }
@@ -14025,9 +14331,15 @@
 
   const debugScopeStatsSnapshot = async (scope) => debugRecordsSnapshot(scope, { includeRecords: false });
 
-  const reembedAllRecords = async (scopeOverride = null) => {
-    const settings = await loadSettings(true);
-    const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false));
+  const reembedAllRecords = async (scopeOverride = null, options = {}) => {
+    if (scopeOverride && typeof scopeOverride === 'object' && !scopeOverride.scopeKey) {
+      options = scopeOverride;
+      scopeOverride = null;
+    }
+    const settings = options.settings || await loadSettings(true);
+    const scope = scopeOverride?.scopeKey
+      ? scopeOverride
+      : (options.scope?.scopeKey ? options.scope : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false)));
     const loaded = await loadScopeRecords(scope.scopeKey);
     assertCompleteScopeLoad(loaded, 'full re-embedding');
     const { records } = loaded;
@@ -14036,26 +14348,37 @@
     const updatedAt = nowIso();
     const next = baseRecords.map(record => ({ ...record }));
     const batchSize = clampInt(settings.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
-    for (let i = 0; i < next.length; i += batchSize) {
-      const batch = next.slice(i, i + batchSize);
-      const vectors = await embedTexts(batch.map(record => record.text), settings);
-      const fallbackUsed = vectors.flashbackFallbackUsed === true;
-      for (let j = 0; j < batch.length; j += 1) {
-        const vector = vectors[j] || batch[j].vector || [];
-        next[i + j] = {
-          ...batch[j],
-          vector,
-          dim: vector.length,
-          provider: fallbackUsed ? 'hash' : settings.embeddingProvider,
-          model: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : settings.embeddingModel,
-          tokenEstimate: estimateTokens(batch[j].text),
-          updatedAt
-        };
-      }
+    const vectors = await embedTexts(next.map(record => record.text), settings, {
+      concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+      onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '전체 벡터 갱신')
+    });
+    const fallbackUsed = vectors.flashbackFallbackUsed === true;
+    for (let index = 0; index < next.length; index += 1) {
+      const record = next[index];
+      const vector = vectors[index] || record.vector || [];
+      next[index] = {
+        ...record,
+        vector,
+        dim: vector.length,
+        provider: fallbackUsed ? 'hash' : settings.embeddingProvider,
+        model: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : settings.embeddingModel,
+        tokenEstimate: estimateTokens(record.text),
+        updatedAt
+      };
     }
     const saved = await withScopeWriteLock(scope.scopeKey, () => saveScopeRecords(scope, next, settings, scope));
     await maybeRebuildEpisodeIndex(scope, settings, null, { force: true, reason: 'reembed_all' });
-    Runtime.lastImport = { at: Date.now(), reembedded: next.length, removedEpisodeIndexes: records.length - baseRecords.length, total: saved.records.length, scopeKey: scope.scopeKey, batchSize, embeddingCost: estimateEmbeddingCostForRecords(next, settings) };
+    Runtime.lastImport = {
+      at: Date.now(),
+      reembedded: next.length,
+      embeddedVectors: next.length,
+      embeddedBatches: next.length ? Math.ceil(next.length / batchSize) : 0,
+      removedEpisodeIndexes: records.length - baseRecords.length,
+      total: saved.records.length,
+      scopeKey: scope.scopeKey,
+      batchSize,
+      embeddingCost: estimateEmbeddingCostForRecords(next, settings)
+    };
     refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
     return Runtime.lastImport;
   };
@@ -14087,7 +14410,13 @@
 
   const cleanRecordForMemory = (record, scope, options = {}) => {
     const originalText = text(record?.text || '');
-    const cleanedText = sanitizeAssistantForMemory(originalText, { stripRolePrefix: false });
+    const sanitizedText = sanitizeAssistantForMemory(originalText, { stripRolePrefix: false });
+    // Current narrative chunks intentionally keep boundary whitespace so their
+    // source offsets reconstruct the original U+A turn exactly. A sanitizer
+    // trim alone is therefore not a content mutation and must be idempotent.
+    const preserveNarrativeBoundaryWhitespace = recordNarrativeChunkVersion(record) >= NARRATIVE_CHUNK_SCHEMA_VERSION
+      && sanitizedText === originalText.trim();
+    const cleanedText = preserveNarrativeBoundaryWhitespace ? originalText : sanitizedText;
     const artifacts = extractMemoryMetadata(originalText);
     const rawPreviousMetadata = record.metadata && typeof record.metadata === 'object' ? record.metadata : {};
     const hadLegacyPeerMetadata = hasLegacyPeerDerivedMetadata(rawPreviousMetadata);
@@ -14099,6 +14428,12 @@
       ? MEMORY_SANITIZER_VERSION
       : previousSanitizerVersion;
     const textChanged = cleanedText !== originalText;
+    const boundaryWhitespaceOnly = textChanged && cleanedText === originalText.trim();
+    const leadingWhitespace = boundaryWhitespaceOnly ? originalText.length - originalText.trimStart().length : 0;
+    const trailingWhitespace = boundaryWhitespaceOnly ? originalText.length - originalText.trimEnd().length : 0;
+    const adjustedChunkStart = Math.max(0, Number(record.chunkSourceStart || 0) + leadingWhitespace);
+    const adjustedChunkEnd = Math.max(adjustedChunkStart, Number(record.chunkSourceEnd || 0) - trailingWhitespace);
+    const adjustedNovelStart = Math.max(adjustedChunkStart, Math.min(adjustedChunkEnd, Number(record.chunkNovelStart ?? adjustedChunkStart) || adjustedChunkStart));
     const metadata = {
       ...previousMetadata,
       ...artifacts,
@@ -14152,7 +14487,16 @@ ${cleanedText}`, 80),
     const next = {
       ...record,
       ...(hash ? { hash } : {}),
-      ...(cleanedText !== originalText && recordNarrativeChunkVersion(record) >= NARRATIVE_CHUNK_SCHEMA_VERSION
+      ...(boundaryWhitespaceOnly && recordNarrativeChunkVersion(record) >= NARRATIVE_CHUNK_SCHEMA_VERSION
+        ? {
+          chunkSourceStart: adjustedChunkStart,
+          chunkSourceEnd: adjustedChunkEnd,
+          chunkNovelStart: adjustedNovelStart,
+          chunkSchemaVersion: NARRATIVE_CHUNK_SCHEMA_VERSION,
+          chunkOffsetsInvalidated: false
+        }
+        : {}),
+      ...(cleanedText !== originalText && !boundaryWhitespaceOnly && recordNarrativeChunkVersion(record) >= NARRATIVE_CHUNK_SCHEMA_VERSION
         ? { chunkSchemaVersion: 0, chunkOffsetsInvalidated: true }
         : {}),
       text: cleanedText,
@@ -14164,7 +14508,10 @@ ${cleanedText}`, 80),
       tokenEstimate: estimateTokens(cleanedText),
       importanceScore: computeImportanceDensity(cleanedText)
     };
-    const anchorsChanged = !arraysEqual(entityAnchors, Array.isArray(record.entityAnchors) ? record.entityAnchors.map(normalizeEntityAnchor).filter(Boolean) : []);
+    const previousEntityAnchors = Array.from(new Set(
+      Array.isArray(record.entityAnchors) ? record.entityAnchors.map(normalizeEntityAnchor).filter(Boolean) : []
+    ));
+    const anchorsChanged = !arraysEqual(entityAnchors, previousEntityAnchors);
     const metadataChanged = nextSanitizerVersion !== previousSanitizerVersion
       || hadLegacyPeerMetadata
       || Number(artifacts.statusDataCount || 0) > 0
@@ -14192,8 +14539,10 @@ ${cleanedText}`, 80),
       dryRun: false,
       ...options
     };
-    const settings = await loadSettings(true);
-    const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false));
+    const settings = opts.settings || await loadSettings(true);
+    const scope = scopeOverride?.scopeKey
+      ? scopeOverride
+      : (opts.scope?.scopeKey ? opts.scope : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false)));
     const rawLoaded = await loadScopeRecordsRaw(scope.scopeKey);
     assertCompleteScopeLoad(rawLoaded, 'memory cleanup');
     const externalRecords = rawLoaded.records.filter(record => !isRetainedMemoryRecord(record));
@@ -14221,6 +14570,8 @@ ${cleanedText}`, 80),
       peerPacketArtifactsRemoved: 0,
       externalSourcesRetired: Number(retirement?.removed || 0),
       reembedRequired: 0,
+      embeddedVectors: 0,
+      embeddedBatches: 0,
       episodeIndexesPresent: records.filter(record => record.autoEpisode || record.sourceType === 'episode_index').length,
       episodeIndexesRemoved: 0,
       episodeRebuildRequested: !!opts.rebuildEpisodes,
@@ -14263,23 +14614,25 @@ ${cleanedText}`, 80),
     if (opts.dryRun) return result;
     if (opts.reembedChanged && reembedIndexes.length) {
       const batchSize = clampInt(settings.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
-      for (let offset = 0; offset < reembedIndexes.length; offset += batchSize) {
-        const batchIndexes = reembedIndexes.slice(offset, offset + batchSize);
-        const batch = batchIndexes.map(index => next[index]);
-        const vectors = await embedTexts(batch.map(record => record.text), settings);
-        const fallbackUsed = vectors.flashbackFallbackUsed === true;
-        for (let i = 0; i < batch.length; i += 1) {
-          const vector = vectors[i] || batch[i].vector || [];
-          next[batchIndexes[i]] = {
-            ...batch[i],
-            vector,
-            dim: vector.length,
-            provider: fallbackUsed ? 'hash' : settings.embeddingProvider,
-            model: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : expectedModel,
-            updatedAt: nowIso()
-          };
-        }
+      const batch = reembedIndexes.map(index => next[index]);
+      const vectors = await embedTexts(batch.map(record => record.text), settings, {
+        concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+        onProgress: maintenanceEmbeddingProgressCallback(opts.maintenanceOperationId, '기억 정제')
+      });
+      const fallbackUsed = vectors.flashbackFallbackUsed === true;
+      for (let i = 0; i < batch.length; i += 1) {
+        const vector = vectors[i] || batch[i].vector || [];
+        next[reembedIndexes[i]] = {
+          ...batch[i],
+          vector,
+          dim: vector.length,
+          provider: fallbackUsed ? 'hash' : settings.embeddingProvider,
+          model: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : expectedModel,
+          updatedAt: nowIso()
+        };
       }
+      result.embeddedVectors = reembedIndexes.length;
+      result.embeddedBatches = Math.ceil(reembedIndexes.length / batchSize);
     }
     const requiresBaseSave = result.changed > 0
       || (opts.reembedChanged && result.reembedRequired > 0)
@@ -14355,11 +14708,13 @@ ${cleanedText}`, 80),
   };
 
   const inspectMemoryMaintenance = async (options = {}) => {
-    const settings = await loadSettings(true);
-    const snapshot = await loadRisuSnapshot(options.requestPermission === true);
-    const scope = resolveScopeFromSnapshot(snapshot);
-    await ensureScopeStorageReady(scope, settings);
-    const rawLoaded = await loadScopeRecordsRaw(scope.scopeKey);
+    const settings = options.settings || await loadSettings(true);
+    const snapshot = options.snapshot || await loadRisuSnapshot(options.requestPermission === true);
+    const scope = options.scope?.scopeKey
+      ? options.scope
+      : resolveScopeFromSnapshot(snapshot);
+    if (options.ensureStorage !== false) await ensureScopeStorageReady(scope, settings);
+    const rawLoaded = options.rawLoaded || await loadScopeRecordsRaw(scope.scopeKey);
     const storageMissingShards = Math.max(0, Number(rawLoaded.manifest?.missingShards || 0) || 0);
     const storageCorruptShards = Math.max(0, Number(rawLoaded.manifest?.corruptShards || 0) || 0);
     const storageManifestCorrupt = rawLoaded.manifest?.manifestCorrupt === true;
@@ -14457,6 +14812,7 @@ ${cleanedText}`, 80),
       narrativeChunkSchemaVersion: NARRATIVE_CHUNK_SCHEMA_VERSION,
       storageMissingShards,
       storageCorruptShards,
+      storageShardCount: Math.max(0, Number(rawLoaded.manifest?.shardCount || 0) || 0),
       storageManifestCorrupt,
       storageForeignScopeKey,
       storageRecordCountMismatch,
@@ -14489,23 +14845,113 @@ ${cleanedText}`, 80),
       && !plan.liveChunkSchemaMismatch
       && !plan.episodeStale;
     plan.automatic = automaticMaintenanceStrategyForPlan(plan);
+    Object.defineProperty(plan, '_maintenanceContext', {
+      value: { settings, snapshot, scope, rawLoaded },
+      enumerable: false,
+      configurable: true
+    });
     return plan;
   };
 
+  const maintenanceOperationTotals = (operation = {}) => {
+    const nodes = [operation, operation?.sync, operation?.cleanup, operation?.rebuild]
+      .filter((node, index, list) => node && typeof node === 'object' && list.indexOf(node) === index);
+    const total = {
+      sources: 0,
+      chunks: 0,
+      embeddedBatches: 0,
+      embeddedVectors: 0,
+      reusedVectors: 0
+    };
+    for (const node of nodes) {
+      total.sources += Math.max(0, Number(node.sources || node.liveChatTurns || 0) || 0);
+      total.chunks += Math.max(0, Number(node.chunks || 0) || 0);
+      total.embeddedBatches += Math.max(0, Number(node.embeddedBatches || 0) || 0);
+      total.embeddedVectors += Math.max(0, Number(node.embeddedVectors || node.reembedded || 0) || 0);
+      total.reusedVectors += Math.max(0, Number(node.reusedVectors || 0) || 0);
+    }
+    return total;
+  };
+
   const runMemoryMaintenance = async (mode = 'auto', options = {}) => {
+    if (Runtime.maintenanceActiveOperationId) {
+      const error = new Error('이미 기억 유지보수가 실행 중입니다. 현재 작업이 끝난 뒤 다시 시도해 주세요.');
+      error.code = 'FLASHBACK_MAINTENANCE_BUSY';
+      error.operationId = Runtime.maintenanceActiveOperationId;
+      throw error;
+    }
     const normalizedMode = normalizeChoice(mode, ['auto', 'sync', 'rebuild', 'reembed'], 'auto');
-    pushActivityLog('memory_maintenance_started', '기억 유지보수를 시작했습니다.', {
-      maintenanceMode: normalizedMode
-    }, 'info');
+    const preflight = options.preflight && typeof options.preflight === 'object' ? options.preflight : null;
+    const context = preflight?._maintenanceContext && typeof preflight._maintenanceContext === 'object'
+      ? preflight._maintenanceContext
+      : {};
+    const sharedSettings = context.settings || options.settings || null;
+    const sharedSnapshot = context.snapshot || options.snapshot || null;
+    const sharedScope = context.scope?.scopeKey ? context.scope : null;
+    const operationId = `maintenance_${stableHash(`${Date.now()}|${Math.random()}|${normalizedMode}`).slice(0, 20)}`;
+    const startedAt = Date.now();
+    Runtime.maintenanceActiveOperationId = operationId;
     try {
-    const before = await inspectMemoryMaintenance({ requestPermission: true });
+    await persistMaintenanceJournal({
+      operationId,
+      mode: normalizedMode,
+      status: 'running',
+      stage: 'preflight',
+      scopeKey: sharedScope?.scopeKey || '',
+      strategy: '',
+      stages: [],
+      startedAt,
+      durationMs: 0,
+      progress: { sources: 0, chunks: 0, embeddedBatches: 0, embeddedChunks: 0, embeddedVectors: 0, reusedVectors: 0, savedShards: 0 },
+      error: '',
+      result: null
+    });
+    pushActivityLog('memory_maintenance_started', '기억 유지보수를 시작했습니다.', {
+      maintenanceMode: normalizedMode,
+      operationId
+    }, 'info');
+    const before = preflight?.scopeKey
+      ? preflight
+      : await inspectMemoryMaintenance({
+        requestPermission: true,
+        settings: sharedSettings || undefined,
+        snapshot: sharedSnapshot || undefined,
+        scope: sharedScope || undefined
+      });
+    const planContext = before?._maintenanceContext && typeof before._maintenanceContext === 'object'
+      ? before._maintenanceContext
+      : {};
+    const settings = planContext.settings || sharedSettings || undefined;
+    const snapshot = planContext.snapshot || sharedSnapshot || undefined;
+    const scope = planContext.scope?.scopeKey ? planContext.scope : sharedScope;
+    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId };
+    await persistMaintenanceJournal({
+      operationId,
+      status: 'running',
+      stage: 'plan_ready',
+      scopeKey: before.scopeKey || scope?.scopeKey || '',
+      strategy: before.automatic?.strategy || normalizedMode,
+      stages: before.automatic?.stages || [],
+      progress: {
+        sources: before.liveTurns,
+        chunks: before.estimatedEmbeddingChunks,
+        embeddedBatches: 0,
+        embeddedChunks: 0,
+        savedShards: 0
+      }
+    });
     let operation;
     if (normalizedMode === 'sync') {
-      operation = await ingestLiveChatColdStart({ scope: 'current', historyLimit: 0, incremental: true });
+      await persistMaintenanceJournal({ operationId, status: 'running', stage: 'sync', scopeKey: before.scopeKey || '', strategy: 'sync', stages: ['sync'] });
+      operation = await ingestLiveChatColdStart({ scope: 'current', historyLimit: 0, incremental: true, ...operationSettings });
     } else if (normalizedMode === 'rebuild') {
-      operation = await rebuildCurrentChatMemory(options);
-    } else if (normalizedMode === 'reembed') {
-      operation = await reembedAllRecords();
+      await persistMaintenanceJournal({ operationId, status: 'running', stage: 'rebuild', scopeKey: before.scopeKey || '', strategy: 'rebuild', stages: ['rebuild'] });
+      const rebuildOptions = { ...options, ...operationSettings };
+      delete rebuildOptions.preflight;
+      operation = await rebuildCurrentChatMemory(rebuildOptions);
+      } else if (normalizedMode === 'reembed') {
+        await persistMaintenanceJournal({ operationId, status: 'running', stage: 'reembed', scopeKey: before.scopeKey || '', strategy: 'reembed', stages: ['reembed'] });
+        operation = await reembedAllRecords({ settings, scope, maintenanceOperationId: operationId });
     } else {
       const automatic = before.automatic || automaticMaintenanceStrategyForPlan(before);
       if (automatic.blocked) {
@@ -14521,7 +14967,10 @@ ${cleanedText}`, 80),
       const needsVectorRepair = automatic.stages.includes('reembed');
       const needsCleanup = automatic.stages.includes('cleanup');
       if (before.requiresFullRebuild) {
-        const rebuild = await rebuildCurrentChatMemory(options);
+        await persistMaintenanceJournal({ operationId, status: 'running', stage: 'rebuild', scopeKey: before.scopeKey || '', strategy: 'full_rebuild', stages: ['rebuild'] });
+        const rebuildOptions = { ...options, ...operationSettings };
+        delete rebuildOptions.preflight;
+        const rebuild = await rebuildCurrentChatMemory(rebuildOptions);
         operation = {
           strategy: 'full_rebuild',
           stages: ['rebuild'],
@@ -14541,23 +14990,29 @@ ${cleanedText}`, 80),
         let cleanup = null;
         if (needsSync) {
           stages.push('sync');
+          await persistMaintenanceJournal({ operationId, status: 'running', stage: 'sync', scopeKey: before.scopeKey || '', strategy: 'targeted_repair', stages });
           sync = await ingestLiveChatColdStart({
             scope: 'current',
             historyLimit: 0,
             incremental: true,
-            skipEpisodeRebuild: true
+            skipEpisodeRebuild: true,
+            ...operationSettings
           });
         }
         if (needsCleanup) {
           stages.push('cleanup');
           if (needsVectorRepair) stages.push('reembed');
           if (needsSync || needsVectorRepair || before.episodeStale || before.shardIndexMismatch) stages.push('episode_rebuild');
+          await persistMaintenanceJournal({ operationId, status: 'running', stage: 'cleanup', scopeKey: before.scopeKey || '', strategy: 'targeted_repair', stages });
           cleanup = await cleanAndReembedAllRecords(null, {
+            settings,
+            scope,
             retireExternal: true,
             rebuildEpisodes: true,
             forceEpisodeRebuild: needsSync || needsVectorRepair || before.episodeStale || before.shardIndexMismatch,
             forceIndexRebuild: before.shardIndexMismatch === true,
-            reembedChanged: true
+            reembedChanged: true,
+            maintenanceOperationId: operationId
           });
         }
         operation = {
@@ -14568,11 +15023,23 @@ ${cleanedText}`, 80),
         };
       }
     }
-    const after = await inspectMemoryMaintenance({ requestPermission: false });
+    await persistMaintenanceJournal({ operationId, status: 'running', stage: 'verify', scopeKey: before.scopeKey || scope?.scopeKey || '', strategy: operation?.strategy || normalizedMode, stages: operation?.stages || [] });
+    const after = await inspectMemoryMaintenance({
+      requestPermission: false,
+      settings,
+      snapshot,
+      scope,
+      ensureStorage: false
+    });
+    const completedAt = Date.now();
+    const operationTotals = maintenanceOperationTotals(operation);
     const result = {
-      at: Date.now(),
+      at: completedAt,
       maintenance: true,
       maintenanceMode: normalizedMode,
+      operationId,
+      startedAt,
+      durationMs: Math.max(0, completedAt - startedAt),
       scopeKey: after.scopeKey || before.scopeKey,
       before,
       after,
@@ -14583,19 +15050,56 @@ ${cleanedText}`, 80),
     Runtime.lastStorageAction = result;
     invalidateGuiDataCache('all');
     refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
+    await persistMaintenanceJournal({
+      operationId,
+      mode: normalizedMode,
+      status: 'completed',
+      stage: 'complete',
+      scopeKey: result.scopeKey,
+      strategy: result.operation?.strategy || normalizedMode,
+      stages: result.operation?.stages || [],
+      startedAt,
+      durationMs: result.durationMs,
+      progress: {
+        sources: operationTotals.sources,
+        chunks: operationTotals.chunks,
+        embeddedBatches: operationTotals.embeddedBatches,
+        embeddedChunks: operationTotals.embeddedVectors,
+        embeddedVectors: operationTotals.embeddedVectors,
+        reusedVectors: operationTotals.reusedVectors,
+        savedShards: Number(after.storageShardCount || 0) || 0
+      },
+      error: '',
+      result: { healthy: result.healthy, strategy: result.operation?.strategy || normalizedMode, stages: result.operation?.stages || [] }
+    });
     pushActivityLog('memory_maintenance_completed', '기억 유지보수를 완료했습니다.', {
       scopeKey: result.scopeKey,
       maintenanceMode: normalizedMode,
+      operationId,
       healthy: result.healthy,
       strategy: result.operation?.strategy || normalizedMode
     }, 'success');
     return result;
     } catch (error) {
+      const failedAt = Date.now();
+      await persistMaintenanceJournal({
+        operationId,
+        mode: normalizedMode,
+        status: 'failed',
+        stage: 'failed',
+        startedAt,
+        durationMs: Math.max(0, failedAt - startedAt),
+        error: formatErrorMessage(error, 800),
+        result: null
+      });
       pushActivityLog('memory_maintenance_failed', '기억 유지보수에 실패했습니다.', {
         maintenanceMode: normalizedMode,
+        operationId,
         error: formatErrorMessage(error, 500)
       }, 'error');
       throw error;
+    } finally {
+      if (Runtime.maintenanceActiveOperationId === operationId) Runtime.maintenanceActiveOperationId = '';
     }
   };
 
@@ -14669,6 +15173,7 @@ ${cleanedText}`, 80),
 
   const maintenanceResultText = (result = {}) => [
     `기억 유지보수 완료 · 모드 ${result.maintenanceMode || '-'}`,
+    `작업 ID: ${result.operationId || '-'} · 소요 ${formatNumber(Math.round(Number(result.durationMs || 0) / 1000))}초`,
     `자동 전략: ${result.operation?.strategy || result.maintenanceMode || '-'}`,
     `이전: 누락 ${formatNumber(result.before?.missingTurns)} · 변경 ${formatNumber(result.before?.changedTurns)} · 정제 ${formatNumber(result.before?.dirtyRecords)} · 벡터 ${formatNumber(result.before?.recordsNeedingEmbedding)}`,
     `현재: 누락 ${formatNumber(result.after?.missingTurns)} · 변경 ${formatNumber(result.after?.changedTurns)} · 정제 ${formatNumber(result.after?.dirtyRecords)} · 정제기 불일치 ${formatNumber(result.after?.sanitizerVersionMismatch)} · 벡터 ${formatNumber(result.after?.recordsNeedingEmbedding)}`,
@@ -15969,7 +16474,12 @@ ${cleanedText}`, 80),
 
   const applyBusyState = () => {
     const busy = Runtime.guiBusyDepth > 0;
-    for (const btn of guiQueryAll('button')) btn.disabled = busy;
+    for (const btn of guiQueryAll('button')) {
+      // The close action is an escape hatch. A host API or repaint can stall
+      // after the durable commit, so the user must always be able to return
+      // control to RisuAI and reopen the GUI later.
+      btn.disabled = busy && !['closeBtn', 'exportDebugLogBtn'].includes(btn.id);
+    }
     const status = getGuiNode('busyStatus');
     if (status) status.textContent = busy ? `${Runtime.guiBusyLabel || '작업 중'}...` : '대기 중';
   };
@@ -16358,7 +16868,9 @@ ${cleanedText}`, 80),
     guiContainerShown = false;
     try {
       const api = getLiveApi(['hideContainer']);
-      if (typeof api?.hideContainer === 'function') await api.hideContainer();
+      if (typeof api?.hideContainer === 'function') {
+        await withDeadline(api.hideContainer(), 3000, 'hide GUI container');
+      }
       return true;
     } catch (error) {
       warn('hideContainer failed', error);
@@ -16677,7 +17189,10 @@ ${cleanedText}`, 80),
       if (!await guiConfirm(`${maintenancePlanText(plan)}\n\n필요한 항목만 자동으로 동기화·정제·복구할까요?`, '자동 점검·복구')) return;
       setBusy(true, '자동 점검·복구');
       try {
-        const result = await runMemoryMaintenance('auto');
+        const result = await runMemoryMaintenance('auto', { preflight: plan });
+        // Release the host/UI lock before the potentially slow refresh and
+        // completion dialog. A stalled repaint or modal must not strand RisuAI.
+        setBusy(false);
         await refreshUi('import');
         await guiAlert(maintenanceResultText(result), '기억 유지보수 완료');
       } catch (error) { await guiError('자동 점검·복구 실패', error); }
@@ -16694,6 +17209,9 @@ ${cleanedText}`, 80),
       setBusy(true, mode === 'rebuild' ? '현재 채팅 전체 재구축' : (mode === 'reembed' ? '벡터 전체 갱신' : '누락·변경 턴 동기화'));
       try {
         const result = await runMemoryMaintenance(mode);
+        // The maintenance commit is complete; refresh and the result dialog
+        // are presentation work and must not keep the host locked.
+        setBusy(false);
         await refreshUi('import');
         await guiAlert(maintenanceResultText(result), '기억 유지보수 완료');
       } catch (error) { await guiError('고급 기억 유지보수 실패', error); }
@@ -16863,6 +17381,8 @@ ${cleanedText}`, 80),
       lastClone: Runtime.lastClone,
       lastExternalRetirement: Runtime.lastExternalRetirement,
       lastEpisodeIndex: Runtime.lastEpisodeIndex,
+      maintenanceJournal: Runtime.maintenanceJournal,
+      activityLog: activityLogSnapshot(),
       settingsMigration: Runtime.settingsMigration,
       argumentAudit: Runtime.argumentAudit,
       argumentOverrides: { ...Runtime.argumentOverrides },
@@ -16873,6 +17393,8 @@ ${cleanedText}`, 80),
         mounted: guiMounted,
         containerShown: guiContainerShown,
         tab: Runtime.guiTab,
+        busyDepth: Runtime.guiBusyDepth,
+        busyLabel: Runtime.guiBusyLabel,
         perf: { ...Runtime.guiPerf },
         cache: {
           currentStats: !!Runtime.guiCurrentStatsCache,
@@ -16947,7 +17469,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   publicApi._test.currentSceneSourceShardIndexes = currentSceneSourceShardIndexes;
   globalThis.__FlashbackMemory = publicApi;
@@ -16957,6 +17479,7 @@ ${cleanedText}`, 80),
     Runtime.settings = await loadSettings(true);
     Runtime.effectiveSettings = Runtime.settings;
     syncFlashbackRuntimeState(Runtime.settings, Runtime.currentScope || null);
+    await recoverMaintenanceJournal();
     await registerMemoryBridgeIpc().catch(error => warn('Memory Bridge IPC registration failed', error));
     pushActivityLog('plugin_started', `${PLUGIN_NAME}가 시작되었습니다.`, {
       version: PLUGIN_VERSION,
