@@ -1,17 +1,25 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.9.22
+//@display-name ⚡ FLASHBACK Memory v0.10.2
 //@api 3.0
-//@version 0.9.22
+//@version 0.10.2
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
-//@arg embedding_provider string hash|openai|gemini|gemini-embedding|lmstudio|ollama|vertex|vertex-embedding|voyageai|openai_compat|custom; blank uses hash
+//@arg embedding_provider string hash|openai|voyageai|voyage_context|gemini|gemini-embedding|cohere|jina|mistral|bedrock|dashscope|ollama|lmstudio|localai|tei|vertex|vertex-embedding|openai_compat|openai_compat_local|custom_http|custom; blank uses hash
 //@arg embedding_url string Embedding endpoint/base URL; blank uses the selected provider default
+//@arg embedding_endpoint string Optional exact embedding endpoint; blank derives it from embedding_url
 //@arg embedding_model string Embedding model name; blank uses the selected provider default (hash: nomic-embed-text)
 //@arg embedding_key string Optional API key; blank means no arg-level key
 //@arg embedding_timeout_ms string Embedding request timeout in milliseconds; blank uses 30000
+//@arg embedding_dimensions string Requested output dimensions; blank or 0 uses provider auto detection
 //@arg hook_recall_timeout_ms string Maximum total recall time inside beforeRequest; blank uses 20000
 //@arg embedding_batch_size string Number of chunks embedded per request when endpoint supports batching; blank uses 8
+//@arg embedding_max_retries string Retry count for transient embedding failures; blank uses 2
+//@arg embedding_query_task string Optional provider query task/input type
+//@arg embedding_document_task string Optional provider document task/input type
+//@arg embedding_query_prefix string Optional query prefix
+//@arg embedding_document_prefix string Optional document prefix
+//@arg embedding_normalize string true|false; blank uses true
 //@arg fallback_hash_embedding string true|false; blank uses true
 //@arg hash_dimensions string Local hash embedding dimensions when embedding_provider=hash or fallback is used; blank uses 384
 //@arg top_k string Number of vector records injected per request; blank uses 12
@@ -19,6 +27,7 @@
 //@arg lexical_weight string Small lexical overlap boost added to cosine score; blank uses 0.08
 //@arg max_injection_chars string Maximum characters injected into beforeRequest; blank uses 4000
 //@arg injection_position string before_current_input|last_system|before_last_user; blank uses before_current_input
+//@arg prompt_cache_mode string off|existing_only|safe_auto; blank uses existing_only
 //@arg chunk_chars string Maximum source chunk characters before embedding; blank uses 1200
 //@arg chunk_overlap string Overlap characters between chunks; blank uses 160
 //@arg max_response_items string Maximum complete captured U+A turns retained per chat scope; blank uses 1200
@@ -69,7 +78,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.9.22
+ * ⚡ FLASHBACK Memory v0.10.2
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -314,7 +323,8 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.9.22';
+  const PLUGIN_VERSION = '0.10.2';
+  const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const MEMORY_SESSION_BRIDGE_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
   const MEMORY_SESSION_BRIDGE_PLUGIN_ID = 'flashback_hayaku_bridge';
@@ -364,7 +374,8 @@
   });
   const EXTERNAL_RETIREMENT_VERSION = 1;
   const HOOK_RECALL_TIMEOUT_POLICY_VERSION = 1;
-  const SETTINGS_POLICY_VERSION = 4;
+  const SETTINGS_POLICY_VERSION = 5;
+  const EMBEDDING_PREPROCESSING_VERSION = 1;
   const TURN_WORLDLINE_VERSION = 'flashback_turn_worldline_v1';
   const TURN_WORLDLINE_BINDING_POLICY_VERSION = 2;
   // Keep at least the default 1,200-response retention horizon plus reroll
@@ -376,14 +387,24 @@
   const PROVIDER_CHOICES = Object.freeze([
     'hash',
     'openai',
+    'voyageai',
+    'voyage_context',
     'gemini',
     'gemini-embedding',
+    'cohere',
+    'jina',
+    'mistral',
+    'bedrock',
+    'dashscope',
+    'tei',
+    'localai',
     'lmstudio',
     'ollama',
     'vertex',
     'vertex-embedding',
-    'voyageai',
     'openai_compat',
+    'openai_compat_local',
+    'custom_http',
     'custom'
   ]);
 
@@ -444,6 +465,7 @@
     'voyage-4': Object.freeze({ pricePerMillion: 0.06, freeTokens: 200000000 }),
     'voyage-4-lite': Object.freeze({ pricePerMillion: 0.02, freeTokens: 200000000 }),
     'voyage-context-3': Object.freeze({ pricePerMillion: 0.18, freeTokens: 200000000 }),
+    'voyage-context-4': Object.freeze({ pricePerMillion: 0.12, freeTokens: 200000000 }),
     'voyage-code-3': Object.freeze({ pricePerMillion: 0.18, freeTokens: 200000000 }),
     'voyage-finance-2': Object.freeze({ pricePerMillion: 0.12, freeTokens: 50000000 }),
     'voyage-law-2': Object.freeze({ pricePerMillion: 0.12, freeTokens: 50000000 }),
@@ -454,9 +476,28 @@
     mode: 'normal',
     recallQualityPreset: 'balanced',
     embeddingProvider: 'hash',
+    embeddingEnabled: true,
     embeddingUrl: '',
+    embeddingEndpoint: '',
     embeddingModel: 'nomic-embed-text',
     embeddingTimeoutMs: 30000,
+    embeddingDimensions: 0,
+    embeddingMaxRetries: 2,
+    embeddingInputMode: 'automatic',
+    embeddingQueryTask: '',
+    embeddingDocumentTask: '',
+    embeddingQueryPrefix: '',
+    embeddingDocumentPrefix: '',
+    embeddingNormalize: true,
+    embeddingCustomMethod: 'POST',
+    embeddingCustomHeaders: '',
+    embeddingCustomRequestTemplate: '',
+    embeddingCustomResponsePath: '',
+    embeddingCustomErrorPath: '',
+    embeddingFallbackProvider: 'hash',
+    progressiveReembedMaxRecords: 24,
+    progressiveReembedMaxChars: 50000,
+    progressiveReembedMaxRequests: 8,
     hookRecallTimeoutMs: 20000,
     hookRecallTimeoutPolicyVersion: HOOK_RECALL_TIMEOUT_POLICY_VERSION,
     settingsPolicyVersion: SETTINGS_POLICY_VERSION,
@@ -468,6 +509,7 @@
     lexicalWeight: 0.08,
     maxInjectionChars: 4000,
     injectionPosition: 'before_current_input',
+    promptCacheMode: 'existing_only',
     chunkChars: 1200,
     chunkOverlap: 160,
     maxResponseItems: 1200,
@@ -552,6 +594,9 @@
   const QUERY_EMBEDDING_CACHE_LOCAL_TTL_MS = 2 * 60 * 60 * 1000;
   const DOCUMENT_EMBEDDING_CACHE_MAX = 256;
   const DOCUMENT_EMBEDDING_CACHE_TTL_MS = 30 * 60 * 1000;
+  const EMBEDDING_DIAGNOSTIC_MAX = 80;
+  const RECALL_SHARD_CACHE_MAX = 24;
+  const RECALL_SHARD_CACHE_TTL_MS = 5 * 60 * 1000;
   const FLASHBACK_STATIC_CONTRACT_CACHE = new Map();
 
   const normalizeQueryForEmbeddingCache = (value) => text(value || '')
@@ -596,6 +641,8 @@
     operationLogSeq: 0,
     operationLogWrite: null,
     operationLogCache: null,
+    operationLogQueue: [],
+    operationLogFlushTimer: null,
     lastOperationLogError: '',
     activityLogSeq: 0,
     activityLog: [],
@@ -668,6 +715,18 @@
     inAfter: false,
     guiTab: 'provider',
     cacheSafety: {
+      mode: 'existing_only',
+      existingMarkerCount: 0,
+      existingMarkerIndexes: [],
+      finalMarkerIndexes: [],
+      boundaryIndex: -1,
+      boundarySource: 'none',
+      synthesized: false,
+      synthesisReason: 'not_evaluated',
+      volatilePrefixIndex: -1,
+      stablePrefixChars: 0,
+      stablePrefixTokens: 0,
+      dynamicAfterBoundary: true,
       staticContractHash: '',
       staticContractChars: 0,
       staticProfileId: '',
@@ -688,12 +747,25 @@
     },
     queryEmbeddingCache: new Map(),
     queryEmbeddingInFlight: new Map(),
+    documentEmbeddingCache: new Map(),
+    embeddingGeneration: 1,
+    embeddingControllers: new Set(),
+    embeddingDiagnostics: [],
+    lastEmbeddingDiagnostic: null,
+    lastProgressiveReembed: null,
     queryEmbeddingCacheStats: {
       hits: 0,
       misses: 0,
       coalesced: 0,
       evictions: 0,
       fallbackSkipped: 0,
+      invalidations: 0
+    },
+    recallShardCache: new Map(),
+    recallShardCacheStats: {
+      hits: 0,
+      misses: 0,
+      evictions: 0,
       invalidations: 0
     },
     sparseProjectionCache: new Map(),
@@ -703,6 +775,13 @@
       misses: 0,
       evictions: 0,
       invalidations: 0
+    },
+    storagePerfStats: {
+      recallLoads: 0,
+      manifestReuses: 0,
+      shardReads: 0,
+      shardReadBatches: 0,
+      lastRecallLoad: null
     }
   };
 
@@ -730,6 +809,7 @@
     if (!scope?.scopeKey) return scope;
     const previousScopeKey = Runtime.currentScope?.scopeKey || '';
     if (previousScopeKey && previousScopeKey !== scope.scopeKey) {
+      abortEmbeddingJobs('chat_changed');
       Runtime.previousScope = Runtime.currentScope ? { ...Runtime.currentScope } : null;
       Runtime.lastRecall = null;
       Runtime.lastCapture = null;
@@ -1008,12 +1088,16 @@
   const OPERATION_LOG_MAX_TURNS = 2;
   const OPERATION_LOG_MAX_EVENTS_PER_TURN = 40;
   const OPERATION_LOG_MAX_STORED_CHARS = 70000;
+  const OPERATION_LOG_QUEUE_MAX = 160;
+  const OPERATION_LOG_FLUSH_DELAY_MS = 120;
   const ACTIVITY_LOG_MAX_ENTRIES = 30;
   const MAINTENANCE_JOURNAL_VERSION = 1;
   const MAINTENANCE_JOURNAL_WRITE_TIMEOUT_MS = 1500;
   const MAINTENANCE_JOURNAL_STALE_MS = 30 * 60 * 1000;
   const STORAGE_IO_TIMEOUT_MS = 60000;
   const REMOTE_EMBEDDING_CONCURRENCY = 2;
+  const RECALL_SHARD_READ_CONCURRENCY = 3;
+  const STORAGE_SHARD_WRITE_CONCURRENCY = 2;
 
   const operationLogTurnKey = (data = {}) => {
     const scopeKey = text(data.scopeKey || data.scope?.scopeKey || data.pending?.scope?.scopeKey || Runtime.currentScope?.scopeKey || 'unknown');
@@ -1171,30 +1255,34 @@
     return Runtime.operationLogCache;
   };
 
-  const appendOperationLogEntry = async (entry) => {
+  const appendOperationLogEntries = async (entries = []) => {
+    const batch = (Array.isArray(entries) ? entries : [entries]).filter(entry => entry && typeof entry === 'object');
+    if (!batch.length) return await readOperationLogs();
     const store = await readOperationLogs();
-    const turnKey = text(entry.turnKey || operationLogTurnKey(entry));
-    let turn = store.turns.find(item => item.turnKey === turnKey);
-    if (!turn) {
-      turn = {
-        turnKey,
-        scopeKey: text(entry.scopeKey || ''),
-        pairIndex: Number(entry.pairIndex || 0) || 0,
-        turnIndex: Number(entry.turnIndex || 0) || 0,
-        messageHash: text(entry.messageHash || ''),
-        firstAt: entry.at,
-        lastAt: entry.at,
-        events: []
-      };
-      store.turns.push(turn);
+    for (const entry of batch) {
+      const turnKey = text(entry.turnKey || operationLogTurnKey(entry));
+      let turn = store.turns.find(item => item.turnKey === turnKey);
+      if (!turn) {
+        turn = {
+          turnKey,
+          scopeKey: text(entry.scopeKey || ''),
+          pairIndex: Number(entry.pairIndex || 0) || 0,
+          turnIndex: Number(entry.turnIndex || 0) || 0,
+          messageHash: text(entry.messageHash || ''),
+          firstAt: entry.at,
+          lastAt: entry.at,
+          events: []
+        };
+        store.turns.push(turn);
+      }
+      turn.scopeKey = text(entry.scopeKey || turn.scopeKey || '');
+      turn.pairIndex = Number(entry.pairIndex || turn.pairIndex || 0) || 0;
+      turn.turnIndex = Number(entry.turnIndex || turn.turnIndex || 0) || 0;
+      turn.messageHash = text(entry.messageHash || turn.messageHash || '');
+      turn.lastAt = entry.at;
+      turn.events.push(entry);
+      turn.events = turn.events.slice(-OPERATION_LOG_MAX_EVENTS_PER_TURN);
     }
-    turn.scopeKey = text(entry.scopeKey || turn.scopeKey || '');
-    turn.pairIndex = Number(entry.pairIndex || turn.pairIndex || 0) || 0;
-    turn.turnIndex = Number(entry.turnIndex || turn.turnIndex || 0) || 0;
-    turn.messageHash = text(entry.messageHash || turn.messageHash || '');
-    turn.lastAt = entry.at;
-    turn.events.push(entry);
-    turn.events = turn.events.slice(-OPERATION_LOG_MAX_EVENTS_PER_TURN);
     store.turns = store.turns
       .sort((a, b) => Number(a.lastAt || 0) - Number(b.lastAt || 0))
       .slice(-OPERATION_LOG_MAX_TURNS);
@@ -1209,7 +1297,40 @@
       raw = JSON.stringify(store);
     }
     await requireStorageWrite(STORAGE.operationLog, raw, 'operation log save');
+    Runtime.lastOperationLogError = '';
     return store;
+  };
+
+  const appendOperationLogEntry = async (entry) => await appendOperationLogEntries([entry]);
+
+  const cancelOperationLogFlushTimer = () => {
+    const timer = Runtime.operationLogFlushTimer;
+    if (!timer) return false;
+    Runtime.operationLogFlushTimer = null;
+    try { clearTimeout(timer); } catch (_) {}
+    Runtime.scheduledTimers.delete(timer);
+    return true;
+  };
+
+  const queueOperationLogFlush = () => {
+    const batch = Runtime.operationLogQueue.splice(0);
+    if (!batch.length) return Runtime.operationLogWrite || Promise.resolve();
+    Runtime.operationLogWrite = (Runtime.operationLogWrite || Promise.resolve())
+      .catch(() => {})
+      .then(() => appendOperationLogEntries(batch))
+      .catch(error => {
+        Runtime.lastOperationLogError = formatErrorMessage(error, 700);
+        warn('operation log write failed', error);
+      });
+    return Runtime.operationLogWrite;
+  };
+
+  const scheduleOperationLogFlush = () => {
+    if (Runtime.operationLogFlushTimer || Runtime.unloaded) return;
+    Runtime.operationLogFlushTimer = scheduleTimer(() => {
+      Runtime.operationLogFlushTimer = null;
+      queueOperationLogFlush();
+    }, OPERATION_LOG_FLUSH_DELAY_MS);
   };
 
   const opLog = (event, data = {}, level = 'info') => {
@@ -1233,22 +1354,27 @@
       turnKey: text(data.turnKey || operationLogTurnKey({ ...data, event })),
       data: sanitizeOperationLogData(data)
     };
-    Runtime.operationLogWrite = (Runtime.operationLogWrite || Promise.resolve())
-      .catch(() => {})
-      .then(() => appendOperationLogEntry(entry))
-      .catch(error => {
-        Runtime.lastOperationLogError = formatErrorMessage(error, 700);
-        warn('operation log write failed', error);
-      });
+    Runtime.operationLogQueue.push(entry);
+    if (Runtime.operationLogQueue.length > OPERATION_LOG_QUEUE_MAX) {
+      Runtime.operationLogQueue.splice(0, Runtime.operationLogQueue.length - OPERATION_LOG_QUEUE_MAX);
+    }
+    scheduleOperationLogFlush();
     return entry;
   };
 
   const flushOperationLogs = async () => {
+    cancelOperationLogFlushTimer();
+    while (Runtime.operationLogQueue.length) {
+      queueOperationLogFlush();
+      if (Runtime.operationLogWrite) await Runtime.operationLogWrite.catch(() => {});
+    }
     if (Runtime.operationLogWrite) await Runtime.operationLogWrite.catch(() => {});
     return await readOperationLogs();
   };
 
   const clearOperationLogs = async () => {
+    cancelOperationLogFlushTimer();
+    Runtime.operationLogQueue.length = 0;
     const clearWrite = (Runtime.operationLogWrite || Promise.resolve())
       .catch(() => {})
       .then(async () => {
@@ -1471,6 +1597,7 @@
     const key = text(scopeKey || '');
     if (!key) return;
     Runtime.chatMonitorByScope.delete(key);
+    invalidateRecallShardCache(key);
     for (const signature of Array.from(Runtime.driftDismissed.keys())) {
       if (text(signature).includes(key)) Runtime.driftDismissed.delete(signature);
     }
@@ -1967,7 +2094,15 @@
 
   const normalizeProvider = (provider) => {
     const raw = text(provider || '').trim().toLowerCase();
-    if (raw === 'openai-compatible' || raw === 'openai_compatible') return 'openai_compat';
+    if (raw === 'openai-compatible' || raw === 'openai_compatible' || raw === 'openaicompatible') return 'openai_compat';
+    if (raw === 'openai-compatible-local' || raw === 'openai_compatible_local') return 'openai_compat_local';
+    if (raw === 'voyage' || raw === 'voyage_ai') return 'voyageai';
+    if (raw === 'voyage-context' || raw === 'voyage_contextual' || raw === 'voyage-contextual') return 'voyage_context';
+    if (raw === 'jinaai' || raw === 'jina_ai') return 'jina';
+    if (raw === 'aws' || raw === 'aws_bedrock' || raw === 'titan') return 'bedrock';
+    if (raw === 'alibaba' || raw === 'alibaba_cloud') return 'dashscope';
+    if (raw === 'huggingface_tei' || raw === 'hugging_face_tei') return 'tei';
+    if (raw === 'custom-http' || raw === 'customhttp') return 'custom_http';
     if (raw === 'gemini_embedding') return 'gemini-embedding';
     if (raw === 'vertex_embedding') return 'vertex-embedding';
     return PROVIDER_CHOICES.includes(raw) ? raw : DEFAULTS.embeddingProvider;
@@ -1976,14 +2111,24 @@
   const defaultUrlForProvider = (provider) => {
     switch (normalizeProvider(provider)) {
       case 'openai': return 'https://api.openai.com/v1/embeddings';
+      case 'cohere': return 'https://api.cohere.com/v2/embed';
+      case 'jina': return 'https://api.jina.ai/v1/embeddings';
+      case 'mistral': return 'https://api.mistral.ai/v1/embeddings';
+      case 'bedrock': return 'https://bedrock-runtime.us-east-1.amazonaws.com';
+      case 'dashscope': return 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding';
       case 'lmstudio': return 'http://localhost:1234/v1/embeddings';
+      case 'localai': return 'http://localhost:8080/v1/embeddings';
+      case 'tei': return 'http://localhost:8080/embed';
+      case 'openai_compat_local': return 'http://localhost:8080/v1/embeddings';
       case 'ollama': return 'http://localhost:11434';
       case 'voyageai': return 'https://api.voyageai.com/v1/embeddings';
+      case 'voyage_context': return 'https://api.voyageai.com/v1/contextualizedembeddings';
       case 'gemini':
       case 'gemini-embedding': return 'https://generativelanguage.googleapis.com/v1beta';
       case 'vertex':
       case 'vertex-embedding': return '';
       case 'openai_compat':
+      case 'custom_http':
       case 'custom': return '';
       default: return '';
     }
@@ -1992,13 +2137,22 @@
   const defaultModelForProvider = (provider) => {
     switch (normalizeProvider(provider)) {
       case 'openai': return 'text-embedding-3-small';
+      case 'cohere': return 'embed-v4.0';
+      case 'jina': return 'jina-embeddings-v3';
+      case 'mistral': return 'mistral-embed';
+      case 'bedrock': return 'amazon.titan-embed-text-v2:0';
+      case 'dashscope': return 'text-embedding-v4';
       case 'gemini':
       case 'gemini-embedding': return 'gemini-embedding-001';
       case 'vertex':
       case 'vertex-embedding': return 'gemini-embedding-001';
       case 'ollama': return 'nomic-embed-text';
       case 'lmstudio': return 'text-embedding-nomic-embed-text-v1.5';
+      case 'localai':
+      case 'tei':
+      case 'openai_compat_local': return 'nomic-embed-text';
       case 'voyageai': return 'voyage-4-lite';
+      case 'voyage_context': return 'voyage-context-4';
       default: return DEFAULTS.embeddingModel;
     }
   };
@@ -2020,6 +2174,7 @@
     if (raw.startsWith('voyage-4-lite')) return 'voyage-4-lite';
     if (raw === 'voyage-4' || raw.startsWith('voyage-4:')) return 'voyage-4';
     if (raw.startsWith('voyage-context-3')) return 'voyage-context-3';
+    if (raw.startsWith('voyage-context-4')) return 'voyage-context-4';
     if (raw.startsWith('voyage-code-3')) return 'voyage-code-3';
     if (raw.startsWith('voyage-finance-2')) return 'voyage-finance-2';
     if (raw.startsWith('voyage-law-2')) return 'voyage-law-2';
@@ -2029,7 +2184,7 @@
 
   const embeddingPricingFor = (provider = '', model = '') => {
     const normalizedProvider = normalizeProvider(provider);
-    const normalizedModel = normalizedProvider === 'voyageai'
+    const normalizedModel = normalizedProvider === 'voyageai' || normalizedProvider === 'voyage_context'
       ? normalizeVoyagePricingModel(model || defaultModelForProvider('voyageai'))
       : text(model || '').trim();
     if (normalizedProvider === 'hash' || normalizedProvider === 'ollama' || normalizedProvider === 'lmstudio') {
@@ -2045,7 +2200,7 @@
         source: 'local'
       };
     }
-    if (normalizedProvider === 'voyageai') {
+    if (normalizedProvider === 'voyageai' || normalizedProvider === 'voyage_context') {
       const row = VOYAGE_TEXT_EMBEDDING_PRICING[normalizedModel];
       if (row) {
         return {
@@ -2528,7 +2683,7 @@
   };
 
   const NUMERIC_ARGUMENT_NAMES = Object.freeze(new Set([
-    'embedding_timeout_ms', 'hook_recall_timeout_ms', 'embedding_batch_size', 'hash_dimensions',
+    'embedding_timeout_ms', 'embedding_dimensions', 'embedding_max_retries', 'hook_recall_timeout_ms', 'embedding_batch_size', 'hash_dimensions',
     'top_k', 'max_injection_chars', 'chunk_chars', 'chunk_overlap', 'max_response_items',
     'min_capture_chars', 'candidate_limit', 'recency_half_life_days', 'recency_half_life_turns',
     'continuation_recent_items', 'current_scene_tail_turns', 'current_scene_tail_limit',
@@ -2540,10 +2695,12 @@
   ]));
 
   const SETTING_ARGUMENT_NAMES = Object.freeze([
-    'mode', 'embedding_provider', 'embedding_url', 'embedding_model',
-    'embedding_timeout_ms', 'hook_recall_timeout_ms', 'embedding_batch_size',
+    'mode', 'embedding_provider', 'embedding_url', 'embedding_endpoint', 'embedding_model', 'embedding_enabled',
+    'embedding_timeout_ms', 'embedding_dimensions', 'embedding_max_retries', 'embedding_input_mode',
+    'embedding_query_task', 'embedding_document_task', 'embedding_query_prefix', 'embedding_document_prefix',
+    'embedding_normalize', 'hook_recall_timeout_ms', 'embedding_batch_size',
     'fallback_hash_embedding', 'hash_dimensions', 'top_k', 'min_score', 'lexical_weight',
-    'max_injection_chars', 'injection_position', 'chunk_chars', 'chunk_overlap',
+    'max_injection_chars', 'injection_position', 'prompt_cache_mode', 'chunk_chars', 'chunk_overlap',
     'max_response_items', 'capture_after_request', 'min_capture_chars', 'include_scores',
     'enable_gui', 'auto_open_gui', 'debug_log', 'operation_log_enabled',
     'heuristic_recall', 'candidate_limit', 'evidence_gate',
@@ -2611,7 +2768,13 @@
     raw = repairZeroInitializedSettings(raw);
     const provider = normalizeProvider(raw.embeddingProvider ?? raw.embedding_provider ?? DEFAULTS.embeddingProvider);
     const requestedEmbeddingUrl = text(raw.embeddingUrl ?? raw.embedding_url ?? '').trim();
+    const requestedEmbeddingEndpoint = text(raw.embeddingEndpoint ?? raw.embedding_endpoint ?? '').trim();
     const requestedEmbeddingModel = text(raw.embeddingModel ?? raw.embedding_model ?? '').trim();
+    const fallbackHashEmbedding = asBool(raw.fallbackHashEmbedding ?? raw.fallback_hash_embedding, DEFAULTS.fallbackHashEmbedding);
+    const requestedFallbackProvider = raw.embeddingFallbackProvider ?? raw.embedding_fallback_provider;
+    const embeddingFallbackProvider = requestedFallbackProvider == null
+      ? (fallbackHashEmbedding ? 'hash' : '')
+      : normalizeChoice(requestedFallbackProvider, ['', 'hash'], DEFAULTS.embeddingFallbackProvider);
     const recallQualityValues = {
       topK: clampInt(raw.topK ?? raw.top_k, 1, 80, DEFAULTS.topK),
       minScore: clampNumber(raw.minScore ?? raw.min_score, -1, 1, DEFAULTS.minScore),
@@ -2626,20 +2789,40 @@
       mode: normalizeChoice(raw.mode, ['off', 'normal'], DEFAULTS.mode),
       recallQualityPreset,
       embeddingProvider: provider,
+      embeddingEnabled: asBool(raw.embeddingEnabled ?? raw.embedding_enabled, DEFAULTS.embeddingEnabled),
       embeddingUrl: compact(requestedEmbeddingUrl || defaultUrlForProvider(provider), 1400),
+      embeddingEndpoint: compact(requestedEmbeddingEndpoint, 1400),
       embeddingModel: compact(requestedEmbeddingModel || defaultModelForProvider(provider), 240),
       embeddingTimeoutMs: clampInt(raw.embeddingTimeoutMs ?? raw.embedding_timeout_ms, 3000, 180000, DEFAULTS.embeddingTimeoutMs),
+      embeddingDimensions: clampInt(raw.embeddingDimensions ?? raw.embedding_dimensions, 0, 65536, DEFAULTS.embeddingDimensions),
+      embeddingMaxRetries: clampInt(raw.embeddingMaxRetries ?? raw.embedding_max_retries, 0, 5, DEFAULTS.embeddingMaxRetries),
+      embeddingInputMode: normalizeChoice(raw.embeddingInputMode ?? raw.embedding_input_mode, ['automatic', 'manual'], DEFAULTS.embeddingInputMode),
+      embeddingQueryTask: compact(raw.embeddingQueryTask ?? raw.embedding_query_task ?? '', 120),
+      embeddingDocumentTask: compact(raw.embeddingDocumentTask ?? raw.embedding_document_task ?? '', 120),
+      embeddingQueryPrefix: compact(raw.embeddingQueryPrefix ?? raw.embedding_query_prefix ?? '', 500),
+      embeddingDocumentPrefix: compact(raw.embeddingDocumentPrefix ?? raw.embedding_document_prefix ?? '', 500),
+      embeddingNormalize: asBool(raw.embeddingNormalize ?? raw.embedding_normalize, DEFAULTS.embeddingNormalize),
+      embeddingCustomMethod: normalizeChoice(raw.embeddingCustomMethod ?? raw.embedding_custom_method, ['POST', 'PUT', 'PATCH'], DEFAULTS.embeddingCustomMethod),
+      embeddingCustomHeaders: compact(raw.embeddingCustomHeaders ?? raw.embedding_custom_headers ?? '', 8000),
+      embeddingCustomRequestTemplate: compact(raw.embeddingCustomRequestTemplate ?? raw.embedding_custom_request_template ?? '', 16000),
+      embeddingCustomResponsePath: compact(raw.embeddingCustomResponsePath ?? raw.embedding_custom_response_path ?? '', 500),
+      embeddingCustomErrorPath: compact(raw.embeddingCustomErrorPath ?? raw.embedding_custom_error_path ?? '', 500),
+      embeddingFallbackProvider,
+      progressiveReembedMaxRecords: clampInt(raw.progressiveReembedMaxRecords ?? raw.progressive_reembed_max_records, 1, 200, DEFAULTS.progressiveReembedMaxRecords),
+      progressiveReembedMaxChars: clampInt(raw.progressiveReembedMaxChars ?? raw.progressive_reembed_max_chars, 1000, 500000, DEFAULTS.progressiveReembedMaxChars),
+      progressiveReembedMaxRequests: clampInt(raw.progressiveReembedMaxRequests ?? raw.progressive_reembed_max_requests, 1, 64, DEFAULTS.progressiveReembedMaxRequests),
       hookRecallTimeoutMs: clampInt(raw.hookRecallTimeoutMs ?? raw.hook_recall_timeout_ms, 1000, 20000, DEFAULTS.hookRecallTimeoutMs),
       hookRecallTimeoutPolicyVersion: clampInt(raw.hookRecallTimeoutPolicyVersion, 0, HOOK_RECALL_TIMEOUT_POLICY_VERSION, DEFAULTS.hookRecallTimeoutPolicyVersion),
       settingsPolicyVersion: SETTINGS_POLICY_VERSION,
       embeddingBatchSize: clampInt(raw.embeddingBatchSize ?? raw.embedding_batch_size, 1, 128, DEFAULTS.embeddingBatchSize),
-      fallbackHashEmbedding: asBool(raw.fallbackHashEmbedding ?? raw.fallback_hash_embedding, DEFAULTS.fallbackHashEmbedding),
+      fallbackHashEmbedding: embeddingFallbackProvider === 'hash',
       hashDimensions: clampInt(raw.hashDimensions ?? raw.hash_dimensions, 64, 4096, DEFAULTS.hashDimensions),
       topK: recallQualityValues.topK,
       minScore: recallQualityValues.minScore,
       lexicalWeight: clampNumber(raw.lexicalWeight ?? raw.lexical_weight, 0, 0.5, DEFAULTS.lexicalWeight),
       maxInjectionChars: clampInt(raw.maxInjectionChars ?? raw.max_injection_chars, 800, 8000, DEFAULTS.maxInjectionChars),
       injectionPosition: normalizeChoice(raw.injectionPosition ?? raw.injection_position, ['before_current_input', 'last_system', 'before_last_user'], DEFAULTS.injectionPosition),
+      promptCacheMode: normalizeChoice(raw.promptCacheMode ?? raw.prompt_cache_mode, ['off', 'existing_only', 'safe_auto'], DEFAULTS.promptCacheMode),
       chunkChars: clampInt(raw.chunkChars ?? raw.chunk_chars, 240, 12000, DEFAULTS.chunkChars),
       chunkOverlap: clampInt(raw.chunkOverlap ?? raw.chunk_overlap, 0, 3000, DEFAULTS.chunkOverlap),
       maxResponseItems: clampInt(raw.maxResponseItems ?? raw.max_response_items ?? raw.maxChatItems ?? raw.max_chat_items, 1, 50000, DEFAULTS.maxResponseItems),
@@ -2739,6 +2922,9 @@
     FlashbackRuntimeState.capabilities = {
       episodicRawEvidence: true,
       vectorRecall: true,
+      embeddingProviderAdapter: true,
+      embeddingProfiles: true,
+      progressiveReembedding: true,
       sparseRecall: true,
       exactRecall: true,
       indexedShardRecall: true,
@@ -2752,6 +2938,7 @@
       previousFinalizedTurnRecall: true,
       provenanceCurrentTurn: true,
       prefillSafePlacement: true,
+      promptCacheAwarePlacement: true,
       authoritativePairRecovery: true,
       externalArtifactSanitizer: true,
       turnIdentity: 'Tn=Un+An',
@@ -2802,10 +2989,35 @@
     return overrides;
   };
 
+  const embeddingProfileSettingsFingerprint = (settings = DEFAULTS) => stableHash([
+    normalizeProvider(settings.embeddingProvider),
+    text(settings.embeddingModel || '').trim(),
+    Number(settings.embeddingDimensions || 0) || 0,
+    text(settings.embeddingQueryTask || '').trim(),
+    text(settings.embeddingDocumentTask || '').trim(),
+    text(settings.embeddingQueryPrefix || ''),
+    text(settings.embeddingDocumentPrefix || ''),
+    settings.embeddingNormalize !== false ? 'normalize' : 'raw',
+    EMBEDDING_PREPROCESSING_VERSION
+  ].join('\n'));
+  const embeddingRequestSettingsFingerprint = (settings = DEFAULTS) => stableHash([
+    embeddingProfileSettingsFingerprint(settings),
+    text(settings.embeddingUrl || ''),
+    text(settings.embeddingEndpoint || ''),
+    Number(settings.embeddingTimeoutMs || 0) || 0,
+    Number(settings.embeddingBatchSize || 0) || 0,
+    Number(settings.embeddingMaxRetries || 0) || 0,
+    text(settings.embeddingCustomHeaders || ''),
+    text(settings.embeddingCustomMethod || 'POST'),
+    text(settings.embeddingCustomRequestTemplate || ''),
+    text(settings.embeddingCustomResponsePath || ''),
+    settings.embeddingEnabled !== false ? 'enabled' : 'disabled'
+  ].join('\n'));
+
   const settingsEnvelope = (overrides = {}) => {
     const settings = normalizeSettings({ ...DEFAULTS, ...(overrides || {}) });
     return {
-      version: 4,
+      version: 5,
       savedAt: nowIso(),
       settingsPolicyVersion: SETTINGS_POLICY_VERSION,
       overrides: settingsOverrideDiff(settings),
@@ -2901,6 +3113,7 @@
   };
 
   const saveSettings = async (settings) => {
+    const previousEmbeddingFingerprint = embeddingRequestSettingsFingerprint(Runtime.settings || DEFAULTS);
     const requested = normalizeSettings(settings || {});
     const nextOverrides = settingsOverrideDiff(requested);
     const argumentOverrides = Runtime.argumentOverrides || {};
@@ -2917,6 +3130,8 @@
     await requireStorageWrite(STORAGE.settings, safeStringify(envelope), 'settings save');
     Runtime.storedSettingsOverrides = Object.freeze({ ...envelope.overrides });
     const normalized = applyArgumentOverrides(envelope.settings, { overrides: argumentOverrides });
+    const nextEmbeddingFingerprint = embeddingRequestSettingsFingerprint(normalized);
+    if (previousEmbeddingFingerprint !== nextEmbeddingFingerprint) abortEmbeddingJobs('settings_changed');
     Runtime.settings = normalized;
     if (!normalized.operationLogEnabled) await clearOperationLogs().catch(() => false);
     return normalized;
@@ -3021,6 +3236,8 @@
 
   const saveEmbeddingKeyLocal = async (key) => {
     const clean = text(key || '').trim();
+    const previous = Runtime.sessionEmbeddingKey;
+    if (previous !== clean) abortEmbeddingJobs('credential_changed');
     Runtime.sessionEmbeddingKey = clean;
     const storage = await RisuCompat.localStorageStatus();
     const baseStatus = {
@@ -3087,10 +3304,20 @@
     : [];
 
   const dot = (a, b) => {
-    const len = Math.min(a?.length || 0, b?.length || 0);
+    if (!Array.isArray(a) || !Array.isArray(b) || !a.length || a.length !== b.length) return 0;
     let sum = 0;
-    for (let i = 0; i < len; i += 1) sum += a[i] * b[i];
-    return sum;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i += 1) {
+      const x = Number(a[i]);
+      const y = Number(b[i]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return 0;
+      sum += x * y;
+      normA += x * x;
+      normB += y * y;
+    }
+    if (normA <= 0 || normB <= 0) return 0;
+    return sum / (Math.sqrt(normA) * Math.sqrt(normB));
   };
 
   const hashEmbedding = (value, dimensions = DEFAULTS.hashDimensions) => {
@@ -3328,20 +3555,78 @@
     return out;
   };
 
+  const EMBEDDING_ERROR_TYPES = Object.freeze([
+    'AUTH_ERROR', 'RATE_LIMIT', 'TIMEOUT', 'NETWORK_ERROR', 'INVALID_MODEL',
+    'INVALID_RESPONSE', 'DIMENSION_MISMATCH', 'INPUT_TOO_LONG', 'SERVER_ERROR',
+    'ABORTED', 'UNKNOWN'
+  ]);
+
+  class EmbeddingAdapterError extends Error {
+    constructor(type, message, details = {}) {
+      super(compact(message || type || 'Embedding request failed.', 500));
+      this.name = 'EmbeddingAdapterError';
+      this.type = EMBEDDING_ERROR_TYPES.includes(type) ? type : 'UNKNOWN';
+      this.code = this.type;
+      this.status = Number(details.status || 0) || 0;
+      this.retryAfterMs = Math.max(0, Number(details.retryAfterMs || 0) || 0);
+      this.provider = compact(details.provider || '', 80);
+      this.retryable = details.retryable === true;
+    }
+  }
+
+  const sanitizeEmbeddingErrorMessage = (value = '') => compact(text(value || '')
+    .replace(/(?:Bearer\s+)[A-Za-z0-9._~+\/-]+/gi, 'Bearer ***')
+    .replace(/([?&](?:key|api_key|token|access_token)=)[^&\s]+/gi, '$1***')
+    .replace(/((?:api[_ -]?key|access[_ -]?token|token)\s*[:=]\s*)[^\s,;]+/gi, '$1***')
+    .replace(/(?:sk-|AIza|voyage-|jina_)[A-Za-z0-9._~-]{8,}/g, '***'), 500);
+
+  const embeddingErrorDetail = (payload) => {
+    if (typeof payload === 'string') return sanitizeEmbeddingErrorMessage(payload);
+    if (!payload || typeof payload !== 'object') return '';
+    const candidates = [
+      payload?.error?.message,
+      typeof payload.error === 'string' ? payload.error : '',
+      payload.message,
+      payload?.error?.code,
+      payload.code
+    ];
+    return sanitizeEmbeddingErrorMessage(candidates.find(value => text(value).trim()) || '');
+  };
+
+  const classifyEmbeddingError = (error, context = {}) => {
+    if (error instanceof EmbeddingAdapterError) return error;
+    const status = Number(error?.status || error?.response?.status || context.status || 0) || 0;
+    const raw = sanitizeEmbeddingErrorMessage(error?.message || error || 'Embedding request failed.');
+    const lower = raw.toLowerCase();
+    let type = 'UNKNOWN';
+    if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR' || /aborted|aborterror/.test(lower)) type = context.timedOut ? 'TIMEOUT' : 'ABORTED';
+    else if (error?.code === 'FLASHBACK_DEADLINE' || /timeout|timed out|deadline/.test(lower)) type = 'TIMEOUT';
+    else if (status === 401 || status === 403 || /unauthori[sz]ed|forbidden|api key|authentication/.test(lower)) type = 'AUTH_ERROR';
+    else if (status === 429 || /rate.?limit|too many requests/.test(lower)) type = 'RATE_LIMIT';
+    else if (status === 404 || /model.*(?:not found|unknown|invalid)/.test(lower)) type = 'INVALID_MODEL';
+    else if (status === 413 || /input.*(?:too long|token limit|maximum|max context)|maximum context|context.*(?:exceed|too long)|token.*(?:exceed|limit)|payload too large/.test(lower)) type = 'INPUT_TOO_LONG';
+    else if (status >= 500) type = 'SERVER_ERROR';
+    else if (/network|failed to fetch|econn|enotfound|socket|dns/.test(lower)) type = 'NETWORK_ERROR';
+    else if (/dimension/.test(lower)) type = 'DIMENSION_MISMATCH';
+    else if (/json|response|embedding|vector|index/.test(lower)) type = 'INVALID_RESPONSE';
+    const retryable = ['RATE_LIMIT', 'TIMEOUT', 'NETWORK_ERROR', 'SERVER_ERROR'].includes(type);
+    return new EmbeddingAdapterError(type, raw || type, { ...context, status, retryable });
+  };
+
   const responseToJsonOrText = async (response, timeoutMs = DEFAULTS.embeddingTimeoutMs) => {
-    if (!response) throw new Error('Empty embedding response.');
+    if (!response) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Empty embedding response.');
     if (typeof response.json === 'function') {
-      try {
-        return await withDeadline(response.json(), timeoutMs, 'embedding response JSON');
-      } catch (error) {
-        if (error?.code === 'FLASHBACK_DEADLINE') throw error;
-      }
+      try { return await withDeadline(response.json(), timeoutMs, 'embedding response JSON'); }
+      catch (error) { if (error?.code === 'FLASHBACK_DEADLINE') throw error; }
     }
     if (typeof response.text === 'function') {
       const raw = await withDeadline(response.text(), timeoutMs, 'embedding response text');
-      return tryJsonParse(raw, raw);
+      const parsed = tryJsonParse(raw, null);
+      if (parsed != null) return parsed;
+      throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding endpoint returned a non-JSON response.');
     }
-    return response;
+    if (typeof response === 'object') return response;
+    throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding endpoint returned an unreadable response.');
   };
 
   const joinUrl = (base, suffix) => {
@@ -3354,92 +3639,18 @@
 
   const openAiLikeEmbeddingUrl = (settings) => {
     const provider = normalizeProvider(settings.embeddingProvider);
+    const exact = text(settings.embeddingEndpoint || '').trim();
+    if (exact) return exact;
     const configured = text(settings.embeddingUrl || '').trim() || defaultUrlForProvider(provider);
     if (!configured) return '';
     if (/\/embeddings(?:\?|$)/i.test(configured)) return configured;
-    if (provider === 'lmstudio') return joinUrl(configured, 'v1/embeddings');
-    if (provider === 'openai' || provider === 'voyageai') return configured;
+    if (provider === 'lmstudio' || provider === 'localai' || provider === 'openai_compat_local') return joinUrl(configured, 'v1/embeddings');
+    if (provider === 'openai' || provider === 'voyageai' || provider === 'jina' || provider === 'mistral') return configured;
     if (provider === 'custom' || provider === 'openai_compat') {
       if (/\/v\d+\/?$/i.test(configured)) return joinUrl(configured, 'embeddings');
       return joinUrl(configured, 'v1/embeddings');
     }
     return configured;
-  };
-
-  const embedTextsRemoteOllama = async (texts, settings) => {
-    const base = text(settings.embeddingUrl || '').trim() || defaultUrlForProvider('ollama');
-    const headers = { 'Content-Type': 'application/json' };
-    const model = settings.embeddingModel || defaultModelForProvider('ollama');
-    const url = joinUrl(base, 'api/embed');
-    const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify({ model, input: texts }) }, settings.embeddingTimeoutMs);
-    const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
-    let embeddings = Array.isArray(data?.embeddings) ? data.embeddings : null;
-    if (!embeddings && Array.isArray(data?.embedding)) embeddings = [data.embedding];
-    if (!Array.isArray(embeddings) || !Array.isArray(embeddings[0])) {
-      const fallbackUrl = joinUrl(base, 'api/embeddings');
-      const out = [];
-      for (const prompt of texts) {
-        const fallbackResponse = await RisuCompat.nativeFetch(fallbackUrl, { method: 'POST', headers, body: JSON.stringify({ model, prompt }) }, settings.embeddingTimeoutMs);
-        const fallbackData = await responseToJsonOrText(fallbackResponse, settings.embeddingTimeoutMs);
-        if (!Array.isArray(fallbackData?.embedding)) throw new Error(`No embeddings in Ollama response: ${compact(data, 500)}`);
-        out.push(normalizeVector(fallbackData.embedding));
-      }
-      return out;
-    }
-    return embeddings.map(normalizeVector);
-  };
-
-  const embedTextsRemoteOpenAICompat = async (texts, settings, options = {}) => {
-    const provider = normalizeProvider(settings.embeddingProvider);
-    const url = openAiLikeEmbeddingUrl(settings);
-    if (!url) throw new Error('OpenAI-compatible embedding URL is empty.');
-    const headers = { 'Content-Type': 'application/json' };
-    const key = await readEmbeddingKey();
-    if (key) headers.Authorization = `Bearer ${key.replace(/^Bearer\s+/i, '')}`;
-    const body = provider === 'voyageai'
-      ? { model: settings.embeddingModel || defaultModelForProvider('voyageai'), input: texts, input_type: options.taskType === 'query' ? 'query' : 'document' }
-      : { model: settings.embeddingModel, input: texts };
-    const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify(body) }, settings.embeddingTimeoutMs);
-    const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
-    let embeddings;
-    if (Array.isArray(data?.data)) {
-      let rows = data.data.slice();
-      const indexedRows = rows.filter(item => item?.index != null);
-      if (indexedRows.length > 0 && indexedRows.length !== rows.length) {
-        throw new Error(`Partially indexed OpenAI-compatible embedding response: ${compact(data, 500)}`);
-      }
-      const hasIndexes = rows.length > 0 && rows.every(item => Number.isInteger(Number(item?.index)));
-      if (hasIndexes) {
-        rows = rows.sort((a, b) => Number(a.index) - Number(b.index));
-        if (rows.some((item, index) => Number(item.index) !== index)) {
-          throw new Error(`Invalid embedding indexes in OpenAI-compatible response: ${compact(data, 500)}`);
-        }
-      }
-      embeddings = rows.map(item => item?.embedding);
-    } else {
-      embeddings = data?.embeddings;
-    }
-    if (!Array.isArray(embeddings) || !Array.isArray(embeddings[0])) throw new Error(`No embeddings in OpenAI-compatible response: ${compact(data, 500)}`);
-    return embeddings.map(normalizeVector);
-  };
-
-  const embedTextsRemoteGemini = async (texts, settings, options = {}) => {
-    const base = text(settings.embeddingUrl || '').trim() || defaultUrlForProvider('gemini');
-    const model = settings.embeddingModel || defaultModelForProvider('gemini');
-    const key = await readEmbeddingKey();
-    const cleanModel = model.startsWith('models/') ? model : `models/${model}`;
-    const suffix = `models/${encodeURIComponent(cleanModel.replace(/^models\//, ''))}:batchEmbedContents`;
-    const url = joinUrl(base, suffix);
-    const headers = { 'Content-Type': 'application/json' };
-    if (key) headers['x-goog-api-key'] = key;
-    const body = {
-      requests: texts.map(input => ({ model: cleanModel, content: { parts: [{ text: input }] }, taskType: options.taskType === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT' }))
-    };
-    const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify(body) }, settings.embeddingTimeoutMs);
-    const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
-    const embeddings = Array.isArray(data?.embeddings) ? data.embeddings.map(item => item.values || item.embedding || item) : null;
-    if (!Array.isArray(embeddings) || !Array.isArray(embeddings[0])) throw new Error(`No embeddings in Gemini response: ${compact(data, 500)}`);
-    return embeddings.map(normalizeVector);
   };
 
   const vertexEmbeddingUrl = (settings) => {
@@ -3452,125 +3663,612 @@
     return '';
   };
 
-  const embedTextsRemoteVertex = async (texts, settings, options = {}) => {
-    const url = vertexEmbeddingUrl(settings);
-    if (!url) {
-      throw new Error('Vertex embedding URL must be a full :predict endpoint or end at /projects/{project}/locations/{location}.');
-    }
-    const headers = { 'Content-Type': 'application/json' };
-    const token = await readEmbeddingKey();
-    if (token) headers.Authorization = `Bearer ${token.replace(/^Bearer\s+/i, '')}`;
-    const taskType = options.taskType === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT';
-    const out = [];
-    for (const input of texts) {
-      const body = {
-        instances: [{ content: input, task_type: taskType }],
-        parameters: { autoTruncate: true }
-      };
-      const response = await RisuCompat.nativeFetch(url, { method: 'POST', headers, body: JSON.stringify(body) }, settings.embeddingTimeoutMs);
-      const data = await responseToJsonOrText(response, settings.embeddingTimeoutMs);
-      const prediction = Array.isArray(data?.predictions) ? data.predictions[0] : null;
-      const vector = prediction?.embeddings?.values || prediction?.embedding?.values || prediction?.values;
-      if (!Array.isArray(vector)) throw new Error(`No embeddings in Vertex response: ${compact(data, 500)}`);
-      out.push(normalizeVector(vector));
+
+  const embeddingProfileDescriptor = (settings = DEFAULTS, dimensions = 0, providerOverride = '', modelOverride = '') => ({
+    provider: normalizeProvider(providerOverride || settings.embeddingProvider),
+    model: text(modelOverride || settings.embeddingModel || '').trim(),
+    dimensions: Math.max(0, Number(dimensions || settings.embeddingDimensions || 0) || 0),
+    queryTask: text(settings.embeddingQueryTask || '').trim(),
+    documentTask: text(settings.embeddingDocumentTask || '').trim(),
+    queryPrefix: text(settings.embeddingQueryPrefix || ''),
+    documentPrefix: text(settings.embeddingDocumentPrefix || ''),
+    normalize: settings.embeddingNormalize !== false,
+    preprocessingVersion: EMBEDDING_PREPROCESSING_VERSION
+  });
+
+  const embeddingProfileId = (settings = DEFAULTS, dimensions = 0, providerOverride = '', modelOverride = '') => {
+    const profile = embeddingProfileDescriptor(settings, dimensions, providerOverride, modelOverride);
+    return `emb_${stableHash(JSON.stringify(profile))}`;
+  };
+
+  const prepareEmbeddingInput = (value, purpose, settings) => {
+    const normalized = normalizeQueryForEmbeddingCache(value);
+    if (!normalized) return '';
+    const prefix = purpose === 'query' ? settings.embeddingQueryPrefix : settings.embeddingDocumentPrefix;
+    return prefix ? `${prefix}${normalized}` : normalized;
+  };
+
+  const safeParseHeaders = (raw = '') => {
+    if (!text(raw).trim()) return {};
+    const parsed = tryJsonParse(raw, null);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Custom headers must be a JSON object.');
+    const out = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,80}$/.test(key) || /^(?:__proto__|prototype|constructor)$/i.test(key)) continue;
+      out[key] = compact(value, 1000);
     }
     return out;
   };
 
+  const safeJsonPath = (root, path = '') => {
+    const clean = text(path || '').trim().replace(/^\$\.?/, '');
+    if (!clean) return root;
+    let values = [root];
+    for (const segment of clean.split('.').filter(Boolean)) {
+      const match = segment.match(/^([A-Za-z0-9_-]+)(\[\*\])?$/);
+      if (!match || /^(?:__proto__|prototype|constructor)$/.test(match[1])) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Unsafe or unsupported JSON response path.');
+      const next = [];
+      for (const value of values) {
+        const child = value && typeof value === 'object' ? value[match[1]] : undefined;
+        if (match[2]) { if (Array.isArray(child)) next.push(...child); }
+        else next.push(child);
+      }
+      values = next;
+    }
+    return values.length === 1 ? values[0] : values;
+  };
+
+  const safeTemplateSubstitute = (template, variables) => {
+    const walk = value => {
+      if (Array.isArray(value)) return value.map(walk);
+      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, walk(child)]));
+      if (typeof value !== 'string') return value;
+      const exact = value.match(/^\{\{(model|texts|queryTask|documentTask|purpose)\}\}$/);
+      if (exact) return variables[exact[1]];
+      return value.replace(/\{\{(model|queryTask|documentTask|purpose)\}\}/g, (_match, key) => text(variables[key]));
+    };
+    return walk(template);
+  };
+
+  const parseOpenAiVectors = data => {
+    if (!Array.isArray(data?.data)) return Array.isArray(data?.embeddings) ? data.embeddings : null;
+    let rows = data.data.slice();
+    const indexed = rows.filter(item => item?.index != null);
+    if (indexed.length && indexed.length !== rows.length) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding response contains only partially indexed rows.');
+    if (indexed.length) {
+      rows.sort((a, b) => Number(a.index) - Number(b.index));
+      if (rows.some((item, index) => !Number.isInteger(Number(item.index)) || Number(item.index) !== index)) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding response indexes are invalid.');
+    }
+    return rows.map(item => item?.embedding);
+  };
+
+  const retryAfterMsFromResponse = response => {
+    try {
+      const raw = response?.headers?.get?.('retry-after');
+      if (!raw) return 0;
+      if (/^\d+(?:\.\d+)?$/.test(raw)) return Math.ceil(Number(raw) * 1000);
+      const timestamp = Date.parse(raw);
+      return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : 0;
+    } catch (_) { return 0; }
+  };
+
+  const abortEmbeddingJobs = (reason = 'cancelled') => {
+    Runtime.embeddingGeneration += 1;
+    for (const controller of Runtime.embeddingControllers) { try { controller.abort(reason); } catch (_) {} }
+    Runtime.embeddingControllers.clear();
+    Runtime.queryEmbeddingInFlight.clear();
+    return Runtime.embeddingGeneration;
+  };
+
+  const embeddingFetchJson = async (request, cfg, signal = null) => {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    let timedOut = false;
+    let timer = null;
+    const abortFromParent = () => { try { controller?.abort(signal?.reason || 'aborted'); } catch (_) {} };
+    if (signal?.aborted) abortFromParent();
+    else signal?.addEventListener?.('abort', abortFromParent, { once: true });
+    if (controller) Runtime.embeddingControllers.add(controller);
+    if (controller) timer = setTimeout(() => { timedOut = true; try { controller.abort('timeout'); } catch (_) {} }, cfg.embeddingTimeoutMs);
+    try {
+      const response = await RisuCompat.nativeFetch(request.url, {
+        method: request.method || 'POST',
+        headers: request.headers || {},
+        body: JSON.stringify(request.body ?? {}),
+        signal: controller?.signal || signal || undefined
+      }, cfg.embeddingTimeoutMs);
+      const status = Number(response?.status || 0) || 0;
+      if (status >= 400 || response?.ok === false) {
+        let detail = '';
+        try { detail = embeddingErrorDetail(await responseToJsonOrText(response, cfg.embeddingTimeoutMs)); }
+        catch (_) {}
+        const lowerDetail = detail.toLowerCase();
+        const inputTooLong = status === 413 || /input.*(?:too long|token limit|maximum|max context)|maximum context|context.*(?:exceed|too long)|token.*(?:exceed|limit)|payload too large/.test(lowerDetail);
+        const type = status === 429
+          ? 'RATE_LIMIT'
+          : status >= 500
+            ? 'SERVER_ERROR'
+            : status === 401 || status === 403
+              ? 'AUTH_ERROR'
+              : status === 404
+                ? 'INVALID_MODEL'
+                : inputTooLong
+                  ? 'INPUT_TOO_LONG'
+                  : 'INVALID_RESPONSE';
+        throw new EmbeddingAdapterError(type, `Embedding endpoint returned HTTP ${status || 'error'}${detail ? `: ${detail}` : '.'}`, { status, retryAfterMs: retryAfterMsFromResponse(response), retryable: status === 429 || status >= 500 });
+      }
+      return await responseToJsonOrText(response, cfg.embeddingTimeoutMs);
+    } catch (error) {
+      throw classifyEmbeddingError(error, { provider: cfg.embeddingProvider, timedOut });
+    } finally {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.('abort', abortFromParent);
+      if (controller) Runtime.embeddingControllers.delete(controller);
+    }
+  };
+
+  const providerTask = (cfg, purpose, fallback) => text(purpose === 'query' ? cfg.embeddingQueryTask : cfg.embeddingDocumentTask).trim() || fallback;
+
+  const providerBatchLimit = (provider, cfg = {}) => {
+    const normalized = normalizeProvider(provider);
+    if (normalized === 'cohere') return 96;
+    if (normalized === 'dashscope') {
+      const model = text(cfg.embeddingModel || '').trim().toLowerCase();
+      if (model.includes('qwen3.7-text-embedding')) return 20;
+      if (/text-embedding-v[12](?:$|[-:])/.test(model)) return 25;
+      return 10;
+    }
+    return 128;
+  };
+
+  const effectiveProviderBatchSize = (provider, cfg = {}, capabilities = null) => capabilities?.batch === false
+    ? 1
+    : Math.min(providerBatchLimit(provider, cfg), clampInt(cfg.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize));
+
+  const isBedrockTitanV2Model = (model = '') => /(?:^|[./])amazon\.titan-embed-text-v2(?::\d+)?$/i.test(text(model).trim());
+
+  const commonAuthHeaders = (key, extra = {}) => ({
+    'Content-Type': 'application/json',
+    ...(key ? { Authorization: `Bearer ${key.replace(/^Bearer\s+/i, '')}` } : {}),
+    ...extra
+  });
+
+  const PROVIDER_HANDLERS = Object.freeze({
+    openai_compat: {
+      capabilities: { batch: true, queryDocument: false, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({
+        url: openAiLikeEmbeddingUrl(cfg), headers: commonAuthHeaders(key),
+        body: { model: cfg.embeddingModel, input: texts, ...(cfg.embeddingDimensions > 0 ? { dimensions: cfg.embeddingDimensions } : {}) }
+      }),
+      parse: parseOpenAiVectors
+    },
+    voyageai: {
+      capabilities: { batch: true, queryDocument: true, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({
+        url: text(cfg.embeddingEndpoint || cfg.embeddingUrl || defaultUrlForProvider('voyageai')), headers: commonAuthHeaders(key),
+        body: { model: cfg.embeddingModel, input: texts, input_type: providerTask(cfg, purpose, purpose === 'query' ? 'query' : 'document'), truncation: false, ...(cfg.embeddingDimensions > 0 ? { output_dimension: cfg.embeddingDimensions } : {}) }
+      }),
+      parse: parseOpenAiVectors
+    },
+    voyage_context: {
+      capabilities: { batch: true, queryDocument: true, dimensions: true, remote: true, contextualGroups: true },
+      request: (texts, cfg, purpose, key, requestOptions = {}) => ({
+        url: text(cfg.embeddingEndpoint || cfg.embeddingUrl || defaultUrlForProvider('voyage_context')),
+        headers: commonAuthHeaders(key),
+        body: {
+          model: cfg.embeddingModel || defaultModelForProvider('voyage_context'),
+          inputs: Array.isArray(requestOptions.contextGroups) && requestOptions.contextGroups.length
+            ? requestOptions.contextGroups
+            : texts.map(item => [item]),
+          input_type: providerTask(cfg, purpose, purpose === 'query' ? 'query' : 'document'),
+          ...(cfg.embeddingDimensions > 0 ? { output_dimension: cfg.embeddingDimensions } : {})
+        }
+      }),
+      parse: data => {
+        if (!Array.isArray(data?.data)) return null;
+        const outer = data.data.slice().sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0));
+        const vectors = [];
+        for (const group of outer) {
+          const rows = Array.isArray(group?.data) ? group.data.slice() : [];
+          rows.sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0));
+          for (const row of rows) vectors.push(row?.embedding);
+        }
+        return vectors;
+      }
+    },
+    gemini: {
+      capabilities: { batch: true, queryDocument: true, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => {
+        const cleanModel = cfg.embeddingModel.startsWith('models/') ? cfg.embeddingModel : `models/${cfg.embeddingModel}`;
+        const url = text(cfg.embeddingEndpoint || '') || joinUrl(cfg.embeddingUrl || defaultUrlForProvider('gemini'), `models/${encodeURIComponent(cleanModel.replace(/^models\//, ''))}:batchEmbedContents`);
+        const taskType = providerTask(cfg, purpose, purpose === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT');
+        return { url, headers: { 'Content-Type': 'application/json', ...(key ? { 'x-goog-api-key': key } : {}) }, body: { requests: texts.map(input => ({ model: cleanModel, content: { parts: [{ text: input }] }, ...(taskType ? { taskType } : {}), ...(cfg.embeddingDimensions > 0 ? { outputDimensionality: cfg.embeddingDimensions } : {}) })) } };
+      },
+      parse: data => Array.isArray(data?.embeddings) ? data.embeddings.map(item => item?.values || item?.embedding || item) : null
+    },
+    cohere: {
+      capabilities: { batch: true, queryDocument: true, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || cfg.embeddingUrl || defaultUrlForProvider('cohere')), headers: commonAuthHeaders(key), body: { model: cfg.embeddingModel, texts, input_type: providerTask(cfg, purpose, purpose === 'query' ? 'search_query' : 'search_document'), embedding_types: ['float'], truncate: 'NONE', ...(cfg.embeddingDimensions > 0 ? { output_dimension: cfg.embeddingDimensions } : {}) } }),
+      parse: data => data?.embeddings?.float || data?.embeddings
+    },
+    jina: {
+      capabilities: { batch: true, queryDocument: true, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || cfg.embeddingUrl || defaultUrlForProvider('jina')), headers: commonAuthHeaders(key), body: { model: cfg.embeddingModel, input: texts, task: providerTask(cfg, purpose, purpose === 'query' ? 'retrieval.query' : 'retrieval.passage'), embedding_type: 'float', normalized: cfg.embeddingNormalize !== false, ...(cfg.embeddingDimensions > 0 ? { dimensions: cfg.embeddingDimensions } : {}) } }),
+      parse: parseOpenAiVectors
+    },
+    mistral: {
+      capabilities: { batch: true, queryDocument: false, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || cfg.embeddingUrl || defaultUrlForProvider('mistral')), headers: commonAuthHeaders(key), body: { model: cfg.embeddingModel, input: texts, ...(cfg.embeddingDimensions > 0 ? { output_dimension: cfg.embeddingDimensions } : {}) } }),
+      parse: parseOpenAiVectors
+    },
+    dashscope: {
+      capabilities: { batch: true, queryDocument: true, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || cfg.embeddingUrl || defaultUrlForProvider('dashscope')), headers: commonAuthHeaders(key), body: { model: cfg.embeddingModel, input: { texts }, parameters: { text_type: providerTask(cfg, purpose, purpose === 'query' ? 'query' : 'document'), ...(cfg.embeddingDimensions > 0 ? { dimension: cfg.embeddingDimensions } : {}) } } }),
+      parse: data => {
+        if (!Array.isArray(data?.output?.embeddings)) return null;
+        const rows = data.output.embeddings.slice();
+        const indexes = rows.map(item => item?.text_index ?? item?.index);
+        const indexed = indexes.filter(value => value != null);
+        if (indexed.length && indexed.length !== rows.length) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'DashScope embedding response contains only partially indexed rows.');
+        if (indexed.length) {
+          rows.sort((a, b) => Number(a?.text_index ?? a?.index) - Number(b?.text_index ?? b?.index));
+          if (rows.some((item, index) => !Number.isInteger(Number(item?.text_index ?? item?.index)) || Number(item?.text_index ?? item?.index) !== index)) {
+            throw new EmbeddingAdapterError('INVALID_RESPONSE', 'DashScope embedding response indexes are invalid.');
+          }
+        }
+        return rows.map(item => item?.embedding);
+      }
+    },
+    ollama: {
+      capabilities: { batch: true, queryDocument: false, dimensions: true, remote: false },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || '') || (/\/api\/embed(?:\?|$)/.test(cfg.embeddingUrl) ? cfg.embeddingUrl : joinUrl(cfg.embeddingUrl || defaultUrlForProvider('ollama'), 'api/embed')), headers: commonAuthHeaders(key), body: { model: cfg.embeddingModel, input: texts, truncate: false, ...(cfg.embeddingDimensions > 0 ? { dimensions: cfg.embeddingDimensions } : {}) } }),
+      parse: data => data?.embeddings || (Array.isArray(data?.embedding) ? [data.embedding] : null)
+    },
+    tei: {
+      capabilities: { batch: true, queryDocument: false, dimensions: false, remote: false },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || cfg.embeddingUrl || defaultUrlForProvider('tei')), headers: commonAuthHeaders(key), body: { inputs: texts } }),
+      parse: data => Array.isArray(data) ? data : data?.embeddings
+    },
+    bedrock: {
+      capabilities: { batch: false, queryDocument: false, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || '') || joinUrl(cfg.embeddingUrl || defaultUrlForProvider('bedrock'), `model/${encodeURIComponent(cfg.embeddingModel)}/invoke`), headers: commonAuthHeaders(key), body: { inputText: texts[0], ...(cfg.embeddingDimensions > 0 ? { dimensions: cfg.embeddingDimensions } : {}), normalize: cfg.embeddingNormalize !== false } }),
+      parse: data => Array.isArray(data?.embedding) ? [data.embedding] : null
+    },
+    vertex: {
+      capabilities: { batch: false, queryDocument: true, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || '') || vertexEmbeddingUrl(cfg), headers: commonAuthHeaders(key), body: { instances: [{ content: texts[0], task_type: providerTask(cfg, purpose, purpose === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT') }], parameters: { autoTruncate: false, ...(cfg.embeddingDimensions > 0 ? { outputDimensionality: cfg.embeddingDimensions } : {}) } } }),
+      parse: data => { const row = data?.predictions?.[0]; const vector = row?.embeddings?.values || row?.embedding?.values || row?.values; return Array.isArray(vector) ? [vector] : null; }
+    },
+    custom_http: {
+      capabilities: { batch: true, queryDocument: true, dimensions: true, remote: true },
+      request: (texts, cfg, purpose, key) => {
+        const parsedTemplate = tryJsonParse(cfg.embeddingCustomRequestTemplate, null) || { model: '{{model}}', input: '{{texts}}' };
+        const body = safeTemplateSubstitute(parsedTemplate, { model: cfg.embeddingModel, texts, queryTask: cfg.embeddingQueryTask, documentTask: cfg.embeddingDocumentTask, purpose });
+        return { url: text(cfg.embeddingEndpoint || cfg.embeddingUrl), method: cfg.embeddingCustomMethod, headers: commonAuthHeaders(key, safeParseHeaders(cfg.embeddingCustomHeaders)), body };
+      },
+      parse: (data, cfg) => safeJsonPath(data, cfg.embeddingCustomResponsePath || 'data[*].embedding')
+    }
+  });
+
+  const providerHandlerFor = provider => {
+    const id = normalizeProvider(provider);
+    if (id === 'hash') return null;
+    if (id === 'openai' || id === 'lmstudio' || id === 'localai' || id === 'openai_compat' || id === 'openai_compat_local' || id === 'custom') return PROVIDER_HANDLERS.openai_compat;
+    if (id === 'gemini-embedding') return PROVIDER_HANDLERS.gemini;
+    if (id === 'vertex-embedding') return PROVIDER_HANDLERS.vertex;
+    return PROVIDER_HANDLERS[id] || null;
+  };
+
   const validateRemoteEmbeddingBatch = (vectors = [], expectedCount = 0, expectedDim = 0) => {
     if (!Array.isArray(vectors) || vectors.length !== expectedCount) {
-      throw new Error(`Embedding response count mismatch: expected ${expectedCount}, received ${Array.isArray(vectors) ? vectors.length : 0}.`);
+        throw new EmbeddingAdapterError('INVALID_RESPONSE', `Embedding response count mismatch: expected ${expectedCount}, received ${Array.isArray(vectors) ? vectors.length : 0}.`);
     }
     let dim = expectedDim;
     for (const vector of vectors) {
-      if (!Array.isArray(vector) || !vector.length || vector.some(value => !Number.isFinite(Number(value)))) {
-        throw new Error('Embedding response contains an invalid vector.');
+      if (!Array.isArray(vector) || !vector.length || vector.some(value => typeof value !== 'number' || !Number.isFinite(value))) {
+        throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding response contains an invalid vector.');
       }
-      if (!vector.some(value => Math.abs(Number(value)) > 1e-12)) throw new Error('Embedding response contains a zero vector.');
+      if (!vector.some(value => Math.abs(Number(value)) > 1e-12)) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding response contains a zero vector.');
       if (!dim) dim = vector.length;
-      if (vector.length !== dim) throw new Error(`Embedding response dimension mismatch: expected ${dim}, received ${vector.length}.`);
+      if (vector.length !== dim) throw new EmbeddingAdapterError('DIMENSION_MISMATCH', `Embedding response dimension mismatch: expected ${dim}, received ${vector.length}.`);
     }
     return dim;
   };
 
-  const embedTexts = async (texts, settings = null, options = {}) => {
-    const cfg = settings || await loadSettings();
-    const list = (texts || []).map(item => compact(item, 20000));
-    if (!list.length) return tagEmbeddingVectors([], false);
-    Runtime.lastEmbedUsedFallback = false;
-    Runtime.lastEmbedError = '';
-    if (cfg.embeddingProvider === 'hash') {
-      try { options.onProgress?.({ completedBatches: 0, totalBatches: 1, completedTexts: 0, totalTexts: list.length }); } catch (_) {}
-      const hashed = await hashEmbeddingBatch(list, cfg.hashDimensions);
-      try { options.onProgress?.({ completedBatches: 1, totalBatches: 1, completedTexts: list.length, totalTexts: list.length }); } catch (_) {}
-      return tagEmbeddingVectors(hashed, false);
-    }
-    const chunks = [];
-    let remoteDim = 0;
-    const batchSize = clampInt(cfg.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
+  const recordEmbeddingDiagnostic = diagnostic => {
+    const safe = Object.freeze({ ...diagnostic, at: Date.now() });
+    Runtime.lastEmbeddingDiagnostic = safe;
+    Runtime.embeddingDiagnostics.push(safe);
+    if (Runtime.embeddingDiagnostics.length > EMBEDDING_DIAGNOSTIC_MAX) Runtime.embeddingDiagnostics.splice(0, Runtime.embeddingDiagnostics.length - EMBEDDING_DIAGNOSTIC_MAX);
+    return safe;
+  };
+
+  const maskedEmbeddingUrl = value => {
     try {
-      const batches = [];
-      for (let i = 0; i < list.length; i += batchSize) batches.push(list.slice(i, i + batchSize));
-      const provider = normalizeProvider(cfg.embeddingProvider);
-      let completedBatches = 0;
-      let completedTexts = 0;
-      const reportProgress = () => {
-        if (typeof options.onProgress !== 'function') return;
-        try {
-          options.onProgress({
-            completedBatches,
-            totalBatches: batches.length,
-            completedTexts,
-            totalTexts: list.length
-          });
-        } catch (error) {
-          warn('embedding progress callback failed', error);
+      const url = new URL(text(value || ''));
+      return `${url.protocol}//${url.host}${url.pathname}`.replace(/\/model\/[^/]+\/invoke$/i, '/model/***/invoke');
+    } catch (_) { return text(value || '').replace(/([?&](?:key|token)=)[^&]+/gi, '$1***').slice(0, 240); }
+  };
+
+  const withEmbeddingRetries = async (fn, cfg, signal, stats) => {
+    const maxRetries = clampInt(cfg.embeddingMaxRetries, 0, 5, DEFAULTS.embeddingMaxRetries);
+    for (let attempt = 0; ; attempt += 1) {
+      try { return await fn(); }
+      catch (rawError) {
+        const error = classifyEmbeddingError(rawError, { provider: cfg.embeddingProvider });
+        if (!error.retryable || attempt >= maxRetries || signal?.aborted) {
+          error.retryCount = stats.retryCount;
+          throw error;
         }
-      };
-      const fetchBatch = async batch => {
-        if (provider === 'ollama') return await embedTextsRemoteOllama(batch, cfg);
-        if (provider === 'gemini' || provider === 'gemini-embedding') return await embedTextsRemoteGemini(batch, cfg, options);
-        if (provider === 'vertex' || provider === 'vertex-embedding') return await embedTextsRemoteVertex(batch, cfg, options);
-        return await embedTextsRemoteOpenAICompat(batch, cfg, options);
-      };
-      const concurrency = clampInt(options.concurrency, 1, 4, 1);
-      reportProgress();
-      if (concurrency <= 1 || batches.length <= 1) {
-        for (const batch of batches) {
-          const vectors = await fetchBatch(batch);
-          remoteDim = validateRemoteEmbeddingBatch(vectors, batch.length, remoteDim);
-          chunks.push(...vectors);
-          completedBatches += 1;
-          completedTexts += batch.length;
-          reportProgress();
+        stats.retryCount += 1;
+        const base = error.retryAfterMs || (attempt === 0 ? 500 : 1500 * attempt);
+        await delay(Math.min(10000, base + Math.floor(Math.random() * 150)));
+      }
+    }
+  };
+
+  const embedVoyageContextualRows = async (rows, cfg, purpose, options, handler, generation, stats) => {
+    const cache = purpose === 'query' ? Runtime.queryEmbeddingCache : Runtime.documentEmbeddingCache;
+    const profileFamily = embeddingProfileId(cfg, cfg.embeddingDimensions || 0);
+    const groupMap = new Map();
+    for (let index = 0; index < rows.length; index += 1) {
+      const sourceIndex = rows[index].sourceIndex;
+      const supplied = Array.isArray(options.contextGroupIds) ? text(options.contextGroupIds[sourceIndex] || '').trim() : '';
+      const groupId = purpose === 'query' ? `query:${index}` : (supplied || `document:${index}`);
+      if (!groupMap.has(groupId)) groupMap.set(groupId, { id: groupId, items: [] });
+      groupMap.get(groupId).items.push({ outputIndex: index, text: rows[index].text });
+    }
+    const groups = [];
+    const contextTokenBudget = 110000;
+    for (const logicalGroup of groupMap.values()) {
+      let segmentItems = [];
+      let segmentTokens = 0;
+      let segmentNo = 0;
+      for (const item of logicalGroup.items) {
+        const itemTokens = estimateTokens(item.text);
+        if (segmentItems.length && segmentTokens + itemTokens > contextTokenBudget) {
+          groups.push({ id: `${logicalGroup.id}:segment:${segmentNo}`, items: segmentItems, tokenEstimate: segmentTokens });
+          segmentNo += 1;
+          segmentItems = [];
+          segmentTokens = 0;
         }
+        segmentItems.push(item);
+        segmentTokens += itemTokens;
+      }
+      if (segmentItems.length) groups.push({ id: `${logicalGroup.id}:segment:${segmentNo}`, items: segmentItems, tokenEstimate: segmentTokens });
+    }
+    const vectors = new Array(rows.length);
+    const pendingGroups = [];
+    for (const group of groups) {
+      const groupHash = stableHash(group.items.map(item => item.text).join('\u0000'));
+      const entries = group.items.map((item, position) => ({
+        ...item,
+        key: stableHash(`${profileFamily}\n${purpose}\n${EMBEDDING_PREPROCESSING_VERSION}\n${groupHash}\n${position}\n${stableHash(item.text)}`)
+      }));
+      const cached = entries.map(entry => cache.get(entry.key));
+      if (cached.every(entry => Array.isArray(entry?.vector) && entry.vector.length)) {
+        entries.forEach((entry, index) => {
+          vectors[entry.outputIndex] = cached[index].vector;
+          cached[index].lastUsedAt = Date.now();
+        });
+        stats.cacheHits += entries.length;
       } else {
-        const batchVectors = new Array(batches.length);
-        let nextBatch = 0;
-        const worker = async () => {
-          while (true) {
-            const index = nextBatch++;
-            if (index >= batches.length) return;
-            batchVectors[index] = await fetchBatch(batches[index]);
-            completedBatches += 1;
-            completedTexts += batches[index].length;
-            reportProgress();
+        stats.cacheMisses += entries.length;
+        pendingGroups.push({ ...group, entries });
+      }
+    }
+    const chunkBudget = clampInt(cfg.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
+    const batches = [];
+    let current = [];
+    let currentChunks = 0;
+    let currentTokens = 0;
+    for (const group of pendingGroups) {
+      const groupTokens = Number(group.tokenEstimate || 0) || group.entries.reduce((sum, entry) => sum + estimateTokens(entry.text), 0);
+      if (current.length && (currentChunks + group.entries.length > chunkBudget || currentTokens + groupTokens > contextTokenBudget)) {
+        batches.push(current);
+        current = [];
+        currentChunks = 0;
+        currentTokens = 0;
+      }
+      current.push(group);
+      currentChunks += group.entries.length;
+      currentTokens += groupTokens;
+    }
+    if (current.length) batches.push(current);
+    const key = batches.length ? await readEmbeddingKey() : '';
+    let expectedDim = 0;
+    let completedTexts = 0;
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      if (options.signal?.aborted) throw new EmbeddingAdapterError('ABORTED', 'Embedding request was cancelled.');
+      const batchGroups = batches[batchIndex];
+      const batchEntries = batchGroups.flatMap(group => group.entries);
+      const contextGroups = batchGroups.map(group => group.entries.map(entry => entry.text));
+      const request = handler.request(batchEntries.map(entry => entry.text), cfg, purpose, key, { contextGroups });
+      const data = await withEmbeddingRetries(async () => {
+        stats.requestCount += 1;
+        return await embeddingFetchJson(request, cfg, options.signal || null);
+      }, cfg, options.signal || null, stats);
+      if (generation !== Runtime.embeddingGeneration) throw new EmbeddingAdapterError('ABORTED', 'Embedding result belongs to an obsolete settings generation.');
+      if (!Array.isArray(data?.data) || data.data.length !== contextGroups.length) {
+        throw new EmbeddingAdapterError('INVALID_RESPONSE', `Contextual embedding group count mismatch: expected ${contextGroups.length}, received ${Array.isArray(data?.data) ? data.data.length : 0}.`);
+      }
+      const outerHasIndex = data.data.map(group => Number.isInteger(group?.index));
+      if (outerHasIndex.some(Boolean) && !outerHasIndex.every(Boolean)) {
+        throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Contextual embedding response has partial outer indexes.');
+      }
+      const orderedGroups = data.data.slice().sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0));
+      for (let groupIndex = 0; groupIndex < orderedGroups.length; groupIndex += 1) {
+        const responseGroup = orderedGroups[groupIndex];
+        if (outerHasIndex.every(Boolean) && Number(responseGroup.index) !== groupIndex) {
+          throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Contextual embedding response has invalid outer indexes.');
+        }
+        if (!Array.isArray(responseGroup?.data) || responseGroup.data.length !== contextGroups[groupIndex].length) {
+          throw new EmbeddingAdapterError('INVALID_RESPONSE', `Contextual embedding chunk count mismatch for group ${groupIndex}.`);
+        }
+        const innerHasIndex = responseGroup.data.map(item => Number.isInteger(item?.index));
+        if (innerHasIndex.some(Boolean) && !innerHasIndex.every(Boolean)) {
+          throw new EmbeddingAdapterError('INVALID_RESPONSE', `Contextual embedding response has partial inner indexes for group ${groupIndex}.`);
+        }
+        if (innerHasIndex.every(Boolean)) {
+          const orderedInner = responseGroup.data.slice().sort((a, b) => Number(a.index) - Number(b.index));
+          if (orderedInner.some((item, index) => Number(item.index) !== index)) {
+            throw new EmbeddingAdapterError('INVALID_RESPONSE', `Contextual embedding response has invalid inner indexes for group ${groupIndex}.`);
           }
-        };
-        await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, worker));
-        for (let index = 0; index < batches.length; index += 1) {
-          const vectors = batchVectors[index];
-          remoteDim = validateRemoteEmbeddingBatch(vectors, batches[index].length, remoteDim);
-          chunks.push(...vectors);
         }
       }
-      return tagEmbeddingVectors(chunks, false);
-    } catch (error) {
-      if (!cfg.fallbackHashEmbedding) throw error;
+      const rawVectors = handler.parse(data, cfg, purpose);
+      expectedDim = validateRemoteEmbeddingBatch(rawVectors, batchEntries.length, expectedDim);
+      const normalized = rawVectors.map(vector => cfg.embeddingNormalize === false ? vector.map(Number) : normalizeVector(vector));
+      batchEntries.forEach((entry, index) => {
+        const vector = normalized[index];
+        vectors[entry.outputIndex] = vector;
+        if (cache.size >= (purpose === 'query' ? QUERY_EMBEDDING_CACHE_MAX : DOCUMENT_EMBEDDING_CACHE_MAX)) cache.delete(cache.keys().next().value);
+        cache.set(entry.key, { vector, dimensions: vector.length, profileId: embeddingProfileId(cfg, vector.length), textHash: stableHash(entry.text), purpose, createdAt: Date.now(), lastUsedAt: Date.now(), at: Date.now(), providerUsed: 'voyage_context', modelUsed: cfg.embeddingModel, dim: vector.length, fallbackUsed: false });
+      });
+      stats.batchCount += 1;
+      completedTexts += batchEntries.length;
+      try { options.onProgress?.({ completedBatches: batchIndex + 1, totalBatches: batches.length, completedTexts, totalTexts: pendingGroups.reduce((sum, group) => sum + group.entries.length, 0) }); } catch (_) {}
+    }
+    return { vectors, dimensions: vectors[0]?.length || expectedDim || 0, groupCount: groups.length };
+  };
+
+  const createEmbeddingProviderAdapter = rawSettings => {
+    const cfg = normalizeSettings(rawSettings || DEFAULTS);
+    const provider = normalizeProvider(cfg.embeddingProvider);
+    const handler = providerHandlerFor(provider);
+    const capabilities = provider === 'hash'
+      ? { batch: true, queryDocument: true, dimensions: true, remote: false }
+      : (handler?.capabilities || { batch: false, queryDocument: false, dimensions: false, remote: true });
+    const validateConfig = () => {
+      if (!cfg.embeddingEnabled) return true;
+      if (provider !== 'hash' && !handler) throw new EmbeddingAdapterError('INVALID_MODEL', `Unsupported embedding provider: ${provider}`);
+      if (provider !== 'hash' && !text(cfg.embeddingModel).trim()) throw new EmbeddingAdapterError('INVALID_MODEL', 'Embedding model is empty.');
+      if (provider === 'bedrock' && !isBedrockTitanV2Model(cfg.embeddingModel)) {
+        throw new EmbeddingAdapterError('INVALID_MODEL', 'The Bedrock adapter supports Amazon Titan Text Embeddings V2 request and response schema only.');
+      }
+      const requestUrl = provider === 'hash' ? '' : (provider === 'vertex' || provider === 'vertex-embedding' ? (cfg.embeddingEndpoint || vertexEmbeddingUrl(cfg)) : provider === 'custom_http' ? (cfg.embeddingEndpoint || cfg.embeddingUrl) : 'deferred');
+      if (provider !== 'hash' && requestUrl !== 'deferred' && !requestUrl) throw new EmbeddingAdapterError('NETWORK_ERROR', 'Embedding endpoint is empty or incomplete.');
+      return true;
+    };
+    const embedResult = async (rawTexts, options = {}) => {
+      validateConfig();
+      const startedAt = Date.now();
+      const purpose = options.purpose === 'query' || options.taskType === 'query' ? 'query' : 'document';
+      const sourceTexts = Array.isArray(rawTexts) ? rawTexts : [rawTexts];
+      const rows = sourceTexts.map((value, sourceIndex) => ({ sourceIndex, text: prepareEmbeddingInput(value, purpose, cfg) })).filter(row => row.text);
+      const list = rows.map(row => row.text);
+      const generation = Runtime.embeddingGeneration;
+      const stats = { requestCount: 0, batchCount: 0, retryCount: 0, cacheHits: 0, cacheMisses: 0 };
+      if (!list.length) return { vectors: [], model: cfg.embeddingModel, provider, dimensions: 0, profileId: embeddingProfileId(cfg, 0), usage: { inputTokens: 0 }, metadata: stats };
+      if (!cfg.embeddingEnabled || provider === 'hash') {
+        const vectors = await hashEmbeddingBatch(list, cfg.hashDimensions);
+        return { vectors, model: `hash-${cfg.hashDimensions}`, provider: 'hash', dimensions: cfg.hashDimensions, profileId: embeddingProfileId(cfg, cfg.hashDimensions, 'hash', `hash-${cfg.hashDimensions}`), usage: { inputTokens: null }, metadata: { ...stats, batchCount: 1 } };
+      }
+      if (provider === 'voyage_context') {
+        const contextual = await embedVoyageContextualRows(rows, cfg, purpose, options, handler, generation, stats);
+        const result = { vectors: contextual.vectors, model: cfg.embeddingModel, provider, dimensions: contextual.dimensions, profileId: embeddingProfileId(cfg, contextual.dimensions), usage: { inputTokens: null }, metadata: { ...stats, contextGroupCount: contextual.groupCount } };
+        recordEmbeddingDiagnostic({ provider, model: cfg.embeddingModel, dimensions: result.dimensions, profileId: result.profileId, baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: purpose, inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: stats.batchCount, contextGroupCount: contextual.groupCount, elapsedMs: Date.now() - startedAt, cacheHits: stats.cacheHits, cacheMisses: stats.cacheMisses, retryCount: stats.retryCount, errorType: '', fallbackUsed: false, staleVectorCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0, pendingReembeddingCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0 });
+        return result;
+      }
+      const uniqueTexts = [];
+      const uniqueIndex = new Map();
+      const restore = [];
+      for (const item of list) {
+        if (!uniqueIndex.has(item)) { uniqueIndex.set(item, uniqueTexts.length); uniqueTexts.push(item); }
+        restore.push(uniqueIndex.get(item));
+      }
+      const profileFamily = embeddingProfileId(cfg, cfg.embeddingDimensions || 0);
+      const cache = purpose === 'query' ? Runtime.queryEmbeddingCache : Runtime.documentEmbeddingCache;
+      const uniqueVectors = new Array(uniqueTexts.length);
+      const pending = [];
+      for (let i = 0; i < uniqueTexts.length; i += 1) {
+        const key = stableHash(`${profileFamily}\n${purpose}\n${EMBEDDING_PREPROCESSING_VERSION}\n${stableHash(uniqueTexts[i])}`);
+        const cached = cache.get(key);
+        if (cached?.vector) { uniqueVectors[i] = cached.vector; cached.lastUsedAt = Date.now(); stats.cacheHits += 1; }
+        else { pending.push({ index: i, text: uniqueTexts[i], key }); stats.cacheMisses += 1; }
+      }
+      const key = await readEmbeddingKey();
+      const maxBatch = effectiveProviderBatchSize(provider, cfg, capabilities);
+      const batches = [];
+      for (let i = 0; i < pending.length; i += maxBatch) batches.push(pending.slice(i, i + maxBatch));
+      let expectedDim = 0;
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        if (options.signal?.aborted) throw new EmbeddingAdapterError('ABORTED', 'Embedding request was cancelled.');
+        const batch = batches[batchIndex];
+        const request = handler.request(batch.map(item => item.text), cfg, purpose, key);
+        if (!request?.url) throw new EmbeddingAdapterError('NETWORK_ERROR', 'Embedding endpoint is empty.');
+        const data = await withEmbeddingRetries(async () => {
+          stats.requestCount += 1;
+          return await embeddingFetchJson(request, cfg, options.signal || null);
+        }, cfg, options.signal || null, stats);
+        if (generation !== Runtime.embeddingGeneration) throw new EmbeddingAdapterError('ABORTED', 'Embedding result belongs to an obsolete settings generation.');
+        const rawVectors = handler.parse(data, cfg, purpose);
+        expectedDim = validateRemoteEmbeddingBatch(rawVectors, batch.length, expectedDim);
+        const vectors = rawVectors.map(vector => cfg.embeddingNormalize === false ? vector.map(Number) : normalizeVector(vector));
+        batch.forEach((item, index) => {
+          uniqueVectors[item.index] = vectors[index];
+          const limit = purpose === 'query' ? QUERY_EMBEDDING_CACHE_MAX : DOCUMENT_EMBEDDING_CACHE_MAX;
+          if (cache.size >= limit) cache.delete(cache.keys().next().value);
+          cache.set(item.key, { vector: vectors[index], dimensions: vectors[index].length, profileId: embeddingProfileId(cfg, vectors[index].length), textHash: stableHash(item.text), purpose, createdAt: Date.now(), lastUsedAt: Date.now(), at: Date.now(), providerUsed: provider, modelUsed: cfg.embeddingModel, dim: vectors[index].length, fallbackUsed: false });
+        });
+        stats.batchCount += 1;
+        try { options.onProgress?.({ completedBatches: batchIndex + 1, totalBatches: batches.length, completedTexts: Math.min(pending.length, (batchIndex + 1) * maxBatch), totalTexts: pending.length }); } catch (_) {}
+      }
+      const vectors = restore.map(index => uniqueVectors[index]);
+      const dimensions = vectors[0]?.length || expectedDim || 0;
+      const result = { vectors, model: cfg.embeddingModel, provider, dimensions, profileId: embeddingProfileId(cfg, dimensions), usage: { inputTokens: null }, metadata: stats };
+      recordEmbeddingDiagnostic({ provider, model: cfg.embeddingModel, dimensions, profileId: result.profileId, baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: purpose, inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: stats.batchCount, elapsedMs: Date.now() - startedAt, cacheHits: stats.cacheHits, cacheMisses: stats.cacheMisses, retryCount: stats.retryCount, errorType: '', fallbackUsed: false, staleVectorCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0, pendingReembeddingCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0 });
+      return result;
+    };
+    return Object.freeze({
+      normalizeConfig: () => ({ ...cfg }),
+      validateConfig,
+      embedTexts: embedResult,
+      testConnection: async options => {
+        const startedAt = Date.now();
+        const result = await embedResult(['Embedding connection test.'], { ...(options || {}), purpose: 'query' });
+        return { ok: true, provider: result.provider, model: result.model, dimensions: result.dimensions, elapsedMs: Date.now() - startedAt, errorType: '' };
+      },
+      resolveDimensions: result => Number(result?.dimensions || cfg.embeddingDimensions || 0) || 0,
+      normalizeResponse: (data, purpose = 'document') => handler?.parse?.(data, cfg, purpose) || data,
+      classifyError: classifyEmbeddingError,
+      getCapabilities: () => ({ ...capabilities })
+    });
+  };
+
+  const tagEmbeddingVectorsExtended = (vectors, result, fallbackUsed = false, error = '') => {
+    const out = tagEmbeddingVectors(vectors, fallbackUsed, error);
+    const metadata = {
+      flashbackEmbeddingProvider: result?.provider || '',
+      flashbackEmbeddingModel: result?.model || '',
+      flashbackEmbeddingDimensions: Number(result?.dimensions || 0) || 0,
+      flashbackEmbeddingProfileId: result?.profileId || '',
+      flashbackEmbeddingMetadata: result?.metadata || null
+    };
+    for (const [key, value] of Object.entries(metadata)) {
+      try { Object.defineProperty(out, key, { value, enumerable: false, configurable: true }); } catch (_) { out[key] = value; }
+    }
+    return out;
+  };
+
+  const embedTexts = async (texts, settings = null, options = {}) => {
+    const cfg = normalizeSettings(settings || await loadSettings());
+    const list = (texts || []).map(item => compact(item, 20000));
+    if (!list.length) return tagEmbeddingVectorsExtended([], null, false);
+    Runtime.lastEmbedUsedFallback = false;
+    Runtime.lastEmbedError = '';
+    try {
+      const result = await createEmbeddingProviderAdapter(cfg).embedTexts(list, { ...options, purpose: options.purpose || (options.taskType === 'query' ? 'query' : 'document') });
+      return tagEmbeddingVectorsExtended(result.vectors, result, false);
+    } catch (rawError) {
+      const error = classifyEmbeddingError(rawError, { provider: cfg.embeddingProvider });
+      recordEmbeddingDiagnostic({ provider: normalizeProvider(cfg.embeddingProvider), model: cfg.embeddingModel, dimensions: cfg.embeddingDimensions || 0, profileId: embeddingProfileId(cfg, cfg.embeddingDimensions || 0), baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: options.purpose || options.taskType || 'document', inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: 0, elapsedMs: 0, cacheHits: 0, cacheMisses: list.length, retryCount: Number(error.retryCount || 0) || 0, errorType: error.type, fallbackUsed: cfg.fallbackHashEmbedding === true });
+      if (!cfg.fallbackHashEmbedding || error.type === 'ABORTED') throw error;
       warn('embedding endpoint failed; using hash fallback for all texts (dimension drift guard)', error);
       Runtime.lastEmbedUsedFallback = true;
-      Runtime.lastEmbedError = compact(error?.message || error || '알 수 없는 오류', 800);
-      return tagEmbeddingVectors(await hashEmbeddingBatch(list, cfg.hashDimensions), true, Runtime.lastEmbedError);
+      Runtime.lastEmbedError = sanitizeEmbeddingErrorMessage(error.message || error.type);
+      const vectors = await hashEmbeddingBatch(list, cfg.hashDimensions);
+      const result = { vectors, provider: 'hash', model: `hash-${cfg.hashDimensions}`, dimensions: cfg.hashDimensions, profileId: embeddingProfileId(cfg, cfg.hashDimensions, 'hash', `hash-${cfg.hashDimensions}`), metadata: { requestCount: 0, batchCount: 1, retryCount: 0 } };
+      return tagEmbeddingVectorsExtended(vectors, result, true, Runtime.lastEmbedError);
     }
   };
 
@@ -3581,12 +4279,10 @@
   const queryEmbeddingCacheKey = (query, cfg, taskType = 'query') => {
     const normalized = normalizeQueryForEmbeddingCache(query);
     return stableHash([
-      'flashback-query-vector-v1',
-      normalizeProvider(cfg.embeddingProvider),
-      cfg.embeddingModel || '',
-      stableHash(cfg.embeddingUrl || ''),
+      'flashback-query-vector-v2',
+      embeddingProfileSettingsFingerprint(cfg),
       taskType || 'query',
-      Number(cfg.hashDimensions || 0) || 0,
+      EMBEDDING_PREPROCESSING_VERSION,
       normalized.length,
       stableHash(normalized)
     ].join('\n'));
@@ -3620,7 +4316,8 @@
         const dim = Array.isArray(vector) ? vector.length : 0;
         const providerUsed = fallbackUsed ? 'hash' : normalizeProvider(cfg.embeddingProvider);
         const modelUsed = (fallbackUsed || providerUsed === 'hash') ? `hash-${dim || cfg.hashDimensions}` : (cfg.embeddingModel || '');
-        const entry = { vector, providerUsed, modelUsed, dim, fallbackUsed, at: Date.now(), cacheKey: key };
+        const profileId = vectors.flashbackEmbeddingProfileId || embeddingProfileId(cfg, dim, providerUsed, modelUsed);
+        const entry = { vector, providerUsed, modelUsed, dim, profileId, fallbackUsed, at: Date.now(), cacheKey: key };
         if (!fallbackUsed) {
           if (Runtime.queryEmbeddingCache.size >= QUERY_EMBEDDING_CACHE_MAX) {
             const oldest = Runtime.queryEmbeddingCache.keys().next().value;
@@ -4700,8 +5397,9 @@
       if (Array.isArray(record.vector) && record.vector.length) {
         const provider = normalizeProvider(record.provider || settings.embeddingProvider || DEFAULTS.embeddingProvider);
         const model = text(record.model || (provider === 'hash' ? `hash-${record.vector.length}` : settings.embeddingModel) || '');
-        const key = `${provider}\u0000${model}\u0000${record.vector.length}`;
-        if (!vectorGroups.has(key)) vectorGroups.set(key, { provider, model, dim: record.vector.length, vectors: [], count: 0 });
+        const profileId = recordEmbeddingProfileId(record, settings);
+        const key = `${profileId || 'legacy'}\u0000${provider}\u0000${model}\u0000${record.vector.length}`;
+        if (!vectorGroups.has(key)) vectorGroups.set(key, { provider, model, profileId, dim: record.vector.length, vectors: [], count: 0 });
         const group = vectorGroups.get(key);
         group.count += 1;
         if (group.vectors.length < 96) group.vectors.push(record.vector);
@@ -4714,6 +5412,7 @@
       .map(group => ({
       provider: group.provider,
       model: group.model,
+      profileId: group.profileId,
       dim: group.dim,
       vector: centroidForVectors(group.vectors)
     })).filter(item => item.vector.length);
@@ -4925,20 +5624,176 @@
     };
   };
 
-  const loadScopeRecordsForRecall = async (scopeOrKey, selection = null) => {
-    const manifest = await loadScopeManifest(scopeOrKey);
+  const scopeShardKeyForManifest = (scopeKey, manifest, shardIndex) => {
+    const commitId = text(manifest?.commitId || '').trim();
+    return commitId ? scopeKeys.commitShard(scopeKey, commitId, shardIndex) : scopeKeys.shard(scopeKey, shardIndex);
+  };
+
+  const storageShardChecksum = (records = []) => stableHash(safeStringify(Array.isArray(records) ? records : []));
+
+  const recallShardCacheKey = (scopeKey, commitId, shardIndex) => `${text(scopeKey)}\u0000${text(commitId)}\u0000${Number(shardIndex)}`;
+
+  const invalidateRecallShardCache = (scopeKey = '', commitId = '') => {
+    const wantedScope = text(scopeKey || '');
+    const wantedCommit = text(commitId || '');
+    let removed = 0;
+    for (const [key, entry] of Runtime.recallShardCache.entries()) {
+      if (wantedScope && text(entry?.scopeKey || '') !== wantedScope) continue;
+      if (wantedCommit && text(entry?.commitId || '') !== wantedCommit) continue;
+      Runtime.recallShardCache.delete(key);
+      removed += 1;
+    }
+    if (removed) Runtime.recallShardCacheStats.invalidations += removed;
+    return removed;
+  };
+
+  const rememberRecallShardCache = (scopeKey, commitId, shardIndex, records, expectedRecordCount) => {
+    if (!scopeKey || !commitId || !Array.isArray(records)) return false;
+    const key = recallShardCacheKey(scopeKey, commitId, shardIndex);
+    Runtime.recallShardCache.delete(key);
+    while (Runtime.recallShardCache.size >= RECALL_SHARD_CACHE_MAX) {
+      const oldest = Runtime.recallShardCache.keys().next().value;
+      if (!oldest) break;
+      Runtime.recallShardCache.delete(oldest);
+      Runtime.recallShardCacheStats.evictions += 1;
+    }
+    Runtime.recallShardCache.set(key, {
+      scopeKey: text(scopeKey),
+      commitId: text(commitId),
+      shardIndex: Number(shardIndex),
+      expectedRecordCount,
+      records,
+      at: Date.now()
+    });
+    return true;
+  };
+
+  const bumpStorageMetric = (metrics, key, amount = 1) => {
+    if (!metrics || typeof metrics !== 'object') return;
+    metrics[key] = Number(metrics[key] || 0) + Number(amount || 0);
+  };
+
+  const readScopeShardRecords = async (scopeKey, shardIndex, manifest = {}, options = {}) => {
+    const commitId = text(manifest?.commitId || '').trim();
+    const metrics = options.metrics && typeof options.metrics === 'object' ? options.metrics : null;
+    const summary = Array.isArray(manifest?.shardSummaries)
+      ? manifest.shardSummaries.find((item, index) => Number(item?.shardIndex ?? index) === Number(shardIndex))
+      : null;
+    const expectedRecordCount = summary && Number.isFinite(Number(summary.recordCount)) ? Number(summary.recordCount) : null;
+    if (options.useCache === true && commitId) {
+      const key = recallShardCacheKey(scopeKey, commitId, shardIndex);
+      const cached = Runtime.recallShardCache.get(key);
+      if (cached) {
+        const fresh = Date.now() - Number(cached.at || 0) <= RECALL_SHARD_CACHE_TTL_MS;
+        const countMatches = expectedRecordCount == null || cached.records?.length === expectedRecordCount;
+        if (fresh && countMatches) {
+          Runtime.recallShardCache.delete(key);
+          Runtime.recallShardCache.set(key, { ...cached, at: Date.now() });
+          Runtime.recallShardCacheStats.hits += 1;
+          bumpStorageMetric(metrics, 'cacheHits');
+          return { missing: false, corrupt: false, records: cached.records, cacheHit: true };
+        }
+        Runtime.recallShardCache.delete(key);
+        Runtime.recallShardCacheStats.invalidations += 1;
+      }
+      Runtime.recallShardCacheStats.misses += 1;
+      bumpStorageMetric(metrics, 'cacheMisses');
+    }
+    const readStartedAt = Date.now();
+    let raw = await RisuCompat.getItem(scopeShardKeyForManifest(scopeKey, manifest, shardIndex));
+    bumpStorageMetric(metrics, 'storageReadMs', Date.now() - readStartedAt);
+    bumpStorageMetric(metrics, 'storageReads');
+    let fallbackUsed = false;
+    if ((raw == null || raw === '') && commitId) {
+      const fallbackStartedAt = Date.now();
+      const fallbackRaw = await RisuCompat.getItem(scopeKeys.shard(scopeKey, shardIndex));
+      bumpStorageMetric(metrics, 'storageReadMs', Date.now() - fallbackStartedAt);
+      bumpStorageMetric(metrics, 'storageReads');
+      const fallbackParsed = typeof fallbackRaw === 'string' ? tryJsonParse(fallbackRaw, null) : fallbackRaw;
+      if (fallbackParsed?.commitId === commitId) {
+        raw = fallbackRaw;
+        fallbackUsed = true;
+      }
+    }
+    if (raw == null || raw === '') return { missing: true, corrupt: false, records: [] };
+    const parseStartedAt = Date.now();
+    const parsed = typeof raw === 'string' ? tryJsonParse(raw, null) : raw;
+    bumpStorageMetric(metrics, 'parseMs', Date.now() - parseStartedAt);
+    const objectPayload = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+    const recordsPayload = objectPayload && Array.isArray(parsed.records) ? parsed.records : (Array.isArray(parsed) ? parsed : null);
+    const commitMatches = !commitId || (objectPayload && text(parsed.commitId || '') === commitId);
+    const scopeMatches = !objectPayload || !parsed.scopeKey || text(parsed.scopeKey) === text(scopeKey);
+    const shardMatches = !objectPayload || parsed.shard == null || Number(parsed.shard) === Number(shardIndex);
+    const checksumStartedAt = Date.now();
+    const checksumMatches = !objectPayload || !parsed.checksum || text(parsed.checksum) === storageShardChecksum(recordsPayload || []);
+    bumpStorageMetric(metrics, 'checksumMs', Date.now() - checksumStartedAt);
+    const recordCountMatches = expectedRecordCount == null || recordsPayload?.length === expectedRecordCount;
+    const recordObjectsValid = Array.isArray(recordsPayload)
+      && recordsPayload.every(record => record && typeof record === 'object' && !Array.isArray(record));
+    if (!recordsPayload || !recordObjectsValid || !commitMatches || !scopeMatches || !shardMatches || !checksumMatches || !recordCountMatches) {
+      return { missing: true, corrupt: true, records: [] };
+    }
+    if (options.useCache === true && commitId && objectPayload && parsed.checksum && !fallbackUsed) {
+      rememberRecallShardCache(scopeKey, commitId, shardIndex, recordsPayload, expectedRecordCount);
+    }
+    return { missing: false, corrupt: false, records: recordsPayload, cacheHit: false };
+  };
+
+  const mapOrderedWithConcurrency = async (items = [], concurrency = 1, mapper) => {
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) return [];
+    const out = new Array(list.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const position = cursor;
+        cursor += 1;
+        if (position >= list.length) return;
+        out[position] = await mapper(list[position], position);
+      }
+    };
+    const workerCount = Math.min(list.length, Math.max(1, Number(concurrency || 1) || 1));
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    return out;
+  };
+
+  const loadScopeRecordsForRecall = async (scopeOrKey, selection = null, options = {}) => {
+    const requestedScopeKey = typeof scopeOrKey === 'string' ? scopeOrKey : text(scopeOrKey?.scopeKey || '');
+    const suppliedManifest = options.manifest && typeof options.manifest === 'object'
+      && text(options.manifest.scopeKey || '') === text(requestedScopeKey || options.manifest.scopeKey || '')
+      ? options.manifest
+      : null;
+    const manifestStartedAt = Date.now();
+    const manifest = suppliedManifest || await loadScopeManifest(scopeOrKey);
     const indexes = Array.isArray(selection?.indexes)
       ? selection.indexes.filter(index => Number.isInteger(index) && index >= 0 && index < manifest.shardCount)
       : Array.from({ length: manifest.shardCount }, (_, index) => index);
+    const metrics = {
+      manifestMs: suppliedManifest ? 0 : Date.now() - manifestStartedAt,
+      manifestReused: !!suppliedManifest,
+      shardWallMs: 0,
+      storageReadMs: 0,
+      parseMs: 0,
+      checksumMs: 0,
+      storageReads: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      shardRequests: indexes.length,
+      concurrency: Math.min(RECALL_SHARD_READ_CONCURRENCY, Math.max(1, indexes.length))
+    };
+    const shardStartedAt = Date.now();
+    const shards = await mapOrderedWithConcurrency(indexes, RECALL_SHARD_READ_CONCURRENCY, index => (
+      readScopeShardRecords(manifest.scopeKey, index, manifest, { useCache: true, metrics })
+    ));
+    metrics.shardWallMs = Date.now() - shardStartedAt;
     const records = [];
     const externalRecords = [];
     let missingShards = 0;
     let corruptShards = 0;
-    for (const index of indexes) {
-      const shard = await readScopeShardRecords(manifest.scopeKey, index, manifest);
-      if (shard.missing) {
+    for (const shard of shards) {
+      if (!shard || shard.missing) {
         missingShards += 1;
-        if (shard.corrupt) corruptShards += 1;
+        if (shard?.corrupt) corruptShards += 1;
         continue;
       }
       for (const record of shard.records) {
@@ -4953,43 +5808,17 @@
     if (manifest.manifestCorrupt !== true && missingShards === 0 && !recordCountMismatch && (externalRecords.length || manifest.externalRetirementVersion < EXTERNAL_RETIREMENT_VERSION)) {
       scheduleExternalRetirement(manifest.scopeKey, { reason: 'recall_read' });
     }
-    return { manifest: { ...manifest, expectedCount: manifest.count || 0, count: records.length, missingShards, corruptShards, recordCountMismatch, externalRetirementPending: externalRecords.length }, records, selection: { ...(selection || {}), indexes } };
-  };
-
-  const scopeShardKeyForManifest = (scopeKey, manifest, shardIndex) => {
-    const commitId = text(manifest?.commitId || '').trim();
-    return commitId ? scopeKeys.commitShard(scopeKey, commitId, shardIndex) : scopeKeys.shard(scopeKey, shardIndex);
-  };
-
-  const storageShardChecksum = (records = []) => stableHash(safeStringify(Array.isArray(records) ? records : []));
-
-  const readScopeShardRecords = async (scopeKey, shardIndex, manifest = {}) => {
-    const commitId = text(manifest?.commitId || '').trim();
-    let raw = await RisuCompat.getItem(scopeShardKeyForManifest(scopeKey, manifest, shardIndex));
-    if ((raw == null || raw === '') && commitId) {
-      const fallbackRaw = await RisuCompat.getItem(scopeKeys.shard(scopeKey, shardIndex));
-      const fallbackParsed = typeof fallbackRaw === 'string' ? tryJsonParse(fallbackRaw, null) : fallbackRaw;
-      if (fallbackParsed?.commitId === commitId) raw = fallbackRaw;
-    }
-    if (raw == null || raw === '') return { missing: true, corrupt: false, records: [] };
-    const parsed = typeof raw === 'string' ? tryJsonParse(raw, null) : raw;
-    const objectPayload = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
-    const recordsPayload = objectPayload && Array.isArray(parsed.records) ? parsed.records : (Array.isArray(parsed) ? parsed : null);
-    const commitMatches = !commitId || (objectPayload && text(parsed.commitId || '') === commitId);
-    const scopeMatches = !objectPayload || !parsed.scopeKey || text(parsed.scopeKey) === text(scopeKey);
-    const shardMatches = !objectPayload || parsed.shard == null || Number(parsed.shard) === Number(shardIndex);
-    const checksumMatches = !objectPayload || !parsed.checksum || text(parsed.checksum) === storageShardChecksum(recordsPayload || []);
-    const summary = Array.isArray(manifest?.shardSummaries)
-      ? manifest.shardSummaries.find((item, index) => Number(item?.shardIndex ?? index) === Number(shardIndex))
-      : null;
-    const expectedRecordCount = summary && Number.isFinite(Number(summary.recordCount)) ? Number(summary.recordCount) : null;
-    const recordCountMatches = expectedRecordCount == null || recordsPayload?.length === expectedRecordCount;
-    const recordObjectsValid = Array.isArray(recordsPayload)
-      && recordsPayload.every(record => record && typeof record === 'object' && !Array.isArray(record));
-    if (!recordsPayload || !recordObjectsValid || !commitMatches || !scopeMatches || !shardMatches || !checksumMatches || !recordCountMatches) {
-      return { missing: true, corrupt: true, records: [] };
-    }
-    return { missing: false, corrupt: false, records: recordsPayload };
+    Runtime.storagePerfStats.recallLoads += 1;
+    Runtime.storagePerfStats.shardReads += metrics.storageReads;
+    Runtime.storagePerfStats.shardReadBatches += indexes.length ? Math.ceil(indexes.length / RECALL_SHARD_READ_CONCURRENCY) : 0;
+    if (suppliedManifest) Runtime.storagePerfStats.manifestReuses += 1;
+    Runtime.storagePerfStats.lastRecallLoad = { ...metrics, at: Date.now(), scopeKey: manifest.scopeKey, commitId: manifest.commitId || '' };
+    return {
+      manifest: { ...manifest, expectedCount: manifest.count || 0, count: records.length, missingShards, corruptShards, recordCountMismatch, externalRetirementPending: externalRecords.length },
+      records,
+      selection: { ...(selection || {}), indexes },
+      performance: metrics
+    };
   };
 
   const removeCommitShardSet = async (scopeKey, commitId, shardCount) => {
@@ -5001,6 +5830,7 @@
       await RisuCompat.removeItem(scopeKeys.commitShard(scopeKey, cleanCommitId, i));
       removed += 1;
     }
+    invalidateRecallShardCache(scopeKey, cleanCommitId);
     return removed;
   };
 
@@ -5020,6 +5850,8 @@
       else await RisuCompat.removeItem(legacyKey);
       removed += 1;
     }
+    if (commitId) invalidateRecallShardCache(scopeKey, commitId);
+    else invalidateRecallShardCache(scopeKey);
     return removed;
   };
 
@@ -5057,6 +5889,12 @@
       if (!/:records:(?:commit:[^:]+:)?shard:\d{4}$/.test(k)) continue;
       await RisuCompat.removeItem(k);
       removed += 1;
+    }
+    for (const [cacheKey, entry] of Runtime.recallShardCache.entries()) {
+      if (text(entry?.scopeKey || '') !== text(scopeKey)) continue;
+      if (activeCommitId && text(entry?.commitId || '') === text(activeCommitId)) continue;
+      Runtime.recallShardCache.delete(cacheKey);
+      Runtime.recallShardCacheStats.invalidations += 1;
     }
     return removed;
   };
@@ -5136,6 +5974,7 @@
   };
 
   const saveScopeRecords = async (scopeOrKey, records, settings = null, scopeMeta = {}) => {
+    const saveStartedAt = Date.now();
     const cfg = settings || await loadSettings();
     const scope = typeof scopeOrKey === 'string' ? { ...scopeMeta, scopeKey: scopeOrKey } : { ...(scopeOrKey || {}), ...scopeMeta };
     const oldManifest = await loadScopeManifest(scope);
@@ -5193,16 +6032,34 @@
     const shardCount = Math.ceil(clean.length / shardSize);
     const commitId = stableHash(`${scope.scopeKey}|${Date.now()}|${clean.length}|${Math.random()}`);
     const shardSummaries = [];
-    try {
-      for (let i = 0; i < shardCount; i += 1) {
+    const shardWriteStartedAt = Date.now();
+    let shardWriteWorkMs = 0;
+    const shardWriteResults = await mapOrderedWithConcurrency(
+      Array.from({ length: shardCount }, (_, index) => index),
+      STORAGE_SHARD_WRITE_CONCURRENCY,
+      async i => {
+        const startedAt = Date.now();
+        try {
         const shard = clean.slice(i * shardSize, (i + 1) * shardSize);
-        shardSummaries.push(buildRecallShardSummary(shard, i, cfg));
+          const summary = buildRecallShardSummary(shard, i, cfg);
         await requireStorageWrite(scopeKeys.commitShard(scope.scopeKey, commitId, i), safeStringify({ version: 2, shard: i, scopeKey: scope.scopeKey, commitId, checksum: storageShardChecksum(shard), records: shard }), 'scope shard save');
+          const elapsed = Date.now() - startedAt;
+          shardWriteWorkMs += elapsed;
+          return { ok: true, summary, elapsed };
+        } catch (error) {
+          const elapsed = Date.now() - startedAt;
+          shardWriteWorkMs += elapsed;
+          return { ok: false, error, elapsed };
+        }
       }
-    } catch (error) {
+    );
+    const failedShardWrite = shardWriteResults.find(result => result?.ok !== true);
+    if (failedShardWrite) {
       await removeCommitShardSet(scope.scopeKey, commitId, shardCount).catch(cleanupError => warn('failed commit shard cleanup failed', cleanupError));
-      throw error;
+      throw failedShardWrite.error || new Error('scope shard save failed');
     }
+    shardSummaries.push(...shardWriteResults.map(result => result.summary));
+    const shardWriteWallMs = Date.now() - shardWriteStartedAt;
     const maxNumericId = clean.reduce((max, record) => {
       const m = text(record.id).match(/(\d+)$/);
       return m ? Math.max(max, Number(m[1]) || 0) : max;
@@ -5273,7 +6130,17 @@
     }
     await cleanupExtraScopeShards(scope.scopeKey, shardCount, oldManifest);
     await cleanupListedScopeShardOrphans(scope.scopeKey, commitId).catch(error => warn('listed shard cleanup failed', error));
-    return { manifest: savedManifest, records: clean };
+    return {
+      manifest: savedManifest,
+      records: clean,
+      performance: {
+        totalMs: Date.now() - saveStartedAt,
+        shardWriteWallMs,
+        shardWriteWorkMs,
+        shardWrites: shardCount,
+        concurrency: Math.min(STORAGE_SHARD_WRITE_CONCURRENCY, Math.max(1, shardCount))
+      }
+    };
   };
 
   const externalRecordTypeCounts = (records = []) => {
@@ -6770,6 +7637,50 @@
     text(record.text || '').trim()
   ].join('\u0000');
 
+  const inferredLegacyEmbeddingProfileId = (record = {}, settings = DEFAULTS) => {
+    const provider = text(record.provider || '').trim();
+    const model = text(record.model || '').trim();
+    const dimensions = Number(record.dim || record.vector?.length || 0) || 0;
+    if (!provider || !model || !dimensions) return '';
+    const legacyDefaults = normalizeSettings({
+      ...settings,
+      embeddingProvider: provider,
+      embeddingModel: model,
+      embeddingDimensions: dimensions,
+      embeddingQueryTask: '',
+      embeddingDocumentTask: '',
+      embeddingQueryPrefix: '',
+      embeddingDocumentPrefix: '',
+      embeddingNormalize: true
+    });
+    return embeddingProfileId(legacyDefaults, dimensions, provider, model);
+  };
+
+  const recordEmbeddingProfileId = (record = {}, settings = DEFAULTS) => text(record.embeddingProfileId || '').trim()
+    || inferredLegacyEmbeddingProfileId(record, settings);
+
+  const recordEmbeddingCompatibility = (record = {}, settings = DEFAULTS, context = {}) => {
+    const vector = Array.isArray(record.vector) ? record.vector : [];
+    const recordProvider = text(record.provider || '').trim();
+    const recordModel = text(record.model || '').trim();
+    const recordProfileId = recordEmbeddingProfileId(record, settings);
+    const queryProvider = normalizeProvider(context.provider || settings.embeddingProvider);
+    const queryModel = text(context.model || (queryProvider === 'hash' ? `hash-${vector.length || settings.hashDimensions}` : settings.embeddingModel)).trim();
+    const dimensions = Number(context.dimensions || vector.length || 0) || 0;
+    const queryProfileId = text(context.profileId || embeddingProfileId(settings, dimensions, queryProvider, queryModel)).trim();
+    const legacy = !recordProvider || !recordModel || !recordProfileId;
+    return {
+      legacy,
+      recordProfileId,
+      queryProfileId,
+      providerComparable: !legacy && normalizeProvider(recordProvider) === queryProvider,
+      modelComparable: !legacy && recordModel === queryModel,
+      dimensionComparable: !legacy && vector.length > 0 && vector.length === dimensions,
+      profileComparable: !legacy && recordProfileId === queryProfileId,
+      comparable: !legacy && normalizeProvider(recordProvider) === queryProvider && recordModel === queryModel && vector.length > 0 && vector.length === dimensions && recordProfileId === queryProfileId
+    };
+  };
+
   const reusableVectorRecord = (record, settings = Runtime.settings || DEFAULTS) => {
     if (!record || !Array.isArray(record.vector) || !record.vector.length) return false;
     if (record.autoEpisode || record.sourceType === 'episode_index') return false;
@@ -6780,6 +7691,12 @@
     const expectedModel = expectedProvider === 'hash' ? `hash-${settings.hashDimensions}` : text(settings.embeddingModel || '');
     if (text(record.model || '') !== expectedModel) return false;
     if (expectedProvider === 'hash' && record.vector.length !== settings.hashDimensions) return false;
+    if (!recordEmbeddingCompatibility(record, settings, {
+      provider: expectedProvider,
+      model: expectedModel,
+      dimensions: settings.embeddingDimensions || record.vector.length,
+      profileId: embeddingProfileId(settings, settings.embeddingDimensions || record.vector.length, expectedProvider, expectedModel)
+    }).comparable) return false;
     return record.vector.every(value => Number.isFinite(Number(value)))
       && record.vector.some(value => Number(value) !== 0);
   };
@@ -6903,8 +7820,20 @@
       if (record) reused[index] = record;
       else missingIndexes.push(index);
     }
+    if (normalizeProvider(cfg.embeddingProvider) === 'voyage_context' && missingIndexes.length) {
+      const dirtyGroups = new Set(missingIndexes.map(index => text(drafts[index]?.sourceHash || drafts[index]?.sourceId || `draft:${index}`)));
+      for (let index = 0; index < drafts.length; index += 1) {
+        const groupId = text(drafts[index]?.sourceHash || drafts[index]?.sourceId || `draft:${index}`);
+        if (!dirtyGroups.has(groupId) || missingIndexes.includes(index)) continue;
+        reused[index] = null;
+        missingIndexes.push(index);
+      }
+      missingIndexes.sort((a, b) => a - b);
+    }
     const embedded = missingIndexes.length
       ? await embedTexts(missingIndexes.map(index => drafts[index].text), cfg, {
+        purpose: 'document',
+        contextGroupIds: missingIndexes.map(index => text(drafts[index]?.sourceHash || drafts[index]?.sourceId || `draft:${index}`)),
         concurrency: cfg.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
         onProgress: options.onProgress
       })
@@ -6922,6 +7851,9 @@
       const embeddedVector = vectors[index] || hashEmbedding(draft.text, cfg.hashDimensions);
       const provider = reusedRecord?.provider || (fallbackUsed ? 'hash' : cfg.embeddingProvider);
       const model = reusedRecord?.model || ((fallbackUsed || cfg.embeddingProvider === 'hash') ? `hash-${cfg.hashDimensions}` : cfg.embeddingModel);
+      const profileId = recordEmbeddingProfileId(reusedRecord || {}, cfg)
+        || embedded.flashbackEmbeddingProfileId
+        || embeddingProfileId(cfg, embeddedVector.length, provider, model);
       return {
       schema: 'vector_rag_memory.record.v2',
       id: `vrm_${recordHash.slice(0, 20)}`,
@@ -6963,6 +7895,10 @@
       dim: embeddedVector.length || cfg.hashDimensions,
       provider,
       model,
+      embeddingProvider: provider,
+      embeddingModel: model,
+      embeddingDimensions: embeddedVector.length || cfg.hashDimensions,
+      embeddingProfileId: profileId,
       tokenEstimate: estimateTokens(draft.text),
       createdAt: reusedRecord?.createdAt || createdAt,
       updatedAt: createdAt
@@ -7073,7 +8009,7 @@
         invalidatedEpisodeIndexes
       }, 'success');
     }
-    return { inserted, updated, deduped, replacedRecords, invalidatedEpisodeIndexes, total: saved.records.length, manifest, scopeKey: scope.scopeKey };
+    return { inserted, updated, deduped, replacedRecords, invalidatedEpisodeIndexes, total: saved.records.length, manifest, scopeKey: scope.scopeKey, storagePerformance: saved.performance || null };
     });
   };
 
@@ -7453,6 +8389,7 @@
       && manifest.turnWorldlineBindingPolicyVersion >= TURN_WORLDLINE_BINDING_POLICY_VERSION) {
       return { changed: false, reason: 'worldline_current', liveHash };
     }
+    if (manifest.turnWorldlineLiveHash && manifest.turnWorldlineLiveHash !== liveHash) abortEmbeddingJobs('worldline_changed');
     const cfg = settings || await loadSettings();
     const result = await withScopeWriteLock(scope.scopeKey, async () => {
       const currentManifest = await loadScopeManifest(scope.scopeKey);
@@ -8474,14 +9411,16 @@
 
   const recordVectorSpace = (record = {}, settings = Runtime.settings || DEFAULTS) => {
     const vector = Array.isArray(record?.vector) ? record.vector : [];
-    if (!vector.length) return { key: '', provider: '', model: '', dim: 0 };
+    if (!vector.length) return { key: '', provider: '', model: '', dim: 0, profileId: '' };
     const providerRaw = text(record?.provider || '').trim();
-    const provider = providerRaw ? normalizeProvider(providerRaw) : normalizeProvider(settings.embeddingProvider || DEFAULTS.embeddingProvider);
+    if (!providerRaw) return { key: '', provider: '', model: '', dim: vector.length, profileId: '', legacy: true };
+    const provider = normalizeProvider(providerRaw);
     const modelRaw = text(record?.model || '').trim();
-    const model = modelRaw || (provider === 'hash'
-      ? `hash-${vector.length}`
-      : text(settings.embeddingModel || defaultModelForProvider(provider)));
-    return { key: `${provider}\u0000${model}\u0000${vector.length}`, provider, model, dim: vector.length };
+    if (!modelRaw) return { key: '', provider, model: '', dim: vector.length, profileId: '', legacy: true };
+    const model = modelRaw;
+    const profileId = recordEmbeddingProfileId(record, settings);
+    if (!profileId) return { key: '', provider, model, dim: vector.length, profileId: '', legacy: true };
+    return { key: `${profileId}\u0000${vector.length}`, provider, model, dim: vector.length, profileId, legacy: false };
   };
 
   const compatibleRecordVectorGroup = (records = [], settings = Runtime.settings || DEFAULTS) => {
@@ -8494,7 +9433,7 @@
     }
     return Array.from(groups.values())
       .sort((a, b) => b.records.length - a.records.length || a.key.localeCompare(b.key))[0]
-      || { key: '', provider: '', model: '', dim: 0, records: [] };
+      || { key: '', provider: '', model: '', dim: 0, profileId: '', records: [] };
   };
 
   const recordVectorsComparable = (left = {}, right = {}, settings = Runtime.settings || DEFAULTS) => {
@@ -8806,6 +9745,10 @@
         dim: vector.length,
         provider: vectorSpace.provider,
         model: vectorSpace.model,
+        embeddingProvider: vectorSpace.provider,
+        embeddingModel: vectorSpace.model,
+        embeddingDimensions: vector.length,
+        embeddingProfileId: vectorSpace.profileId,
         tokenEstimate: estimateTokens(body),
         importanceScore: importance,
         createdAt,
@@ -8862,6 +9805,10 @@
           dim: vector.length,
           provider: vectorSpace.provider,
           model: vectorSpace.model,
+          embeddingProvider: vectorSpace.provider,
+          embeddingModel: vectorSpace.model,
+          embeddingDimensions: vector.length,
+          embeddingProfileId: vectorSpace.profileId,
           tokenEstimate: estimateTokens(body),
           importanceScore: importance,
           createdAt,
@@ -9485,15 +10432,29 @@
 
   const buildSparseFieldsForRecord = (record = {}, settings = Runtime.settings || DEFAULTS) => visibleRecallFieldsForRecord(record);
 
+  const sparseProjectionRevisionForRecord = (record = {}) => {
+    const textRevision = `${text(record?.hash || '').trim()}\u0000${stableHash(record?.text || '')}`;
+    const stateRevisionSource = Array.isArray(record?.structuredStateFacts)
+      ? record.structuredStateFacts
+      : (Number(record?.chunkIndex || 0) > 0 ? [] : (record?.metadata || {}));
+    return stableHash(safeStringify([
+      FLASHBACK_SPARSE_INDEX_VERSION,
+      textRevision,
+      record?.sourceType || '',
+      record?.title || '',
+      Array.isArray(record?.tags) ? record.tags : [],
+      stateRevisionSource,
+      record?.updatedAt || '',
+      Number(record?.chunkIndex || 0) || 0
+    ]));
+  };
+
   const sparseProjectionForRecord = (record = {}, settings = Runtime.settings || DEFAULTS) => {
-    const fields = buildSparseFieldsForRecord(record, settings);
-    const publicFieldHash = stableHash(safeStringify(fields));
     const recordKey = text(record?.id || record?.sourceId || record?.hash || stableHash(record?.text || ''));
     const key = [
       FLASHBACK_SPARSE_INDEX_VERSION,
       recordKey,
-      record?.hash || stableHash(record?.text || ''),
-      publicFieldHash
+      sparseProjectionRevisionForRecord(record)
     ].join(':');
     const cached = Runtime.sparseProjectionCache.get(key);
     if (cached) {
@@ -9507,6 +10468,8 @@
     if (previousKey && previousKey !== key && Runtime.sparseProjectionCache.delete(previousKey)) {
       Runtime.sparseCacheStats.invalidations += 1;
     }
+    const fields = buildSparseFieldsForRecord(record, settings);
+    const anchors = extractRecallAnchors(`${record.title || ''}\n${Array.isArray(record.tags) ? record.tags.join(' ') : ''}\n${record.text || ''}`);
     const tokens = {};
     const lengths = {};
     const fieldTf = {};
@@ -9518,7 +10481,7 @@
       lengths[field] = Math.max(1, Array.from(tf.values()).reduce((sum, value) => sum + value, 0));
       fieldTf[field] = tf;
     }
-    const value = { key, fields, tokens, lengths, fieldTf };
+    const value = { key, fields, anchors, tokens, lengths, fieldTf };
     while (Runtime.sparseProjectionCache.size >= FLASHBACK_SPARSE_CACHE_MAX) {
       const oldest = Runtime.sparseProjectionCache.keys().next().value;
       if (!oldest) break;
@@ -9534,6 +10497,15 @@
     Runtime.sparseProjectionCache.set(key, value);
     Runtime.sparseProjectionRecordKeys.set(recordKey, key);
     return value;
+  };
+
+  const sparseScoringProjectionForRecord = (record = {}, settings = Runtime.settings || DEFAULTS) => {
+    const projection = sparseProjectionForRecord(record, settings);
+    if (!projection.bodyForLexical) {
+      projection.bodyForLexical = `${record.title || ''}\n${Array.isArray(record.tags) ? record.tags.join(' ') : ''}\n${Object.values(projection.fields).join('\n')}`;
+      projection.scoringAnchors = extractRecallAnchors(projection.bodyForLexical);
+    }
+    return projection;
   };
 
   const scoreBm25fCandidates = (records = [], queryText = '', settings = Runtime.settings || DEFAULTS, options = {}) => {
@@ -9765,7 +10737,7 @@
     const ageTurns = !isInheritedScopeMemoryRecord(record) && turn > 0 && latestTurn > 0
       ? Math.max(0, latestTurn - turn)
       : Number.POSITIVE_INFINITY;
-    const sparse = buildSparseFieldsForRecord(record, Runtime.settings || DEFAULTS);
+    const sparse = sparseProjectionForRecord(record, Runtime.settings || DEFAULTS).fields;
     const facts = recordStructuredStateFacts(record);
     if (
       contextPreviousTurnMatchesRecord(record, context)
@@ -9958,7 +10930,7 @@
     const ageTurns = !isInheritedScopeMemoryRecord(record) && turn > 0 && latestTurn > 0
       ? Math.max(0, latestTurn - turn)
       : 9999;
-    const sparse = buildSparseFieldsForRecord(record, context.settings || Runtime.settings || DEFAULTS);
+    const sparse = sparseProjectionForRecord(record, context.settings || Runtime.settings || DEFAULTS).fields;
     const durableText = `${sparse.event}\n${record.text || ''}`;
     const durableEvent = record?.durableEvent === true
       || record?.metadata?.durableEvent === true
@@ -10341,7 +11313,8 @@
       const key = responseTurnGroupKey(record) || `${finiteTurnIndex(record)}:${record.id || record.hash || ''}`;
       if (!groups.has(key)) groups.set(key, { important: new Set(), names: new Set(), entities: new Set() });
       const target = groups.get(key);
-      const anchors = extractRecallAnchors(`${record.title || ''}\n${Array.isArray(record.tags) ? record.tags.join(' ') : ''}\n${record.text || ''}`);
+      const anchors = sparseProjectionForRecord(record).anchors
+        || extractRecallAnchors(`${record.title || ''}\n${Array.isArray(record.tags) ? record.tags.join(' ') : ''}\n${record.text || ''}`);
       for (const value of anchors.important || []) target.important.add(value);
       for (const value of anchors.names || []) target.names.add(value);
       for (const value of anchors.entities || []) target.entities.add(value);
@@ -10539,13 +11512,12 @@
     const queryProvider = normalizeProvider(options.queryProvider || DEFAULTS.embeddingProvider);
     const queryModel = text(options.queryModel || '');
     const queryDim = Number(options.queryDim || 0) || 0;
-    const compatible = selected.records.filter(record => {
-      if (!Array.isArray(record.vector) || !record.vector.length || (queryDim > 0 && record.vector.length !== queryDim)) return false;
-      const provider = text(record.provider || '').trim();
-      if (provider && normalizeProvider(provider) !== queryProvider) return false;
-      const model = text(record.model || '').trim();
-      return !queryModel || !model || model === queryModel;
-    });
+    const compatible = selected.records.filter(record => recordEmbeddingCompatibility(record, options.settings || Runtime.settings || DEFAULTS, {
+      provider: queryProvider,
+      model: queryModel,
+      dimensions: queryDim,
+      profileId: options.queryProfileId
+    }).comparable);
     const vector = centroidForVectors(compatible.map(record => record.vector));
     return {
       available: true,
@@ -10645,7 +11617,7 @@
   };
 
   const recordEntityAnchorSet = (record) => {
-    const sparse = buildSparseFieldsForRecord(record, Runtime.settings || DEFAULTS);
+    const sparse = sparseProjectionForRecord(record, Runtime.settings || DEFAULTS).fields;
     const out = new Set();
     for (const anchor of extractEntityAnchors(`${sparse.canonical}\n${sparse.identity}\n${sparse.summary}`, 120)) out.add(anchor);
     return out;
@@ -10792,15 +11764,20 @@
   };
 
   const recallSemanticSignals = (record, queryVector = [], settings = Runtime.settings || DEFAULTS, context = {}) => {
-    const sameDim = Array.isArray(record?.vector) && record.vector.length === queryVector.length;
     const recordProviderRaw = text(record?.provider || '').trim();
     const recordProvider = recordProviderRaw ? normalizeProvider(recordProviderRaw) : '';
     const queryProvider = normalizeProvider(context.queryProvider || (context.queryFallbackUsed ? 'hash' : settings.embeddingProvider));
-    const providerComparable = !recordProvider || !queryProvider || recordProvider === queryProvider;
     const recordModel = text(record?.model || '').trim();
     const queryModel = text(context.queryModel || (queryProvider === 'hash' ? `hash-${queryVector.length}` : settings.embeddingModel) || '').trim();
-    const modelComparable = !recordModel || !queryModel || recordModel === queryModel;
-    const vectorComparable = sameDim && providerComparable && modelComparable;
+    const compatibility = recordEmbeddingCompatibility(record, settings, {
+      provider: queryProvider,
+      model: queryModel,
+      dimensions: queryVector.length,
+      profileId: context.queryProfileId || embeddingProfileId(settings, queryVector.length, queryProvider, queryModel)
+    });
+    const providerComparable = compatibility.providerComparable;
+    const modelComparable = compatibility.modelComparable;
+    const vectorComparable = compatibility.comparable;
     const cosine = vectorComparable ? dot(queryVector, record.vector) : 0;
     const currentSemantic = clampNumber(cosine, 0, 1, 0);
     const previousVector = context.previousTurn?.vector;
@@ -10817,6 +11794,8 @@
     const fusedSemantic = clampNumber((currentSemantic * currentWeight + previousSemantic * previousWeight) / weightTotal, 0, 1, currentSemantic);
     return {
       vectorComparable,
+      profileComparable: compatibility.profileComparable,
+      legacyVector: compatibility.legacy,
       providerComparable,
       modelComparable,
       cosine,
@@ -10841,9 +11820,10 @@
     const candidateMeta = context.candidateMeta instanceof Map
       ? context.candidateMeta.get(text(record.id || record.hash || record.sourceId || ''))
       : null;
-    const sparseFields = buildSparseFieldsForRecord(record, settings);
-    const bodyForLexical = `${record.title || ''}\n${Array.isArray(record.tags) ? record.tags.join(' ') : ''}\n${Object.values(sparseFields).join('\n')}`;
-    const recordAnchors = extractRecallAnchors(bodyForLexical);
+    const sparseProjection = sparseScoringProjectionForRecord(record, settings);
+    const sparseFields = sparseProjection.fields;
+    const bodyForLexical = sparseProjection.bodyForLexical;
+    const recordAnchors = sparseProjection.scoringAnchors;
     const cosine01 = cosineToUnit(cosine);
     const semanticCosine = semantic.fusedSemantic;
     const lexical = lexicalOverlap(query, bodyForLexical);
@@ -11030,6 +12010,22 @@
     const pool = items.slice();
     const selected = [];
     const seenHashes = new Set();
+    const prepared = new Map();
+    const preparedFor = item => {
+      if (prepared.has(item)) return prepared.get(item);
+      const normalized = normalizeForLexical(item?.record?.text || '');
+      const value = {
+        signature: stableHash(`${item?.record?.sourceType || ''}\n${normalized.slice(0, 1800)}`),
+        tokens: lexicalTokens(item?.record?.text || '')
+      };
+      prepared.set(item, value);
+      return value;
+    };
+    const preparedDuplicateSimilarity = (left, right) => {
+      const a = preparedFor(left).tokens;
+      const b = preparedFor(right).tokens;
+      return Math.max(jaccardSets(a, b), overlapRatio(a, b) * 0.7);
+    };
     const minimumNovelty = 0.04;
     let stoppedForLowNovelty = false;
     let bestRejectedMmr = null;
@@ -11038,7 +12034,7 @@
       let bestScore = -Infinity;
       for (let i = 0; i < pool.length; i += 1) {
         const item = pool[i];
-        const sig = stableHash(`${item.record.sourceType}\n${normalizeForLexical(item.record.text).slice(0, 1800)}`);
+        const sig = preparedFor(item).signature;
         if (seenHashes.has(sig)) continue;
         let maxSim = 0;
         for (const chosen of selected) {
@@ -11046,7 +12042,7 @@
           if (recordVectorsComparable(item.record, chosen.record, settings)) {
             sim = Math.max(sim, cosineToUnit(dot(item.record.vector, chosen.record.vector)));
           }
-          sim = Math.max(sim, textDuplicateSimilarity(item.record.text, chosen.record.text));
+          sim = Math.max(sim, preparedDuplicateSimilarity(item, chosen));
           maxSim = Math.max(maxSim, sim);
         }
         const mmrScore = lambda * item.score - (1 - lambda) * maxSim;
@@ -11072,7 +12068,7 @@
       const [chosen] = pool.splice(bestIndex, 1);
       if (!chosen) break;
       chosen.mmrScore = bestScore;
-      const sig = stableHash(`${chosen.record.sourceType}\n${normalizeForLexical(chosen.record.text).slice(0, 1800)}`);
+      const sig = preparedFor(chosen).signature;
       seenHashes.add(sig);
       selected.push(chosen);
     }
@@ -11368,44 +12364,72 @@
     const recallStartedAt = Date.now();
     const stageElapsed = {
       scopeStorageLoad: 0,
+      scopeManifestLoad: 0,
+      worldlineLoad: 0,
+      primaryRecallLoad: 0,
+      additionalRecallLoad: 0,
+      shardStorageReadWork: 0,
+      shardParseWork: 0,
+      shardChecksumWork: 0,
       queryEmbedding: 0,
       sparseCandidates: 0,
       finalRerankMmr: 0,
-      renderInjection: 0
+      renderInjection: 0,
+      preRecallHook: 0,
+      beforeRequestTotal: 0,
+      total: 0
     };
     const cfg = settings || await loadSettings();
     const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false));
     const requestedQueryText = text(query || '').trim();
     const primaryQueryText = text(options.currentUser || requestedQueryText).trim() || requestedQueryText;
     const queryText = primaryQueryText;
-    const storageStageStartedAt = Date.now();
-    const [manifest, recallWorldline] = await Promise.all([
-      loadScopeManifest(scope.scopeKey),
-      loadTurnWorldline(scope.scopeKey)
-    ]);
-    stageElapsed.scopeStorageLoad += Date.now() - storageStageStartedAt;
-    if (!queryText) return { records: [], total: 0, storedTotal: manifest.count || 0, externalSuppressed: 0, queryDim: 0, queryText: '', scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, storageManifestCorrupt: manifest.manifestCorrupt === true, storageForeignScopeKey: text(manifest.foreignScopeKey || '') };
-    const embeddingStageStartedAt = Date.now();
-    let queryEmbeddingResult;
-    let remoteEmbeddingError = '';
-    try {
-      const embeddingSettings = normalizeProvider(cfg.embeddingProvider) === 'hash'
-        ? cfg
-        : { ...cfg, fallbackHashEmbedding: false };
-      queryEmbeddingResult = await getCachedQueryEmbedding(primaryQueryText, embeddingSettings, { taskType: 'query' });
-    } catch (error) {
-      remoteEmbeddingError = compact(error?.message || error || 'query embedding failed', 800);
-      queryEmbeddingResult = {
-        vector: [],
-        providerUsed: normalizeProvider(cfg.embeddingProvider),
-        modelUsed: text(cfg.embeddingModel || ''),
-        dim: 0,
-        fallbackUsed: false,
-        failed: true,
-        cacheHit: false
-      };
+    const manifestTask = (async () => {
+      const startedAt = Date.now();
+      const value = await loadScopeManifest(scope.scopeKey);
+      return { value, elapsed: Date.now() - startedAt };
+    })();
+    const worldlineTask = (async () => {
+      const startedAt = Date.now();
+      const value = await loadTurnWorldline(scope.scopeKey);
+      return { value, elapsed: Date.now() - startedAt };
+    })();
+    const embeddingTask = queryText ? (async () => {
+      const startedAt = Date.now();
+      let result;
+      let error = '';
+      try {
+        const embeddingSettings = normalizeProvider(cfg.embeddingProvider) === 'hash'
+          ? cfg
+          : { ...cfg, fallbackHashEmbedding: false };
+        result = await getCachedQueryEmbedding(primaryQueryText, embeddingSettings, { taskType: 'query' });
+      } catch (embeddingError) {
+        error = compact(embeddingError?.message || embeddingError || 'query embedding failed', 800);
+        result = {
+          vector: [],
+          providerUsed: normalizeProvider(cfg.embeddingProvider),
+          modelUsed: text(cfg.embeddingModel || ''),
+          dim: 0,
+          fallbackUsed: false,
+          failed: true,
+          cacheHit: false
+        };
+      }
+      return { result, error, elapsed: Date.now() - startedAt };
+    })() : Promise.resolve({ result: null, error: '', elapsed: 0 });
+    const [manifestState, worldlineState, embeddingState] = await Promise.all([manifestTask, worldlineTask, embeddingTask]);
+    const manifest = manifestState.value;
+    const recallWorldline = worldlineState.value;
+    stageElapsed.scopeManifestLoad = manifestState.elapsed;
+    stageElapsed.worldlineLoad = worldlineState.elapsed;
+    stageElapsed.scopeStorageLoad += Math.max(manifestState.elapsed, worldlineState.elapsed);
+    stageElapsed.queryEmbedding = embeddingState.elapsed;
+    if (!queryText) {
+      stageElapsed.total = Date.now() - recallStartedAt;
+      return { records: [], total: 0, storedTotal: manifest.count || 0, externalSuppressed: 0, queryDim: 0, queryText: '', scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, storageManifestCorrupt: manifest.manifestCorrupt === true, storageForeignScopeKey: text(manifest.foreignScopeKey || ''), stageElapsed };
     }
-    stageElapsed.queryEmbedding += Date.now() - embeddingStageStartedAt;
+    const queryEmbeddingResult = embeddingState.result;
+    const remoteEmbeddingError = embeddingState.error;
     let queryVector = Array.isArray(queryEmbeddingResult.vector) ? queryEmbeddingResult.vector : [];
     let queryFallbackUsed = queryEmbeddingResult.fallbackUsed === true;
     const queryEmbeddingCost = estimateEmbeddingCostForTokens(estimateTokens(primaryQueryText), cfg);
@@ -11416,6 +12440,7 @@
     const queryIntent = { topic: queryType, temporal: temporalIntent, truth: truthIntent };
     let queryProvider = queryFallbackUsed ? 'hash' : normalizeProvider(cfg.embeddingProvider);
     let queryModel = (queryFallbackUsed || queryProvider === 'hash') ? `hash-${cfg.hashDimensions}` : text(cfg.embeddingModel || '');
+    let queryProfileId = text(queryEmbeddingResult.profileId || '') || embeddingProfileId(cfg, queryVector.length, queryProvider, queryModel);
     const retirementPending = manifest.externalRetirementVersion < EXTERNAL_RETIREMENT_VERSION;
     const baseShardSelection = retirementPending
       ? { indexes: Array.from({ length: manifest.shardCount }, (_, index) => index), fullScan: true, reason: 'external_retirement_pending', shardCount: manifest.shardCount }
@@ -11432,8 +12457,12 @@
       reason: currentSceneShardIndexes.length ? 'current_scene_sources' : ''
     });
     const recordLoadStartedAt = Date.now();
-    const loaded = await loadScopeRecordsForRecall(scope.scopeKey, shardSelection);
-    stageElapsed.scopeStorageLoad += Date.now() - recordLoadStartedAt;
+    const loaded = await loadScopeRecordsForRecall(scope.scopeKey, shardSelection, { manifest });
+    stageElapsed.primaryRecallLoad = Date.now() - recordLoadStartedAt;
+    stageElapsed.scopeStorageLoad += stageElapsed.primaryRecallLoad;
+    stageElapsed.shardStorageReadWork += Number(loaded.performance?.storageReadMs || 0);
+    stageElapsed.shardParseWork += Number(loaded.performance?.parseMs || 0);
+    stageElapsed.shardChecksumWork += Number(loaded.performance?.checksumMs || 0);
     let storedRecords = Array.isArray(loaded.records) ? loaded.records : [];
     let externalSuppressed = Number(loaded.manifest?.externalRetirementPending || 0) || 0;
     let storageMissingShards = Number(loaded.manifest?.missingShards || 0) || 0;
@@ -11455,7 +12484,9 @@
       requestMessages: options.messages,
       queryProvider,
       queryModel,
-      queryDim: queryVector.length
+      queryDim: queryVector.length,
+      queryProfileId,
+      settings: cfg
     });
     let previousTurnProfile = previousTurnRecallProfile(primaryQueryText, rawQueryAnchors, queryType, previousTurn);
     let previousTurnShardAdds = 0;
@@ -11465,8 +12496,13 @@
       const additionalIndexes = (previousSelection.indexes || []).filter(index => !loadedIndexes.has(index));
       if (additionalIndexes.length) {
         const additionalLoadStartedAt = Date.now();
-        const additional = await loadScopeRecordsForRecall(scope.scopeKey, { indexes: additionalIndexes, reason: 'previous_turn_context', shardCount: manifest.shardCount });
-        stageElapsed.scopeStorageLoad += Date.now() - additionalLoadStartedAt;
+        const additional = await loadScopeRecordsForRecall(scope.scopeKey, { indexes: additionalIndexes, reason: 'previous_turn_context', shardCount: manifest.shardCount }, { manifest });
+        const additionalElapsed = Date.now() - additionalLoadStartedAt;
+        stageElapsed.additionalRecallLoad += additionalElapsed;
+        stageElapsed.scopeStorageLoad += additionalElapsed;
+        stageElapsed.shardStorageReadWork += Number(additional.performance?.storageReadMs || 0);
+        stageElapsed.shardParseWork += Number(additional.performance?.parseMs || 0);
+        stageElapsed.shardChecksumWork += Number(additional.performance?.checksumMs || 0);
         storedRecords = mergeRecallRecordLists(storedRecords, additional.records || []);
         branchGate = applyRecallHardGates(storedRecords, recallHardGateContext);
         storedRecords = branchGate;
@@ -11482,7 +12518,9 @@
           requestMessages: options.messages,
           queryProvider,
           queryModel,
-          queryDim: queryVector.length
+          queryDim: queryVector.length,
+          queryProfileId,
+          settings: cfg
         });
         previousTurnProfile = previousTurnRecallProfile(primaryQueryText, rawQueryAnchors, queryType, previousTurn);
       }
@@ -11526,9 +12564,12 @@
       addedShards: previousTurnShardAdds,
       excludedFromInjection: excludedPreviousTurnNumber > 0
     };
-    if (!records.length) return { records: [], currentStateFacts, total: 0, storedTotal: manifest.count || 0, loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, worldlineMismatchFiltered, privacyFiltered, stageElapsed };
+    if (!records.length) {
+      stageElapsed.total = Date.now() - recallStartedAt;
+      return { records: [], currentStateFacts, total: 0, storedTotal: manifest.count || 0, loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, worldlineMismatchFiltered, privacyFiltered, stageElapsed };
+    }
     const latestResponseTurn = Math.max(latestLiveResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
-    const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber, excludedPreviousTurnSourceHash };
+    const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, queryProfileId, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber, excludedPreviousTurnSourceHash };
     const candidateLimit = Math.max(effectiveTopK, Math.min(records.length, Math.ceil(Number(cfg.candidateLimit || DEFAULTS.candidateLimit) * topKMultiplier)));
     const sparseStageStartedAt = Date.now();
     let arms = await generateRecallCandidateArms({
@@ -11550,7 +12591,8 @@
         queryFallbackUsed = true;
         queryProvider = 'hash';
         queryModel = `hash-${cfg.hashDimensions}`;
-        Object.assign(recallContext, { queryFallbackUsed, queryProvider, queryModel });
+        queryProfileId = embeddingProfileId(cfg, queryVector.length, queryProvider, queryModel);
+        Object.assign(recallContext, { queryFallbackUsed, queryProvider, queryModel, queryProfileId });
         arms = await generateRecallCandidateArms({
           records,
           queryText: primaryQueryText,
@@ -11607,10 +12649,8 @@
     for (const fused of candidateHardGate) {
       const record = fused.record;
       const recordProvider = text(record?.provider || '').trim();
-      const providerMismatch = !!recordProvider && normalizeProvider(recordProvider) !== queryProvider;
-      const recordModel = text(record?.model || '').trim();
-      const modelMismatch = !!recordModel && !!queryModel && recordModel !== queryModel;
-      if (!Array.isArray(record.vector) || record.vector.length !== queryVector.length || providerMismatch || modelMismatch) dimSkipped += 1;
+      const compatibility = recordEmbeddingCompatibility(record, cfg, { provider: queryProvider, model: queryModel, dimensions: queryVector.length, profileId: queryProfileId });
+      if (!compatibility.comparable) dimSkipped += 1;
       const item = cfg.heuristicRecall
         ? scoreRecordForRecall(record, primaryQueryText, queryVector, queryAnchors, cfg, recallContext)
         : (() => {
@@ -11751,6 +12791,14 @@
         invalidations: Runtime.sparseCacheStats.invalidations,
         size: Runtime.sparseProjectionCache.size
       },
+      shardCache: {
+        hits: Runtime.recallShardCacheStats.hits,
+        misses: Runtime.recallShardCacheStats.misses,
+        evictions: Runtime.recallShardCacheStats.evictions,
+        invalidations: Runtime.recallShardCacheStats.invalidations,
+        size: Runtime.recallShardCache.size,
+        primary: loaded.performance || null
+      },
       stageElapsed,
       diagnostics: {
         candidateArms: candidateArmDiagnostics,
@@ -11762,6 +12810,14 @@
           evictions: Runtime.sparseCacheStats.evictions,
           invalidations: Runtime.sparseCacheStats.invalidations,
           size: Runtime.sparseProjectionCache.size
+        },
+        shardCache: {
+          hits: Runtime.recallShardCacheStats.hits,
+          misses: Runtime.recallShardCacheStats.misses,
+          evictions: Runtime.recallShardCacheStats.evictions,
+          invalidations: Runtime.recallShardCacheStats.invalidations,
+          size: Runtime.recallShardCache.size,
+          primary: loaded.performance || null
         },
         stageElapsed,
         recallAlignment: { ...Runtime.recallAlignment }
@@ -13239,11 +14295,158 @@
     return next;
   };
 
+  const PROMPT_CACHE_MARKER_KEYS = Object.freeze(['cachePoint', 'cache_point', 'cacheControl', 'cache_control']);
+
+  const promptCacheMarkerValuePresent = value => {
+    if (value == null || value === false || value === 0) return false;
+    if (typeof value === 'string') return !['', 'false', 'off', 'none', '0'].includes(value.trim().toLowerCase());
+    return true;
+  };
+
+  const messageHasPromptCacheMarker = message => {
+    if (!message || typeof message !== 'object') return false;
+    if (PROMPT_CACHE_MARKER_KEYS.some(key => promptCacheMarkerValuePresent(message[key]))) return true;
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    return blocks.some(block => block && typeof block === 'object'
+      && PROMPT_CACHE_MARKER_KEYS.some(key => promptCacheMarkerValuePresent(block[key])));
+  };
+
+  const promptCacheMarkerIndexes = messages => {
+    const indexes = [];
+    for (let i = 0; i < (Array.isArray(messages) ? messages.length : 0); i += 1) {
+      if (messageHasPromptCacheMarker(messages[i])) indexes.push(i);
+    }
+    return indexes;
+  };
+
+  const promptCacheMessageBody = message => contentToText(message?.contentText || message?.content || '');
+
+  const promptCacheRegexTest = (pattern, value) => {
+    if (!(pattern instanceof RegExp)) return false;
+    pattern.lastIndex = 0;
+    const matched = pattern.test(value);
+    pattern.lastIndex = 0;
+    return matched;
+  };
+
+  const isPromptCacheVolatileMessage = message => {
+    if (!message || message.flashbackDynamic === true || message.flashbackStatic === true) return true;
+    const body = promptCacheMessageBody(message).trim();
+    if (!body) return true;
+    if (body.includes(INJECTION_HEADER) || body.includes(FLASHBACK_STATIC_HEADER)) return true;
+    if (/\b(?:timestamp|nonce|request_id|requestId|generated_at|generatedAt)\b/i.test(body)) return true;
+    if (!/(?:HAYAKU|LIBRA)/i.test(body)) return false;
+    if (promptCacheRegexTest(HAYAKU_CONTEXT_BLOCK_RE, body)
+      || promptCacheRegexTest(HAYAKU_RAW_BLOCK_RE, body)
+      || promptCacheRegexTest(HAYAKU_IMMUTABLE_CORE_RE, body)
+      || promptCacheRegexTest(HAYAKU_SIDE_WRITE_RE, body)
+      || promptCacheRegexTest(LIBRA_INJECTION_MESSAGE_RE, body)
+      || promptCacheRegexTest(PEER_META_MARKER_RE, body)) return true;
+    return false;
+  };
+
+  const promptCachePrefixMetrics = (messages, endIndex) => {
+    let chars = 0;
+    let tokens = 0;
+    const limit = Math.min(Number(endIndex), (Array.isArray(messages) ? messages.length : 0) - 1);
+    for (let i = 0; i <= limit; i += 1) {
+      const body = promptCacheMessageBody(messages[i]);
+      const role = rawMessageRole(messages[i]);
+      chars += body.length;
+      tokens += estimateTokens(role) + estimateTokens(body);
+    }
+    return { chars, tokens };
+  };
+
+  const promptCacheStablePrefixAnalysis = (messages, endIndex) => {
+    let chars = 0;
+    let tokens = 0;
+    let volatilePrefixIndex = -1;
+    const limit = Math.min(Number(endIndex), (Array.isArray(messages) ? messages.length : 0) - 1);
+    for (let i = 0; i <= limit; i += 1) {
+      const body = promptCacheMessageBody(messages[i]);
+      const role = rawMessageRole(messages[i]);
+      chars += body.length;
+      tokens += estimateTokens(role) + estimateTokens(body);
+      if (volatilePrefixIndex < 0 && isPromptCacheVolatileMessage(messages[i])) volatilePrefixIndex = i;
+    }
+    return { chars, tokens, volatilePrefixIndex };
+  };
+
+  const planPromptCacheBoundary = (messages, options = {}) => {
+    const mode = normalizeChoice(options.mode, ['off', 'existing_only', 'safe_auto'], DEFAULTS.promptCacheMode);
+    const currentInputIndex = Number.isInteger(options.currentInputIndex) ? options.currentInputIndex : -1;
+    const existingMarkerIndexes = promptCacheMarkerIndexes(messages);
+    const warnings = [];
+    if (existingMarkerIndexes.length > 4) warnings.push('existing_cache_marker_limit_exceeded');
+    if (currentInputIndex >= 0 && existingMarkerIndexes.some(index => index >= currentInputIndex)) {
+      warnings.push('cache_marker_at_or_after_current_input');
+    }
+
+    let synthesized = false;
+    let synthesisReason = mode === 'off' ? 'mode_disabled' : 'existing_only_mode';
+    let candidateIndex = -1;
+    let volatilePrefixIndex = -1;
+
+    if (mode === 'safe_auto') {
+      if (existingMarkerIndexes.length) {
+        synthesisReason = 'existing_marker_present';
+      } else if (currentInputIndex < 2) {
+        synthesisReason = 'no_completed_pair';
+      } else {
+        for (let assistantIndex = currentInputIndex - 1; assistantIndex >= 1; assistantIndex -= 1) {
+          const userIndex = assistantIndex - 1;
+          if (rawMessageRole(messages[assistantIndex]) !== 'assistant' || rawMessageRole(messages[userIndex]) !== 'user') continue;
+          if (isPromptCacheVolatileMessage(messages[userIndex]) || isPromptCacheVolatileMessage(messages[assistantIndex])) continue;
+          candidateIndex = userIndex;
+          break;
+        }
+        if (candidateIndex < 0) {
+          synthesisReason = 'no_safe_completed_pair';
+        } else {
+          const analysis = promptCacheStablePrefixAnalysis(messages, candidateIndex);
+          volatilePrefixIndex = analysis.volatilePrefixIndex;
+          if (volatilePrefixIndex >= 0) {
+            synthesisReason = 'volatile_stable_prefix';
+          } else if (analysis.tokens < PROMPT_CACHE_MIN_PREFIX_TOKENS) {
+            synthesisReason = 'stable_prefix_too_short';
+          } else {
+            messages[candidateIndex] = { ...messages[candidateIndex], cachePoint: true };
+            synthesized = true;
+            synthesisReason = 'synthesized';
+          }
+        }
+      }
+    }
+
+    const markerIndexes = promptCacheMarkerIndexes(messages);
+    const eligible = currentInputIndex >= 0
+      ? markerIndexes.filter(index => index < currentInputIndex)
+      : [];
+    const boundaryIndex = mode === 'off' || !eligible.length ? -1 : eligible[eligible.length - 1];
+    const boundarySource = boundaryIndex < 0 ? 'none' : (synthesized ? 'flashback_safe_auto' : 'preset_or_host');
+    const metrics = boundaryIndex >= 0 ? promptCachePrefixMetrics(messages, boundaryIndex) : { chars: 0, tokens: 0 };
+    return {
+      mode,
+      existingMarkerIndexes,
+      markerIndexes,
+      boundaryIndex,
+      boundarySource,
+      synthesized,
+      synthesisReason,
+      candidateIndex,
+      volatilePrefixIndex,
+      stablePrefixChars: metrics.chars,
+      stablePrefixTokens: metrics.tokens,
+      warnings
+    };
+  };
+
   // ============================================================================
   // Diegetic-only injection. Legacy static/dynamic blocks are removed, and one
-  // marker-free recollection message is placed immediately before current input.
+  // marker-free recollection message is placed at the legacy-safe input/prefill boundary.
   // ============================================================================
-  const injectFlashbackMessages = (messages, { staticContract, dynamicBlock, dynamicPosition }, options = {}) => {
+  const injectFlashbackMessages = (messages, { staticContract, dynamicBlock, dynamicPosition, promptCacheMode }, options = {}) => {
     if (!Array.isArray(messages)) return messages;
     // 1. 기존 Flashback 정적/동적 인젝션 제거
     const cleaned = messages.map(msg => {
@@ -13274,41 +14477,113 @@
     // 3. 정적 메타 계약은 더 이상 모델 요청에 삽입하지 않는다.
     let staticInsertionIndex = -1;
 
-    // 4. 동적 블록 삽입 — before_current_input (기본값)
+    // 4. 기존 input/prefill 순서를 지키며, 유효한 캐시 경계와 충돌할 때만 경계 뒤로 조정한다.
     let dynamicInsertionIndex = -1;
+    let cachePlan = {
+      mode: normalizeChoice(promptCacheMode, ['off', 'existing_only', 'safe_auto'], DEFAULTS.promptCacheMode),
+      existingMarkerIndexes: [], markerIndexes: [], boundaryIndex: -1, boundarySource: 'none',
+      synthesized: false, synthesisReason: 'no_dynamic_block', candidateIndex: -1,
+      volatilePrefixIndex: -1,
+      stablePrefixChars: 0, stablePrefixTokens: 0, warnings: []
+    };
+    if (!dynamicBlock) {
+      let observedCurrentInputIndex = -1;
+      for (let i = result.length - 1; i >= 0; i -= 1) {
+        if (rawMessageRole(result[i]) === 'user') { observedCurrentInputIndex = i; break; }
+      }
+      const observedMode = cachePlan.mode;
+      const observedMarkers = promptCacheMarkerIndexes(result);
+      const observedWarnings = [];
+      if (observedMarkers.length > 4) observedWarnings.push('existing_cache_marker_limit_exceeded');
+      if (observedCurrentInputIndex >= 0 && observedMarkers.some(index => index >= observedCurrentInputIndex)) {
+        observedWarnings.push('cache_marker_at_or_after_current_input');
+      }
+      const observedEligible = observedMode === 'off' || observedCurrentInputIndex < 0
+        ? []
+        : observedMarkers.filter(index => index < observedCurrentInputIndex);
+      const observedBoundaryIndex = observedEligible.length ? observedEligible[observedEligible.length - 1] : -1;
+      const observedMetrics = observedBoundaryIndex >= 0
+        ? promptCachePrefixMetrics(result, observedBoundaryIndex)
+        : { chars: 0, tokens: 0 };
+      cachePlan = {
+        ...cachePlan,
+        existingMarkerIndexes: observedMarkers,
+        markerIndexes: observedMarkers,
+        boundaryIndex: observedBoundaryIndex,
+        boundarySource: observedBoundaryIndex >= 0 ? 'preset_or_host' : 'none',
+        stablePrefixChars: observedMetrics.chars,
+        stablePrefixTokens: observedMetrics.tokens,
+        warnings: observedWarnings
+      };
+      warnings.push(...observedWarnings);
+    }
     if (dynamicBlock) {
       const dynamicInjection = { role: 'system', content: dynamicBlock, flashbackDynamic: true };
       const resolved2 = resolveFlashbackCurrentTurn(result, { liveMessages: options.liveMessages || [] });
       const tpi2 = Number(resolved2?.terminalPrefillIndex ?? findFlashbackTerminalAssistantPrefillIndex(result));
       const safeIdx = findLastUserInsertionIndex(result, { liveMessages: options.liveMessages || [] });
+      const strongCurrentResolution = /(?:wrapper|provenance)/i.test(
+        `${resolved2?.source || ''} ${resolved2?.confidence || ''}`
+      );
+      let currentInputIndex = strongCurrentResolution ? Number(resolved2?.requestIndex ?? -1) : -1;
+      if (currentInputIndex < 0) {
+        for (let i = result.length - 1; i >= 0; i -= 1) {
+          if (rawMessageRole(result[i]) === 'user') { currentInputIndex = i; break; }
+        }
+      }
+      if (currentInputIndex < 0) currentInputIndex = safeIdx >= 0 ? safeIdx : (tpi2 >= 0 ? tpi2 : -1);
+      cachePlan = planPromptCacheBoundary(result, { mode: promptCacheMode, currentInputIndex });
+      warnings.push(...cachePlan.warnings);
       const position = dynamicPosition || 'before_current_input';
+      let insertionIndex = -1;
       if (position === 'before_current_input' || position === 'before_last_user') {
-        if (safeIdx >= 0) { result.splice(safeIdx, 0, dynamicInjection); dynamicInsertionIndex = safeIdx; }
-        else if (tpi2 >= 0) { result.splice(tpi2, 0, dynamicInjection); dynamicInsertionIndex = tpi2; }
-        else { result.unshift(dynamicInjection); dynamicInsertionIndex = 0; }
+        insertionIndex = safeIdx >= 0 ? safeIdx : (tpi2 >= 0 ? tpi2 : 0);
       } else if (position === 'last_system') {
-        // cache-hostile 경고
         warnings.push('dynamic_injection_near_prefix');
         let idx = -1;
         for (let i = 0; i < result.length; i += 1) {
           const role = rawMessageRole(result[i]);
           if (role === 'system' || role === 'developer') idx = i;
         }
-        if (idx >= 0) { result.splice(idx + 1, 0, dynamicInjection); dynamicInsertionIndex = idx + 1; }
-        else if (tpi2 >= 0) { result.splice(tpi2, 0, dynamicInjection); dynamicInsertionIndex = tpi2; }
-        else { result.unshift(dynamicInjection); dynamicInsertionIndex = 0; }
+        insertionIndex = idx >= 0 ? idx + 1 : (tpi2 >= 0 ? tpi2 : 0);
       } else {
-        if (safeIdx >= 0) { result.splice(safeIdx, 0, dynamicInjection); dynamicInsertionIndex = safeIdx; }
-        else if (tpi2 >= 0) { result.splice(tpi2, 0, dynamicInjection); dynamicInsertionIndex = tpi2; }
-        else { result.unshift(dynamicInjection); dynamicInsertionIndex = 0; }
+        insertionIndex = safeIdx >= 0 ? safeIdx : (tpi2 >= 0 ? tpi2 : 0);
       }
+      if (cachePlan.mode !== 'off' && cachePlan.boundaryIndex >= 0 && insertionIndex <= cachePlan.boundaryIndex) {
+        const afterBoundary = cachePlan.boundaryIndex + 1;
+        insertionIndex = safeIdx >= afterBoundary
+          ? safeIdx
+          : (tpi2 >= afterBoundary
+            ? tpi2
+            : (currentInputIndex >= afterBoundary ? currentInputIndex : afterBoundary));
+        warnings.push('dynamic_position_clamped_after_cache_boundary');
+      }
+      result.splice(Math.max(0, insertionIndex), 0, dynamicInjection);
+      dynamicInsertionIndex = Math.max(0, insertionIndex);
     }
 
     // 5. cacheSafety 관측 기록
     const dynamicBlockHash = dynamicBlock ? stableHash(dynamicBlock) : '';
     const dynamicBlockChars = dynamicBlock ? dynamicBlock.length : 0;
     const dynamicBlockLines = dynamicBlock ? dynamicBlock.split('\n').length : 0;
+    const finalMarkerIndexes = promptCacheMarkerIndexes(result);
+    const dynamicAfterBoundary = dynamicInsertionIndex < 0 || finalMarkerIndexes.every(index => index < dynamicInsertionIndex);
+    if (!dynamicAfterBoundary) warnings.push('dynamic_block_inside_cache_prefix');
     Runtime.cacheSafety = {
+      mode: cachePlan.mode,
+      existingMarkerCount: cachePlan.existingMarkerIndexes.length,
+      existingMarkerIndexes: [...cachePlan.existingMarkerIndexes],
+      finalMarkerIndexes,
+      boundaryIndex: cachePlan.boundaryIndex >= dynamicInsertionIndex && dynamicInsertionIndex >= 0
+        ? cachePlan.boundaryIndex + 1
+        : cachePlan.boundaryIndex,
+      boundarySource: cachePlan.boundarySource,
+      synthesized: cachePlan.synthesized,
+      synthesisReason: cachePlan.synthesisReason,
+      volatilePrefixIndex: Number(cachePlan.volatilePrefixIndex ?? -1),
+      stablePrefixChars: cachePlan.stablePrefixChars,
+      stablePrefixTokens: cachePlan.stablePrefixTokens,
+      dynamicAfterBoundary,
       staticContractHash: staticContract?.hash || '',
       staticContractChars: staticContract?.chars || 0,
       staticProfileId: staticContract?.profileId || '',
@@ -13320,12 +14595,12 @@
       staticInsertionIndex,
       dynamicInsertionIndex,
       firstDivergenceIndex: dynamicInsertionIndex >= 0 ? dynamicInsertionIndex : staticInsertionIndex,
-      estimatedStablePrefixChars: staticInsertionIndex >= 0 ? result.slice(0, staticInsertionIndex).reduce((sum, m) => sum + text(m.contentText || m.content || '').length, 0) : 0,
-      estimatedStablePrefixTokens: 0,
+      estimatedStablePrefixChars: cachePlan.stablePrefixChars,
+      estimatedStablePrefixTokens: cachePlan.stablePrefixTokens,
       rerollStable: true,
-      providerHintApplied: false,
+      providerHintApplied: cachePlan.synthesized,
       providerFamily: '',
-      warnings
+      warnings: [...new Set(warnings)]
     };
     return result;
   };
@@ -13954,6 +15229,7 @@
         ...settings,
         embeddingTimeoutMs: Math.min(settings.embeddingTimeoutMs, hookRemainingMs())
       };
+      const recallCallStartedAt = Date.now();
       let recall;
       try {
         recall = await withDeadline(
@@ -13987,7 +15263,7 @@
       }
       recall.stageElapsed = {
         ...(recall.stageElapsed || {}),
-        scopeStorageLoad: Number(recall.stageElapsed?.scopeStorageLoad || 0) + Math.max(0, Date.now() - hookStartedAt - Number(recall.stageElapsed?.total || 0))
+        preRecallHook: Math.max(0, recallCallStartedAt - hookStartedAt)
       };
       const renderStageStartedAt = Date.now();
       ensureHookDeadline('beforeRequest render/injection');
@@ -14118,6 +15394,17 @@
         injected: !!dynamicBlock
       }, activitySelectedCount > 0 ? 'success' : 'info');
       if (!dynamicBlock) {
+        injectFlashbackMessages(messages, {
+          staticContract,
+          dynamicBlock: '',
+          dynamicPosition: settings.injectionPosition,
+          promptCacheMode: settings.promptCacheMode
+        }, {
+          liveMessages: liveChat.normalized || [],
+          currentUserResolution: pendingCapture.currentUserResolution
+        });
+        recall.stageElapsed.beforeRequestTotal = Date.now() - hookStartedAt;
+        Runtime.lastRecall.stageElapsed = { ...recall.stageElapsed };
         opLog('before_no_injection_block', { hook: 'beforeRequest', type, pending: pendingCapture.pending, scopeKey: scope.scopeKey, reason: recall.reason || '' }, 'debug');
         if (activitySelectedCount > 0) {
           pushActivityLog('memory_injection_skipped', '기억은 선택됐지만 주입 블록을 만들지 못했습니다.', {
@@ -14136,13 +15423,15 @@
       const injectedMessages = injectFlashbackMessages(messages, {
         staticContract,
         dynamicBlock,
-        dynamicPosition: settings.injectionPosition
+        dynamicPosition: settings.injectionPosition,
+        promptCacheMode: settings.promptCacheMode
       }, {
         liveMessages: liveChat.normalized || [],
         currentUserResolution: pendingCapture.currentUserResolution
       });
       ensureHookDeadline('beforeRequest message injection');
       recall.stageElapsed.renderInjection = Date.now() - renderStageStartedAt;
+      recall.stageElapsed.beforeRequestTotal = Date.now() - hookStartedAt;
       Runtime.lastRecall.stageElapsed = { ...recall.stageElapsed };
       pushActivityLog('memory_injected', '메모리를 주입했습니다.', {
         scopeKey: scope.scopeKey,
@@ -14349,6 +15638,8 @@
     const next = baseRecords.map(record => ({ ...record }));
     const batchSize = clampInt(settings.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
     const vectors = await embedTexts(next.map(record => record.text), settings, {
+      purpose: 'document',
+      contextGroupIds: next.map((record, index) => text(record.sourceHash || record.sourceId || `record:${index}`)),
       concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
       onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '전체 벡터 갱신')
     });
@@ -14362,6 +15653,10 @@
         dim: vector.length,
         provider: fallbackUsed ? 'hash' : settings.embeddingProvider,
         model: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : settings.embeddingModel,
+        embeddingProvider: fallbackUsed ? 'hash' : settings.embeddingProvider,
+        embeddingModel: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : settings.embeddingModel,
+        embeddingDimensions: vector.length,
+        embeddingProfileId: vectors.flashbackEmbeddingProfileId || embeddingProfileId(settings, vector.length, fallbackUsed ? 'hash' : settings.embeddingProvider, (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : settings.embeddingModel),
         tokenEstimate: estimateTokens(record.text),
         updatedAt
       };
@@ -14381,6 +15676,114 @@
     };
     refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
     return Runtime.lastImport;
+  };
+
+  const progressivelyReembedRecords = async (scopeOverride = null, settingsOverride = null, options = {}) => {
+    const settings = normalizeSettings(settingsOverride || await loadSettings());
+    const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false));
+    const loaded = await loadScopeRecords(scope.scopeKey);
+    assertCompleteScopeLoad(loaded, 'progressive re-embedding');
+    const maxRecords = clampInt(options.maxRecords, 1, 200, settings.progressiveReembedMaxRecords);
+    const maxChars = clampInt(options.maxChars, 1000, 500000, settings.progressiveReembedMaxChars);
+    const maxRequests = clampInt(options.maxRequests, 1, 64, settings.progressiveReembedMaxRequests);
+    const finish = value => (Runtime.lastProgressiveReembed = Object.freeze({ ...value, at: Date.now() }));
+    const expectedProvider = normalizeProvider(settings.embeddingProvider);
+    const expectedModel = expectedRecordModel(settings);
+    const selected = [];
+    let selectedChars = 0;
+    for (let index = 0; index < loaded.records.length && selected.length < maxRecords; index += 1) {
+      const record = loaded.records[index];
+      if (!isResponseMemoryRecord(record) || record.autoEpisode || record.sourceType === 'episode_index' || !text(record.text).trim()) continue;
+      const dimensions = settings.embeddingDimensions || (Array.isArray(record.vector) ? record.vector.length : 0);
+      const compatible = recordEmbeddingCompatibility(record, settings, {
+        provider: expectedProvider,
+        model: expectedModel,
+        dimensions,
+        profileId: embeddingProfileId(settings, dimensions, expectedProvider, expectedModel)
+      }).comparable;
+      if (compatible) continue;
+      const chars = text(record.text).length;
+      if (selected.length && selectedChars + chars > maxChars) break;
+      selected.push({ index, record });
+      selectedChars += chars;
+    }
+    if (expectedProvider === 'voyage_context' && selected.length) {
+      const wantedGroups = [];
+      const wantedSet = new Set();
+      for (const item of selected) {
+        const groupId = text(item.record.sourceHash || item.record.sourceId || `record:${item.index}`);
+        if (!wantedSet.has(groupId)) { wantedSet.add(groupId); wantedGroups.push(groupId); }
+      }
+      const groupedRecords = new Map();
+      for (let index = 0; index < loaded.records.length; index += 1) {
+        const record = loaded.records[index];
+        if (!isResponseMemoryRecord(record) || record.autoEpisode || record.sourceType === 'episode_index' || !text(record.text).trim()) continue;
+        const groupId = text(record.sourceHash || record.sourceId || `record:${index}`);
+        if (!wantedSet.has(groupId)) continue;
+        if (!groupedRecords.has(groupId)) groupedRecords.set(groupId, []);
+        groupedRecords.get(groupId).push({ index, record });
+      }
+      selected.length = 0;
+      selectedChars = 0;
+      for (const groupId of wantedGroups) {
+        const group = groupedRecords.get(groupId) || [];
+        const groupChars = group.reduce((sum, item) => sum + text(item.record.text).length, 0);
+        if (selected.length + group.length > maxRecords || selectedChars + groupChars > maxChars) continue;
+        selected.push(...group);
+        selectedChars += groupChars;
+      }
+    }
+    if (!selected.length) return finish({ scopeKey: scope.scopeKey, selected: 0, reembedded: 0, pending: 0, reason: expectedProvider === 'voyage_context' ? 'context_group_exceeds_budget' : 'up_to_date' });
+    const progressiveCapabilities = createEmbeddingProviderAdapter(settings).getCapabilities();
+    const progressiveBatchSize = effectiveProviderBatchSize(expectedProvider, settings, progressiveCapabilities);
+    const requestBound = Math.max(1, Math.floor(maxRequests * progressiveBatchSize));
+    let bounded = selected.slice(0, requestBound);
+    if (expectedProvider === 'voyage_context') {
+      const groups = [];
+      const groupMap = new Map();
+      for (const item of selected) {
+        const groupId = text(item.record.sourceHash || item.record.sourceId || `record:${item.index}`);
+        if (!groupMap.has(groupId)) { groupMap.set(groupId, []); groups.push(groupId); }
+        groupMap.get(groupId).push(item);
+      }
+      bounded = [];
+      let requests = 0;
+      let currentChunks = 0;
+      const chunkBudget = Math.max(1, settings.embeddingBatchSize);
+      for (const groupId of groups) {
+        const group = groupMap.get(groupId);
+        if (currentChunks && currentChunks + group.length > chunkBudget) { requests += 1; currentChunks = 0; }
+        if (requests >= maxRequests) break;
+        bounded.push(...group);
+        currentChunks += group.length;
+        if (currentChunks >= chunkBudget) { requests += 1; currentChunks = 0; }
+      }
+    }
+    const vectors = await embedTexts(bounded.map(item => item.record.text), settings, {
+      purpose: 'document',
+      contextGroupIds: bounded.map(item => text(item.record.sourceHash || item.record.sourceId || `record:${item.index}`)),
+      concurrency: expectedProvider === 'hash' ? 1 : 1
+    });
+    if (vectors.flashbackFallbackUsed === true && expectedProvider !== 'hash') {
+      return finish({ scopeKey: scope.scopeKey, selected: bounded.length, reembedded: 0, pending: selected.length, reason: 'provider_failed_old_vectors_preserved', errorType: Runtime.lastEmbeddingDiagnostic?.errorType || 'UNKNOWN' });
+    }
+    const next = loaded.records.map(record => ({ ...record }));
+    const provider = vectors.flashbackEmbeddingProvider || expectedProvider;
+    const model = vectors.flashbackEmbeddingModel || expectedModel;
+    for (let i = 0; i < bounded.length; i += 1) {
+      const vector = vectors[i];
+      if (!Array.isArray(vector) || !vector.length) continue;
+      next[bounded[i].index] = {
+        ...next[bounded[i].index], vector, dim: vector.length, provider, model,
+        embeddingProvider: provider,
+        embeddingModel: model,
+        embeddingDimensions: vector.length,
+        embeddingProfileId: vectors.flashbackEmbeddingProfileId || embeddingProfileId(settings, vector.length, provider, model),
+        updatedAt: nowIso()
+      };
+    }
+    await withScopeWriteLock(scope.scopeKey, () => saveScopeRecords(scope, next, settings, scope));
+    return finish({ scopeKey: scope.scopeKey, selected: bounded.length, reembedded: bounded.length, pending: Math.max(0, selected.length - bounded.length), chars: selectedChars, requestBudget: maxRequests, reason: 'progressive_batch_complete' });
   };
 
   const arraysEqual = (left = [], right = []) => {
@@ -14589,7 +15992,12 @@ ${cleanedText}`, 80),
       const metadata = cleaned.metadata || {};
       const artifacts = cleaned.artifacts || {};
       const recordProvider = text(record.provider || '').trim();
-      const providerMismatch = !recordProvider || normalizeProvider(recordProvider) !== normalizeProvider(expectedProvider) || text(record.model || '') !== expectedModel;
+      const providerMismatch = !recordEmbeddingCompatibility(record, settings, {
+        provider: expectedProvider,
+        model: expectedModel,
+        dimensions: settings.embeddingDimensions || (Array.isArray(record.vector) ? record.vector.length : 0),
+        profileId: embeddingProfileId(settings, settings.embeddingDimensions || (Array.isArray(record.vector) ? record.vector.length : 0), expectedProvider, expectedModel)
+      }).comparable;
       const vectorMissing = !Array.isArray(record.vector) || !record.vector.length;
       const dimMismatch = Number(record.dim || 0) !== (Array.isArray(record.vector) ? record.vector.length : 0)
         || (settings.embeddingProvider === 'hash' && Array.isArray(record.vector) && record.vector.length !== settings.hashDimensions);
@@ -14611,11 +16019,26 @@ ${cleanedText}`, 80),
       }
       next.push(nextRecord);
     }
+    if (normalizeProvider(settings.embeddingProvider) === 'voyage_context' && reembedIndexes.length) {
+      const selected = new Set(reembedIndexes);
+      const dirtyGroups = new Set(reembedIndexes.map(index => text(next[index]?.sourceHash || next[index]?.sourceId || `record:${index}`)));
+      for (let index = 0; index < next.length; index += 1) {
+        const groupId = text(next[index]?.sourceHash || next[index]?.sourceId || `record:${index}`);
+        if (dirtyGroups.has(groupId)) selected.add(index);
+      }
+      reembedIndexes.length = 0;
+      reembedIndexes.push(...Array.from(selected).sort((a, b) => a - b));
+      result.reembedRequired = reembedIndexes.length;
+    }
     if (opts.dryRun) return result;
     if (opts.reembedChanged && reembedIndexes.length) {
       const batchSize = clampInt(settings.embeddingBatchSize, 1, 128, DEFAULTS.embeddingBatchSize);
       const batch = reembedIndexes.map(index => next[index]);
       const vectors = await embedTexts(batch.map(record => record.text), settings, {
+        purpose: 'document',
+        contextGroupIds: normalizeProvider(settings.embeddingProvider) === 'voyage_context'
+          ? batch.map((record, index) => text(record.sourceHash || record.sourceId || `record:${reembedIndexes[index]}`))
+          : undefined,
         concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
         onProgress: maintenanceEmbeddingProgressCallback(opts.maintenanceOperationId, '기억 정제')
       });
@@ -14628,6 +16051,10 @@ ${cleanedText}`, 80),
           dim: vector.length,
           provider: fallbackUsed ? 'hash' : settings.embeddingProvider,
           model: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : expectedModel,
+          embeddingProvider: fallbackUsed ? 'hash' : settings.embeddingProvider,
+          embeddingModel: (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : expectedModel,
+          embeddingDimensions: vector.length,
+          embeddingProfileId: vectors.flashbackEmbeddingProfileId || embeddingProfileId(settings, vector.length, fallbackUsed ? 'hash' : settings.embeddingProvider, (fallbackUsed || settings.embeddingProvider === 'hash') ? `hash-${settings.hashDimensions}` : expectedModel),
           updatedAt: nowIso()
         };
       }
@@ -14753,7 +16180,12 @@ ${cleanedText}`, 80),
         || cleaned.removedPeerPacketArtifact === true;
       const dirty = contentDirty || cleaned.metadataChanged === true;
       const recordProvider = text(record.provider || '').trim();
-      const providerBad = !recordProvider || normalizeProvider(recordProvider) !== normalizeProvider(expectedProvider) || text(record.model || '') !== expectedModel;
+      const providerBad = !recordEmbeddingCompatibility(record, settings, {
+        provider: expectedProvider,
+        model: expectedModel,
+        dimensions: settings.embeddingDimensions || (Array.isArray(record.vector) ? record.vector.length : 0),
+        profileId: embeddingProfileId(settings, settings.embeddingDimensions || (Array.isArray(record.vector) ? record.vector.length : 0), expectedProvider, expectedModel)
+      }).comparable;
       const vectorMissing = !Array.isArray(record.vector) || !record.vector.length;
       const dimBad = Number(record.dim || 0) !== (Array.isArray(record.vector) ? record.vector.length : 0)
         || (settings.embeddingProvider === 'hash' && Array.isArray(record.vector) && record.vector.length !== settings.hashDimensions);
@@ -15202,7 +16634,7 @@ ${cleanedText}`, 80),
     const formula = pricing.pricePerMillion != null
       ? `tokens / 1,000,000 × $${Number(pricing.pricePerMillion).toFixed(2)}`
       : 'provider/model 단가 미설정';
-    const sourceText = pricing.provider === 'voyageai'
+    const sourceText = pricing.provider === 'voyageai' || pricing.provider === 'voyage_context'
       ? 'Voyage 공식 pricing 기준, 계정 무료 토큰 잔량 미반영'
       : (pricing.local ? '로컬 임베딩은 API 과금 없음' : 'Voyage 외 provider 단가는 아직 추정하지 않음');
     return `<div class="card-title">임베딩 비용 추정</div>
@@ -15852,16 +17284,40 @@ ${cleanedText}`, 80),
   };
 
   const buildProviderTab = (settings, stats = {}) => {
-    const providerOptions = PROVIDER_CHOICES.map(value => `<option value="${value}" ${settings.embeddingProvider === value ? 'selected' : ''}>${value}</option>`).join('');
+    const providerLabels = { bedrock: 'bedrock (Titan V2)', voyage_context: 'voyage_context (Context 4)' };
+    const providerOptions = PROVIDER_CHOICES.map(value => `<option value="${value}" ${settings.embeddingProvider === value ? 'selected' : ''}>${providerLabels[value] || value}</option>`).join('');
+    const recommendedModels = ['text-embedding-3-small', 'text-embedding-3-large', 'voyage-4-lite', 'voyage-4', 'voyage-context-4', 'gemini-embedding-001', 'embed-v4.0', 'jina-embeddings-v3', 'mistral-embed', 'amazon.titan-embed-text-v2:0', 'text-embedding-v4', 'nomic-embed-text', 'bge-m3', 'multilingual-e5-large'].map(model => `<option value="${escapeHtml(model)}"></option>`).join('');
     return `<section class="panel active" data-panel="provider">
       <div class="card">
         <div class="card-title">임베딩 프로바이더</div>
+        <label class="checkline" style="margin-bottom:10px"><input id="embeddingEnabled" type="checkbox" ${settings.embeddingEnabled ? 'checked' : ''}/> 임베딩 사용</label>
         <div class="grid2" style="margin-bottom:10px">
           <div class="field"><label>Provider</label><select id="embeddingProvider">${providerOptions}</select></div>
-          <div class="field"><label>모델</label><input id="embeddingModel" value="${escapeHtml(settings.embeddingModel)}" /></div>
-          <div class="field"><label>Endpoint URL</label><input id="embeddingUrl" value="${escapeHtml(settings.embeddingUrl)}" placeholder="비워두면 기본값" /></div>
+          <div class="field"><label>모델</label><input id="embeddingModel" list="embeddingModelSuggestions" value="${escapeHtml(settings.embeddingModel)}" /><datalist id="embeddingModelSuggestions">${recommendedModels}</datalist></div>
+          <div class="field"><label>Base URL / 서버 주소</label><input id="embeddingUrl" value="${escapeHtml(settings.embeddingUrl)}" placeholder="비워두면 기본값" /></div>
           <div class="field"><label>API Key / Access Token</label><input id="embeddingKey" type="password" placeholder="입력 후 저장하면 로컬 저장소에 유지됩니다" /></div>
+          <div class="field"><label>벡터 차원 (0=자동)</label><input id="embeddingDimensions" type="number" min="0" max="65536" value="${settings.embeddingDimensions}" /></div>
+          <div class="field"><label>요청 제한시간(ms)</label><input id="embeddingTimeoutMs" type="number" min="3000" max="180000" value="${settings.embeddingTimeoutMs}" /></div>
+          <div class="field"><label>배치 크기</label><input id="embeddingBatchSize" type="number" min="1" max="128" value="${settings.embeddingBatchSize}" /></div>
+          <div class="field"><label>재시도 횟수</label><input id="embeddingMaxRetries" type="number" min="0" max="5" value="${settings.embeddingMaxRetries}" /></div>
         </div>
+        <details class="card" style="margin:8px 0 12px"><summary>고급 연결 설정</summary>
+          <div class="grid2" style="margin-top:10px">
+            <div class="field"><label>정확한 Endpoint (선택)</label><input id="embeddingEndpoint" value="${escapeHtml(settings.embeddingEndpoint)}" /></div>
+            <div class="field"><label>입력 모드</label><select id="embeddingInputMode"><option value="automatic" ${settings.embeddingInputMode === 'automatic' ? 'selected' : ''}>automatic</option><option value="manual" ${settings.embeddingInputMode === 'manual' ? 'selected' : ''}>manual</option></select></div>
+            <div class="field"><label>Query task / input type</label><input id="embeddingQueryTask" value="${escapeHtml(settings.embeddingQueryTask)}" /></div>
+            <div class="field"><label>Document task / input type</label><input id="embeddingDocumentTask" value="${escapeHtml(settings.embeddingDocumentTask)}" /></div>
+            <div class="field"><label>Query prefix</label><input id="embeddingQueryPrefix" value="${escapeHtml(settings.embeddingQueryPrefix)}" /></div>
+            <div class="field"><label>Document prefix</label><input id="embeddingDocumentPrefix" value="${escapeHtml(settings.embeddingDocumentPrefix)}" /></div>
+            <label class="checkline"><input id="embeddingNormalize" type="checkbox" ${settings.embeddingNormalize ? 'checked' : ''}/> 반환 벡터 정규화</label>
+            <div class="field"><label>Fallback</label><select id="embeddingFallbackProvider"><option value="hash" ${settings.embeddingFallbackProvider === 'hash' ? 'selected' : ''}>기존 로컬 해시/희소 검색</option><option value="" ${settings.embeddingFallbackProvider === '' ? 'selected' : ''}>벡터 fallback 없음</option></select></div>
+            <div class="field"><label>Custom HTTP method</label><select id="embeddingCustomMethod"><option value="POST" ${settings.embeddingCustomMethod === 'POST' ? 'selected' : ''}>POST</option><option value="PUT" ${settings.embeddingCustomMethod === 'PUT' ? 'selected' : ''}>PUT</option><option value="PATCH" ${settings.embeddingCustomMethod === 'PATCH' ? 'selected' : ''}>PATCH</option></select></div>
+            <div class="field"><label>Custom HTTP headers (JSON)</label><textarea id="embeddingCustomHeaders" rows="3">${escapeHtml(settings.embeddingCustomHeaders)}</textarea></div>
+            <div class="field"><label>Custom request JSON template</label><textarea id="embeddingCustomRequestTemplate" rows="3">${escapeHtml(settings.embeddingCustomRequestTemplate)}</textarea></div>
+            <div class="field"><label>Custom response JSON path</label><input id="embeddingCustomResponsePath" value="${escapeHtml(settings.embeddingCustomResponsePath)}" placeholder="data[*].embedding" /></div>
+            <div class="field"><label>Custom error JSON path</label><input id="embeddingCustomErrorPath" value="${escapeHtml(settings.embeddingCustomErrorPath)}" /></div>
+          </div>
+        </details>
         <div class="actions"><button id="saveSettingsBtn" class="btn btn-primary">저장</button><button id="clearEmbeddingKeyBtn" class="btn">키 삭제</button><button id="testEmbedBtn" class="btn">임베딩 테스트</button></div>
         <div id="embeddingTestStatus" class="embedding-test-status" role="status" aria-live="polite"></div>
         <div class="tiny" style="margin-top:8px">${escapeHtml(embeddingKeyPersistenceStatusText())}</div>
@@ -15940,6 +17396,19 @@ ${cleanedText}`, 80),
           <label class="toggle-row"><input id="entityFocusedRecallEnabled" type="checkbox" ${checked(settings.entityFocusedRecallEnabled)} /><span>엔티티 집중 회수</span></label>
           <label class="toggle-row"><input id="episodeIndexEnabled" type="checkbox" ${checked(settings.episodeIndexEnabled)} /><span>에피소드 인덱스</span></label>
         </div>
+      </div>
+      <div class="card">
+        <div class="card-title">프롬프트 캐싱</div>
+        <div class="field">
+          <label>캐시 경계 정책</label>
+          <select id="promptCacheMode">
+            <option value="off" ${settings.promptCacheMode === 'off' ? 'selected' : ''}>Flashback 최적화 끄기</option>
+            <option value="existing_only" ${settings.promptCacheMode === 'existing_only' ? 'selected' : ''}>기존 경계 우선</option>
+            <option value="safe_auto" ${settings.promptCacheMode === 'safe_auto' ? 'selected' : ''}>안전 자동</option>
+          </select>
+          <span class="field-note">Flashback 최적화 끄기는 Flashback의 배치 최적화와 자동 생성만 끄며, 프리셋과 RisuAI가 만든 캐시 지점은 제거하지 않습니다. 기존 경계 우선은 그 지점을 존중하고, 안전 자동은 기존 지점이 없고 완결된 이전 턴과 1,024토큰 이상의 안정 접두부가 있을 때만 요청 복사본에 경계를 만듭니다.</span>
+        </div>
+        <div class="tiny" style="margin-top:8px">동적으로 바뀌는 회상문은 기존 프리필 순서를 보존하면서 가능한 경우 캐시 경계 뒤에 배치됩니다. 현재 입력 위치의 잘못된 경계는 재작성하지 않고 진단에만 기록합니다. TTL과 제공자별 캐시 키는 RisuAI 및 제공자 설정을 따릅니다.</div>
       </div>
       <div class="card">
         <div class="card-title">보안 및 진단</div>
@@ -16421,11 +17890,31 @@ ${cleanedText}`, 80),
       ...base,
       recallQualityPreset: value('recallQualityPreset', base.recallQualityPreset || recallQualityPresetForValues(base)),
       embeddingProvider: value('embeddingProvider', base.embeddingProvider),
+      embeddingEnabled: checkbox('embeddingEnabled', base.embeddingEnabled),
       embeddingUrl: value('embeddingUrl', base.embeddingUrl),
+      embeddingEndpoint: value('embeddingEndpoint', base.embeddingEndpoint),
       embeddingModel: value('embeddingModel', base.embeddingModel),
+      embeddingDimensions: value('embeddingDimensions', base.embeddingDimensions),
+      embeddingTimeoutMs: value('embeddingTimeoutMs', base.embeddingTimeoutMs),
+      embeddingBatchSize: value('embeddingBatchSize', base.embeddingBatchSize),
+      embeddingMaxRetries: value('embeddingMaxRetries', base.embeddingMaxRetries),
+      embeddingInputMode: value('embeddingInputMode', base.embeddingInputMode),
+      embeddingQueryTask: value('embeddingQueryTask', base.embeddingQueryTask),
+      embeddingDocumentTask: value('embeddingDocumentTask', base.embeddingDocumentTask),
+      embeddingQueryPrefix: value('embeddingQueryPrefix', base.embeddingQueryPrefix),
+      embeddingDocumentPrefix: value('embeddingDocumentPrefix', base.embeddingDocumentPrefix),
+      embeddingNormalize: checkbox('embeddingNormalize', base.embeddingNormalize),
+      embeddingFallbackProvider: value('embeddingFallbackProvider', base.embeddingFallbackProvider),
+      fallbackHashEmbedding: value('embeddingFallbackProvider', base.embeddingFallbackProvider) === 'hash',
+      embeddingCustomHeaders: value('embeddingCustomHeaders', base.embeddingCustomHeaders),
+      embeddingCustomMethod: value('embeddingCustomMethod', base.embeddingCustomMethod),
+      embeddingCustomRequestTemplate: value('embeddingCustomRequestTemplate', base.embeddingCustomRequestTemplate),
+      embeddingCustomResponsePath: value('embeddingCustomResponsePath', base.embeddingCustomResponsePath),
+      embeddingCustomErrorPath: value('embeddingCustomErrorPath', base.embeddingCustomErrorPath),
       captureAfterRequest: checkbox('captureAfterRequest', base.captureAfterRequest),
       persistEmbeddingKey: true,
       operationLogEnabled: checkbox('operationLogEnabled', base.operationLogEnabled),
+      promptCacheMode: value('promptCacheMode', base.promptCacheMode),
       evidenceGate: checkbox('evidenceGate', base.evidenceGate),
       currentSceneTailEnabled: checkbox('currentSceneTailEnabled', base.currentSceneTailEnabled),
       entityFocusedRecallEnabled: checkbox('entityFocusedRecallEnabled', base.entityFocusedRecallEnabled),
@@ -16447,7 +17936,9 @@ ${cleanedText}`, 80),
       evidenceGate: settings.evidenceGate,
       currentSceneTailEnabled: settings.currentSceneTailEnabled,
       entityFocusedRecallEnabled: settings.entityFocusedRecallEnabled,
-      episodeIndexEnabled: settings.episodeIndexEnabled
+      episodeIndexEnabled: settings.episodeIndexEnabled,
+      embeddingEnabled: settings.embeddingEnabled,
+      embeddingNormalize: settings.embeddingNormalize
     };
     Object.entries(checkedIds).forEach(([id, value]) => {
       const node = getGuiNode(id);
@@ -16456,7 +17947,24 @@ ${cleanedText}`, 80),
     const valueIds = {
       embeddingProvider: settings.embeddingProvider,
       embeddingUrl: settings.embeddingUrl,
+      embeddingEndpoint: settings.embeddingEndpoint,
       embeddingModel: settings.embeddingModel,
+      embeddingDimensions: settings.embeddingDimensions,
+      embeddingTimeoutMs: settings.embeddingTimeoutMs,
+      embeddingBatchSize: settings.embeddingBatchSize,
+      embeddingMaxRetries: settings.embeddingMaxRetries,
+      embeddingInputMode: settings.embeddingInputMode,
+      embeddingQueryTask: settings.embeddingQueryTask,
+      embeddingDocumentTask: settings.embeddingDocumentTask,
+      embeddingQueryPrefix: settings.embeddingQueryPrefix,
+      embeddingDocumentPrefix: settings.embeddingDocumentPrefix,
+      embeddingFallbackProvider: settings.embeddingFallbackProvider,
+      embeddingCustomHeaders: settings.embeddingCustomHeaders,
+      embeddingCustomMethod: settings.embeddingCustomMethod,
+      embeddingCustomRequestTemplate: settings.embeddingCustomRequestTemplate,
+      embeddingCustomResponsePath: settings.embeddingCustomResponsePath,
+      embeddingCustomErrorPath: settings.embeddingCustomErrorPath,
+      promptCacheMode: settings.promptCacheMode,
       topK: settings.topK,
       minScore: settings.minScore,
       candidateLimit: settings.candidateLimit,
@@ -17076,7 +18584,8 @@ ${cleanedText}`, 80),
           scopeKey: Runtime.currentScope?.scopeKey || '',
           mode: settings.mode,
           captureAfterRequest: settings.captureAfterRequest,
-          operationLogEnabled: settings.operationLogEnabled
+          operationLogEnabled: settings.operationLogEnabled,
+          promptCacheMode: settings.promptCacheMode
         }, 'success');
         await refreshUi('provider');
       } catch (error) { await guiError('설정 저장 실패', error); }
@@ -17098,7 +18607,8 @@ ${cleanedText}`, 80),
           scopeKey: Runtime.currentScope?.scopeKey || '',
           mode: settings.mode,
           captureAfterRequest: settings.captureAfterRequest,
-          operationLogEnabled: settings.operationLogEnabled
+          operationLogEnabled: settings.operationLogEnabled,
+          promptCacheMode: settings.promptCacheMode
         }, 'success');
         syncMountedSettingsUi(settings);
         await refreshUi('advanced');
@@ -17131,9 +18641,13 @@ ${cleanedText}`, 80),
       const provider = getGuiNode('embeddingProvider')?.value || 'hash';
       setEmbeddingTestStatus('', '');
       const url = getGuiNode('embeddingUrl');
+      const endpoint = getGuiNode('embeddingEndpoint');
       const model = getGuiNode('embeddingModel');
-      if (url && !url.value.trim()) url.value = defaultUrlForProvider(provider);
-      if (model && (!model.value.trim() || model.value === DEFAULTS.embeddingModel || model.value === 'nomic-embed-text' || (provider === 'voyageai' && model.value === 'voyage-3-lite'))) model.value = defaultModelForProvider(provider);
+      const knownUrls = new Set(PROVIDER_CHOICES.map(defaultUrlForProvider).filter(Boolean));
+      const knownModels = new Set(PROVIDER_CHOICES.map(defaultModelForProvider).filter(Boolean));
+      if (url && (!url.value.trim() || knownUrls.has(url.value.trim()))) url.value = defaultUrlForProvider(provider);
+      if (endpoint && knownUrls.has(endpoint.value.trim())) endpoint.value = '';
+      if (model && (!model.value.trim() || knownModels.has(model.value.trim()) || model.value === 'voyage-3-lite')) model.value = defaultModelForProvider(provider);
     });
     getGuiNode('testEmbedBtn')?.addEventListener('click', async () => {
       setEmbeddingTestStatus('testing', '임베딩 호출 중...');
@@ -17146,18 +18660,14 @@ ${cleanedText}`, 80),
           : (Runtime.sessionEmbeddingKey
             ? await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey)
             : await inspectEmbeddingKeyPersistence());
-        const vectors = await embedTexts(['캐릭터는 중요한 장소에서 상대와 대화했다.'], settings, { taskType: 'query' });
-        const [v] = vectors;
-        const provider = normalizeProvider(settings.embeddingProvider);
-        if (provider !== 'hash' && vectors.flashbackFallbackUsed === true) {
-          const error = new Error(vectors.flashbackEmbeddingError || Runtime.lastEmbedError || `${provider} 원격 임베딩 응답을 받지 못했습니다.`);
-          error.code = 'EMBEDDING_PROVIDER_TEST_FAILED';
-          throw error;
-        }
-        if (!Array.isArray(v) || !v.length) throw new Error('임베딩 벡터가 비어 있습니다.');
-        const model = provider === 'hash' ? `hash-${settings.hashDimensions}` : settings.embeddingModel;
-        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider, model, dim: v.length, preview: v.slice(0, 8), embeddingKeyPersistence: keyPersistence };
-        setEmbeddingTestStatus('success', `호출 성공 · ${provider} / ${model} · ${formatNumber(v.length)}차원`);
+        const result = await createEmbeddingProviderAdapter(settings).testConnection();
+        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider: result.provider, model: result.model, dim: result.dimensions, elapsedMs: result.elapsedMs, embeddingKeyPersistence: keyPersistence };
+        setEmbeddingTestStatus('success', `연결 성공 · ${result.provider} / ${result.model} · ${formatNumber(result.dimensions)}차원 · ${formatNumber(result.elapsedMs)}ms`);
+        scheduleTimer(() => {
+          progressivelyReembedRecords(null, settings).then(progress => {
+            pushActivityLog('progressive_reembed', '임베딩 프로필 점진 갱신을 실행했습니다.', progress);
+          }).catch(error => warn('progressive re-embedding failed', classifyEmbeddingError(error)));
+        }, 250);
         await refreshUi('provider');
       } catch (error) {
         const message = formatErrorMessage(error);
@@ -17346,6 +18856,17 @@ ${cleanedText}`, 80),
     }
   };
 
+  const sanitizeEmbeddingSettingsForDiagnostics = (settings = {}) => ({
+    ...settings,
+    embeddingUrl: maskedEmbeddingUrl(settings.embeddingUrl),
+    embeddingEndpoint: maskedEmbeddingUrl(settings.embeddingEndpoint),
+    embeddingCustomHeaders: text(settings.embeddingCustomHeaders).trim() ? '***' : '',
+    embeddingCustomRequestTemplate: text(settings.embeddingCustomRequestTemplate).trim() ? '[configured]' : '',
+    embeddingCustomErrorPath: text(settings.embeddingCustomErrorPath || ''),
+    apiKey: undefined,
+    embeddingKey: undefined
+  });
+
   const debugState = async () => {
     const settings = await loadSettings(true);
     const scope = await resolveCurrentScope(false);
@@ -17357,14 +18878,15 @@ ${cleanedText}`, 80),
     const embeddingKeyPersistence = await inspectEmbeddingKeyPersistence({ includeArgument: true });
     return {
       plugin: { name: PLUGIN_NAME, id: PLUGIN_STORAGE_ID, version: PLUGIN_VERSION },
-      settings,
-      effectiveSettings,
+      settings: sanitizeEmbeddingSettingsForDiagnostics(settings),
+      effectiveSettings: sanitizeEmbeddingSettingsForDiagnostics(effectiveSettings),
       runtime: FlashbackRuntimeState.snapshot(),
       scope,
       manifest: snapshot.manifest,
       records: Number(snapshot.stats?.recordTotal || 0) || 0,
       stats: snapshot.stats,
       lastRecall: Runtime.lastRecall,
+      cacheSafety: cloneRuntimeValue(Runtime.cacheSafety, {}),
       lastCapture: Runtime.lastCapture,
       requestDecision: {
         last: Runtime.lastRequestDecision,
@@ -17385,9 +18907,25 @@ ${cleanedText}`, 80),
       activityLog: activityLogSnapshot(),
       settingsMigration: Runtime.settingsMigration,
       argumentAudit: Runtime.argumentAudit,
-      argumentOverrides: { ...Runtime.argumentOverrides },
-      storedSettingsOverrides: { ...Runtime.storedSettingsOverrides },
+      argumentOverrides: sanitizeEmbeddingSettingsForDiagnostics({ ...Runtime.argumentOverrides }),
+      storedSettingsOverrides: sanitizeEmbeddingSettingsForDiagnostics({ ...Runtime.storedSettingsOverrides }),
       embeddingKeyPersistence,
+      embedding: {
+        activeProfileId: embeddingProfileId(settings, settings.embeddingDimensions || 0),
+        last: Runtime.lastEmbeddingDiagnostic,
+        recent: Runtime.embeddingDiagnostics.slice(-20),
+        activeRequests: Runtime.embeddingControllers.size,
+        generation: Runtime.embeddingGeneration,
+        progressiveReembed: Runtime.lastProgressiveReembed
+      },
+      performance: {
+        storage: { ...Runtime.storagePerfStats },
+        shardCache: { ...Runtime.recallShardCacheStats, size: Runtime.recallShardCache.size },
+        sparseCache: { ...Runtime.sparseCacheStats, size: Runtime.sparseProjectionCache.size },
+        queryEmbeddingCache: { ...Runtime.queryEmbeddingCacheStats, size: Runtime.queryEmbeddingCache.size },
+        documentEmbeddingCache: { size: Runtime.documentEmbeddingCache.size },
+        operationLogQueued: Runtime.operationLogQueue.length
+      },
       gui: {
         visible: guiVisible,
         mounted: guiMounted,
@@ -17451,6 +18989,7 @@ ${cleanedText}`, 80),
       return await maybeRebuildEpisodeIndex(scope, settings, null, { force: true, reason: 'manual_debug' });
     })(),
     reembedAllRecords,
+    progressivelyReembedRecords,
     cleanAndReembedAllRecords,
     listManualEditorRecords,
     deleteManualEditorRecords,
@@ -17469,9 +19008,33 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
+  publicApi._test.opLog = opLog;
+  publicApi._test.flushOperationLogs = flushOperationLogs;
   publicApi._test.currentSceneSourceShardIndexes = currentSceneSourceShardIndexes;
+  publicApi._test.messageHasPromptCacheMarker = messageHasPromptCacheMarker;
+  publicApi._test.promptCacheMarkerIndexes = promptCacheMarkerIndexes;
+  publicApi._test.promptCachePrefixMetrics = promptCachePrefixMetrics;
+  publicApi._test.isPromptCacheVolatileMessage = isPromptCacheVolatileMessage;
+  publicApi._test.planPromptCacheBoundary = planPromptCacheBoundary;
+  publicApi._test.findLastUserInsertionIndex = findLastUserInsertionIndex;
+  publicApi._test.createEmbeddingProviderAdapter = createEmbeddingProviderAdapter;
+  publicApi._test.providerHandlerFor = providerHandlerFor;
+  publicApi._test.providerBatchLimit = providerBatchLimit;
+  publicApi._test.effectiveProviderBatchSize = effectiveProviderBatchSize;
+  publicApi._test.isBedrockTitanV2Model = isBedrockTitanV2Model;
+  publicApi._test.embeddingProfileDescriptor = embeddingProfileDescriptor;
+  publicApi._test.embeddingProfileId = embeddingProfileId;
+  publicApi._test.recordEmbeddingProfileId = recordEmbeddingProfileId;
+  publicApi._test.recordEmbeddingCompatibility = recordEmbeddingCompatibility;
+  publicApi._test.classifyEmbeddingError = classifyEmbeddingError;
+  publicApi._test.cosineSimilarity = dot;
+  publicApi._test.safeJsonPath = safeJsonPath;
+  publicApi._test.safeTemplateSubstitute = safeTemplateSubstitute;
+  publicApi._test.abortEmbeddingJobs = abortEmbeddingJobs;
+  publicApi._test.sanitizeEmbeddingSettingsForDiagnostics = sanitizeEmbeddingSettingsForDiagnostics;
+  publicApi._test.buildRecordsFromSources = buildRecordsFromSources;
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
 
@@ -17549,7 +19112,11 @@ ${cleanedText}`, 80),
     const unloadApi = unloadApiRef.api;
     if (unloadApi && typeof unloadApi.onUnload === 'function') {
       await unloadApi.onUnload(async () => {
+        if (Runtime.operationLogQueue.length || Runtime.operationLogWrite) {
+          await withDeadline(flushOperationLogs(), 1500, 'operation log unload flush').catch(() => {});
+        }
         Runtime.unloaded = true;
+        abortEmbeddingJobs('plugin_unloaded');
         clearScheduledTimers();
         Runtime.writeLocks.clear();
         Runtime.driftChecksInFlight.clear();
@@ -17570,10 +19137,13 @@ ${cleanedText}`, 80),
         Runtime.activityLog.length = 0;
         Runtime.activityLogSeq = 0;
         Runtime.sessionEmbeddingKey = '';
+        Runtime.recallShardCache.clear();
         Runtime.sparseProjectionCache.clear();
         Runtime.sparseProjectionRecordKeys.clear();
         Runtime.queryEmbeddingCache.clear();
         Runtime.queryEmbeddingInFlight.clear();
+        Runtime.documentEmbeddingCache.clear();
+        Runtime.embeddingDiagnostics.length = 0;
         terminateComputeWorker();
         try { await closeGui({ hideContainer: true, removeRoot: true }); } catch (_) {}
         const live = getLiveApi();
