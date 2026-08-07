@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.2
+//@display-name ⚡ FLASHBACK Memory v0.10.6
 //@api 3.0
-//@version 0.10.2
+//@version 0.10.6
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flasgback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,7 +78,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.10.2
+ * ⚡ FLASHBACK Memory v0.10.6
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -323,7 +323,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.2';
+  const PLUGIN_VERSION = '0.10.6';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const MEMORY_SESSION_BRIDGE_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
@@ -595,6 +595,19 @@
   const DOCUMENT_EMBEDDING_CACHE_MAX = 256;
   const DOCUMENT_EMBEDDING_CACHE_TTL_MS = 30 * 60 * 1000;
   const EMBEDDING_DIAGNOSTIC_MAX = 80;
+  // Remote embedding must never become the durability gate for finalized U+A turns.
+  // Live capture commits a local hash vector first, then upgrades that exact turn in
+  // the background. Because durability is already guaranteed, the background upgrade
+  // respects the user's configured timeout instead of imposing a shorter hidden cap.
+  // It also disables a second hash fallback: the already-committed hash vector is the
+  // authoritative fallback and must not be recomputed just because a provider is slow.
+  const LIVE_CAPTURE_REMOTE_MAX_RETRIES = 0;
+  const GEMINI_SAFE_OUTPUT_DIMENSIONS = 768;
+  // gemini-embedding-001 accepts 2,048 input tokens. Keep headroom for tokenizer
+  // estimation differences. Gemini Embedding 2 has a larger limit, but the same
+  // splitter is retained so custom/older endpoints stay fail-safe.
+  const GEMINI_001_SAFE_INPUT_TOKENS = 1800;
+  const GEMINI_2_SAFE_INPUT_TOKENS = 7600;
   const RECALL_SHARD_CACHE_MAX = 24;
   const RECALL_SHARD_CACHE_TTL_MS = 5 * 60 * 1000;
   const FLASHBACK_STATIC_CONTRACT_CACHE = new Map();
@@ -750,9 +763,12 @@
     documentEmbeddingCache: new Map(),
     embeddingGeneration: 1,
     embeddingControllers: new Set(),
+    embeddingActiveRequests: new Map(),
+    embeddingActiveRequestSeq: 0,
     embeddingDiagnostics: [],
     lastEmbeddingDiagnostic: null,
     lastProgressiveReembed: null,
+    capturedTurnReembedQueues: new Map(),
     queryEmbeddingCacheStats: {
       hits: 0,
       misses: 0,
@@ -1137,22 +1153,35 @@
     ageMs: pending.at ? Date.now() - Number(pending.at || 0) : 0
   } : null;
 
-  const operationLogResultSummary = (result = {}) => result && typeof result === 'object' ? {
-    sources: Number(result.sources || 0) || 0,
-    chunks: Number(result.chunks || 0) || 0,
-    inserted: Number(result.inserted || 0) || 0,
-    updated: Number(result.updated || 0) || 0,
-    deduped: Number(result.deduped || 0) || 0,
-    total: Number(result.total || result.savedTotal || 0) || 0,
-    scopeKey: text(result.scopeKey || ''),
-    reason: text(result.reason || ''),
-    skipped: !!result.skipped,
-    embeddingCost: result.embeddingCost ? {
-      tokens: Number(result.embeddingCost.tokens || 0) || 0,
-      knownEstimatedUsd: result.embeddingCost.knownEstimatedUsd ?? result.embeddingCost.estimatedUsd ?? null,
-      unsupportedGroups: Number(result.embeddingCost.unsupportedGroups || 0) || 0
-    } : null
-  } : null;
+  const operationLogResultSummary = (result = {}) => {
+    if (!result || typeof result !== 'object') return null;
+    const out = {};
+    const copyNumber = [
+      'sources', 'chunks', 'inserted', 'updated', 'deduped',
+      'targetRecords', 'reembedded', 'preservedHash', 'storedTotal',
+      'dimensions', 'elapsedMs', 'timeoutMs', 'retryCount'
+    ];
+    for (const key of copyNumber) {
+      if (result[key] == null) continue;
+      out[key] = Number(result[key] || 0) || 0;
+    }
+    if (result.total != null || result.savedTotal != null || result.storedTotal != null) {
+      out.total = Number(result.total ?? result.savedTotal ?? result.storedTotal ?? 0) || 0;
+    }
+    for (const key of ['scopeKey', 'reason', 'provider', 'model', 'errorType']) {
+      if (result[key] != null && result[key] !== '') out[key] = text(result[key]);
+    }
+    if (result.error != null && result.error !== '') out.error = compact(result.error, 700);
+    if (Object.prototype.hasOwnProperty.call(result, 'skipped')) out.skipped = !!result.skipped;
+    if (result.embeddingCost) {
+      out.embeddingCost = {
+        tokens: Number(result.embeddingCost.tokens || 0) || 0,
+        knownEstimatedUsd: result.embeddingCost.knownEstimatedUsd ?? result.embeddingCost.estimatedUsd ?? null,
+        unsupportedGroups: Number(result.embeddingCost.unsupportedGroups || 0) || 0
+      };
+    }
+    return out;
+  };
 
   const operationLogRecallSummary = (recall = {}) => recall && typeof recall === 'object' ? {
     total: Number(recall.total || 0) || 0,
@@ -2770,6 +2799,10 @@
     const requestedEmbeddingUrl = text(raw.embeddingUrl ?? raw.embedding_url ?? '').trim();
     const requestedEmbeddingEndpoint = text(raw.embeddingEndpoint ?? raw.embedding_endpoint ?? '').trim();
     const requestedEmbeddingModel = text(raw.embeddingModel ?? raw.embedding_model ?? '').trim();
+    const requestedEmbeddingDimensions = clampInt(raw.embeddingDimensions ?? raw.embedding_dimensions, 0, 65536, DEFAULTS.embeddingDimensions);
+    const effectiveEmbeddingDimensions = ['gemini', 'gemini-embedding'].includes(provider) && requestedEmbeddingDimensions === 0
+      ? GEMINI_SAFE_OUTPUT_DIMENSIONS
+      : requestedEmbeddingDimensions;
     const fallbackHashEmbedding = asBool(raw.fallbackHashEmbedding ?? raw.fallback_hash_embedding, DEFAULTS.fallbackHashEmbedding);
     const requestedFallbackProvider = raw.embeddingFallbackProvider ?? raw.embedding_fallback_provider;
     const embeddingFallbackProvider = requestedFallbackProvider == null
@@ -2794,7 +2827,7 @@
       embeddingEndpoint: compact(requestedEmbeddingEndpoint, 1400),
       embeddingModel: compact(requestedEmbeddingModel || defaultModelForProvider(provider), 240),
       embeddingTimeoutMs: clampInt(raw.embeddingTimeoutMs ?? raw.embedding_timeout_ms, 3000, 180000, DEFAULTS.embeddingTimeoutMs),
-      embeddingDimensions: clampInt(raw.embeddingDimensions ?? raw.embedding_dimensions, 0, 65536, DEFAULTS.embeddingDimensions),
+      embeddingDimensions: effectiveEmbeddingDimensions,
       embeddingMaxRetries: clampInt(raw.embeddingMaxRetries ?? raw.embedding_max_retries, 0, 5, DEFAULTS.embeddingMaxRetries),
       embeddingInputMode: normalizeChoice(raw.embeddingInputMode ?? raw.embedding_input_mode, ['automatic', 'manual'], DEFAULTS.embeddingInputMode),
       embeddingQueryTask: compact(raw.embeddingQueryTask ?? raw.embedding_query_task ?? '', 120),
@@ -2995,8 +3028,8 @@
     Number(settings.embeddingDimensions || 0) || 0,
     text(settings.embeddingQueryTask || '').trim(),
     text(settings.embeddingDocumentTask || '').trim(),
-    text(settings.embeddingQueryPrefix || ''),
-    text(settings.embeddingDocumentPrefix || ''),
+    effectiveEmbeddingPrefix(settings, 'query'),
+    effectiveEmbeddingPrefix(settings, 'document'),
     settings.embeddingNormalize !== false ? 'normalize' : 'raw',
     EMBEDDING_PREPROCESSING_VERSION
   ].join('\n'));
@@ -3011,6 +3044,7 @@
     text(settings.embeddingCustomMethod || 'POST'),
     text(settings.embeddingCustomRequestTemplate || ''),
     text(settings.embeddingCustomResponsePath || ''),
+    text(settings.embeddingCustomErrorPath || ''),
     settings.embeddingEnabled !== false ? 'enabled' : 'disabled'
   ].join('\n'));
 
@@ -3115,6 +3149,7 @@
   const saveSettings = async (settings) => {
     const previousEmbeddingFingerprint = embeddingRequestSettingsFingerprint(Runtime.settings || DEFAULTS);
     const requested = normalizeSettings(settings || {});
+    if (requested.embeddingEnabled) validateProviderEmbeddingDimensions(requested);
     const nextOverrides = settingsOverrideDiff(requested);
     const argumentOverrides = Runtime.argumentOverrides || {};
     const protectedKeys = new Set(Object.keys(argumentOverrides));
@@ -3644,7 +3679,12 @@
     const configured = text(settings.embeddingUrl || '').trim() || defaultUrlForProvider(provider);
     if (!configured) return '';
     if (/\/embeddings(?:\?|$)/i.test(configured)) return configured;
-    if (provider === 'lmstudio' || provider === 'localai' || provider === 'openai_compat_local') return joinUrl(configured, 'v1/embeddings');
+    if (provider === 'lmstudio' || provider === 'localai' || provider === 'openai_compat_local') {
+      // LM Studio/LocalAI commonly document their OpenAI-compatible base as .../v1.
+      // Do not turn that into .../v1/v1/embeddings when users paste the documented base URL.
+      if (/\/v\d+\/?$/i.test(configured)) return joinUrl(configured, 'embeddings');
+      return joinUrl(configured, 'v1/embeddings');
+    }
     if (provider === 'openai' || provider === 'voyageai' || provider === 'jina' || provider === 'mistral') return configured;
     if (provider === 'custom' || provider === 'openai_compat') {
       if (/\/v\d+\/?$/i.test(configured)) return joinUrl(configured, 'embeddings');
@@ -3670,8 +3710,8 @@
     dimensions: Math.max(0, Number(dimensions || settings.embeddingDimensions || 0) || 0),
     queryTask: text(settings.embeddingQueryTask || '').trim(),
     documentTask: text(settings.embeddingDocumentTask || '').trim(),
-    queryPrefix: text(settings.embeddingQueryPrefix || ''),
-    documentPrefix: text(settings.embeddingDocumentPrefix || ''),
+    queryPrefix: effectiveEmbeddingPrefix(settings, 'query', providerOverride),
+    documentPrefix: effectiveEmbeddingPrefix(settings, 'document', providerOverride),
     normalize: settings.embeddingNormalize !== false,
     preprocessingVersion: EMBEDDING_PREPROCESSING_VERSION
   });
@@ -3684,7 +3724,7 @@
   const prepareEmbeddingInput = (value, purpose, settings) => {
     const normalized = normalizeQueryForEmbeddingCache(value);
     if (!normalized) return '';
-    const prefix = purpose === 'query' ? settings.embeddingQueryPrefix : settings.embeddingDocumentPrefix;
+    const prefix = effectiveEmbeddingPrefix(settings, purpose);
     return prefix ? `${prefix}${normalized}` : normalized;
   };
 
@@ -3756,31 +3796,75 @@
     Runtime.embeddingGeneration += 1;
     for (const controller of Runtime.embeddingControllers) { try { controller.abort(reason); } catch (_) {} }
     Runtime.embeddingControllers.clear();
+    Runtime.embeddingActiveRequests.clear();
     Runtime.queryEmbeddingInFlight.clear();
     return Runtime.embeddingGeneration;
   };
 
-  const embeddingFetchJson = async (request, cfg, signal = null) => {
+  const embeddingFetchJson = async (request, cfg, signal = null, diagnosticContext = {}) => {
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const requestId = `embed_req_${++Runtime.embeddingActiveRequestSeq}`;
+    const startedAt = Date.now();
+    const configuredTimeoutMs = Math.max(1, Number(cfg.embeddingTimeoutMs || DEFAULTS.embeddingTimeoutMs) || DEFAULTS.embeddingTimeoutMs);
+    const requestedDeadlineAt = Math.max(0, Number(diagnosticContext.deadlineAt || 0) || 0);
+    const requestDeadlineAt = requestedDeadlineAt > 0
+      ? Math.min(startedAt + configuredTimeoutMs, requestedDeadlineAt)
+      : startedAt + configuredTimeoutMs;
+    const remainingMs = () => Math.max(0, requestDeadlineAt - Date.now());
+    const timeoutError = (label = 'embedding request') => {
+      const error = new Error(`${label} timed out after ${Math.max(1, requestDeadlineAt - startedAt)}ms`);
+      error.code = 'FLASHBACK_DEADLINE';
+      return error;
+    };
     let timedOut = false;
     let timer = null;
     const abortFromParent = () => { try { controller?.abort(signal?.reason || 'aborted'); } catch (_) {} };
     if (signal?.aborted) abortFromParent();
     else signal?.addEventListener?.('abort', abortFromParent, { once: true });
     if (controller) Runtime.embeddingControllers.add(controller);
-    if (controller) timer = setTimeout(() => { timedOut = true; try { controller.abort('timeout'); } catch (_) {} }, cfg.embeddingTimeoutMs);
+    const initialBudgetMs = remainingMs();
+    Runtime.embeddingActiveRequests.set(requestId, Object.freeze({
+      id: requestId,
+      startedAt,
+      provider: normalizeProvider(cfg.embeddingProvider),
+      model: compact(cfg.embeddingModel || '', 120),
+      purpose: text(diagnosticContext.purpose || ''),
+      batchIndex: Math.max(0, Number(diagnosticContext.batchIndex || 0) || 0),
+      totalBatches: Math.max(0, Number(diagnosticContext.totalBatches || 0) || 0),
+      inputCount: Math.max(0, Number(diagnosticContext.inputCount || 0) || 0),
+      inputCharacters: Math.max(0, Number(diagnosticContext.inputCharacters || 0) || 0),
+      timeoutMs: initialBudgetMs,
+      deadlineAt: requestDeadlineAt,
+      url: maskedEmbeddingUrl(request.url)
+    }));
+    if (controller && initialBudgetMs > 0) timer = setTimeout(() => { timedOut = true; try { controller.abort('timeout'); } catch (_) {} }, initialBudgetMs);
     try {
+      if (initialBudgetMs <= 0) {
+        timedOut = true;
+        throw timeoutError('embedding request deadline');
+      }
       const response = await RisuCompat.nativeFetch(request.url, {
         method: request.method || 'POST',
         headers: request.headers || {},
         body: JSON.stringify(request.body ?? {}),
         signal: controller?.signal || signal || undefined
-      }, cfg.embeddingTimeoutMs);
+      }, Math.max(1, remainingMs()));
       const status = Number(response?.status || 0) || 0;
       if (status >= 400 || response?.ok === false) {
         let detail = '';
-        try { detail = embeddingErrorDetail(await responseToJsonOrText(response, cfg.embeddingTimeoutMs)); }
-        catch (_) {}
+        const detailBudgetMs = remainingMs();
+        if (detailBudgetMs > 0) {
+          try {
+            const errorPayload = await responseToJsonOrText(response, detailBudgetMs);
+            if (normalizeProvider(cfg.embeddingProvider) === 'custom_http' && text(cfg.embeddingCustomErrorPath || '').trim()) {
+              try {
+                const customErrorValue = safeJsonPath(errorPayload, cfg.embeddingCustomErrorPath);
+                detail = embeddingErrorDetail(customErrorValue) || sanitizeEmbeddingErrorMessage(text(customErrorValue || ''));
+              } catch (_) {}
+            }
+            if (!detail) detail = embeddingErrorDetail(errorPayload);
+          } catch (_) {}
+        }
         const lowerDetail = detail.toLowerCase();
         const inputTooLong = status === 413 || /input.*(?:too long|token limit|maximum|max context)|maximum context|context.*(?:exceed|too long)|token.*(?:exceed|limit)|payload too large/.test(lowerDetail);
         const type = status === 429
@@ -3796,13 +3880,20 @@
                   : 'INVALID_RESPONSE';
         throw new EmbeddingAdapterError(type, `Embedding endpoint returned HTTP ${status || 'error'}${detail ? `: ${detail}` : '.'}`, { status, retryAfterMs: retryAfterMsFromResponse(response), retryable: status === 429 || status >= 500 });
       }
-      return await responseToJsonOrText(response, cfg.embeddingTimeoutMs);
+      const parseBudgetMs = remainingMs();
+      if (parseBudgetMs <= 0) {
+        timedOut = true;
+        throw timeoutError('embedding response deadline');
+      }
+      return await responseToJsonOrText(response, parseBudgetMs);
     } catch (error) {
+      if (remainingMs() <= 0 && !(error instanceof EmbeddingAdapterError)) timedOut = true;
       throw classifyEmbeddingError(error, { provider: cfg.embeddingProvider, timedOut });
     } finally {
       if (timer) clearTimeout(timer);
       signal?.removeEventListener?.('abort', abortFromParent);
       if (controller) Runtime.embeddingControllers.delete(controller);
+      Runtime.embeddingActiveRequests.delete(requestId);
     }
   };
 
@@ -3831,6 +3922,153 @@
     ...(key ? { Authorization: `Bearer ${key.replace(/^Bearer\s+/i, '')}` } : {}),
     ...extra
   });
+
+  const isGeminiEmbedding2Model = (model = '') => /(?:^|\/)gemini-embedding-2(?:$|[-:.])/i.test(text(model || '').trim());
+  const isGeminiEmbedding001Model = (model = '') => /(?:^|\/)gemini-embedding-001(?:$|[-:.])/i.test(text(model || '').trim());
+  const isVertexProvider = (provider = '') => ['vertex', 'vertex-embedding'].includes(normalizeProvider(provider));
+  const isGeminiApiProvider = (provider = '') => ['gemini', 'gemini-embedding'].includes(normalizeProvider(provider));
+
+  const vertexAuthHeaders = (key = '') => {
+    const raw = text(key || '').trim();
+    const headers = { 'Content-Type': 'application/json' };
+    if (!raw) return headers;
+    const explicitApiKey = raw.match(/^(?:x-goog-api-key|api-key)\s*:\s*(.+)$/i);
+    if (explicitApiKey?.[1]) return { ...headers, 'x-goog-api-key': explicitApiKey[1].trim() };
+    if (/^Bearer\s+/i.test(raw)) return { ...headers, Authorization: `Bearer ${raw.replace(/^Bearer\s+/i, '')}` };
+    // Google Cloud API key strings conventionally begin with AIza. Other values are
+    // treated as OAuth/access tokens so existing Vertex access-token setups keep working.
+    if (/^AIza[A-Za-z0-9_-]{20,}$/i.test(raw)) return { ...headers, 'x-goog-api-key': raw };
+    return { ...headers, Authorization: `Bearer ${raw}` };
+  };
+
+  const effectiveEmbeddingPrefix = (settings = DEFAULTS, purpose = 'document', providerOverride = '') => {
+    const provider = normalizeProvider(providerOverride || settings.embeddingProvider);
+    const explicit = text(purpose === 'query' ? settings.embeddingQueryPrefix : settings.embeddingDocumentPrefix);
+    if (explicit) return explicit;
+    if ((isGeminiApiProvider(provider) || isVertexProvider(provider)) && isGeminiEmbedding2Model(settings.embeddingModel)) {
+      return purpose === 'query'
+        ? 'task: search result | query: '
+        : 'title: none | text: ';
+    }
+    return '';
+  };
+
+  const providerSafeInputTokenLimit = (provider, cfg = {}) => {
+    const normalized = normalizeProvider(provider);
+    if (isGeminiApiProvider(normalized)) {
+      return isGeminiEmbedding2Model(cfg.embeddingModel) ? GEMINI_2_SAFE_INPUT_TOKENS : GEMINI_001_SAFE_INPUT_TOKENS;
+    }
+    // Vertex text embeddings share the same practical input limits for the Gemini
+    // embedding model family. Keep tokenizer headroom because Flashback estimates tokens.
+    if (isVertexProvider(normalized) && (isGeminiEmbedding001Model(cfg.embeddingModel) || isGeminiEmbedding2Model(cfg.embeddingModel))) {
+      return isGeminiEmbedding2Model(cfg.embeddingModel) ? GEMINI_2_SAFE_INPUT_TOKENS : GEMINI_001_SAFE_INPUT_TOKENS;
+    }
+    return 0;
+  };
+
+  const providerDimensionPolicy = (provider = '', model = '') => {
+    const normalized = normalizeProvider(provider);
+    const id = text(model || '').trim().toLowerCase();
+    if ((isGeminiApiProvider(normalized) || isVertexProvider(normalized)) && (isGeminiEmbedding001Model(id) || isGeminiEmbedding2Model(id))) {
+      return { min: 128, max: 3072, label: `${id || 'Gemini embedding'} 128-3072` };
+    }
+    if (normalized === 'cohere' && /^embed-v4(?:\.0)?(?:$|[-:])/i.test(id)) {
+      return { allowed: [256, 512, 1024, 1536], label: 'Cohere Embed v4' };
+    }
+    if (normalized === 'bedrock' && isBedrockTitanV2Model(id)) {
+      return { allowed: [256, 512, 1024], label: 'Amazon Titan Text Embeddings V2' };
+    }
+    if (normalized === 'voyage_context' && /^voyage-context-/i.test(id)) {
+      return { allowed: [256, 512, 1024, 2048], label: id };
+    }
+    if (normalized === 'voyageai') {
+      if (/^(?:voyage-(?:4(?:-large|-lite)?|3(?:-large|\.5(?:-lite)?)|code-3))(?=$|[-:])/i.test(id)) return { allowed: [256, 512, 1024, 2048], label: id };
+      if (/^voyage-(?:finance-2|law-2)(?=$|[-:])/i.test(id)) return { allowed: [1024], omitDimension: true, label: id };
+      if (/^voyage-code-2(?=$|[-:])/i.test(id)) return { allowed: [1536], omitDimension: true, label: id };
+    }
+    if (normalized === 'dashscope') {
+      if (/qwen3\.7-text-embedding/i.test(id)) return { allowed: [256, 512, 768, 1024, 1536, 2048, 2560], label: id };
+      if (/^text-embedding-v4(?:$|[-:])/i.test(id)) return { allowed: [64, 128, 256, 512, 768, 1024, 1536, 2048], label: id };
+      if (/^text-embedding-v3(?:$|[-:])/i.test(id)) return { allowed: [64, 128, 256, 512, 768, 1024], label: id };
+      if (/^text-embedding-v[12](?:$|[-:])/i.test(id)) return { allowed: [1536], omitDimension: true, label: id };
+    }
+    if (normalized === 'openai') {
+      if (/^text-embedding-ada-002(?:$|[-:])/i.test(id)) return { allowed: [1536], omitDimension: true, label: id };
+      if (/^text-embedding-3-small(?:$|[-:])/i.test(id)) return { min: 1, max: 1536, label: id };
+      if (/^text-embedding-3-large(?:$|[-:])/i.test(id)) return { min: 1, max: 3072, label: id };
+    }
+    if (normalized === 'mistral') {
+      if (/^mistral-embed(?:$|[-:])/i.test(id)) return { allowed: [1024], label: id };
+      if (/^codestral-embed(?:$|[-:])/i.test(id)) return { min: 1, max: 3072, label: id };
+    }
+    return null;
+  };
+
+  const validateProviderEmbeddingDimensions = (cfg = {}) => {
+    const dim = Math.max(0, Number(cfg.embeddingDimensions || 0) || 0);
+    if (!dim) return true;
+    const policy = providerDimensionPolicy(cfg.embeddingProvider, cfg.embeddingModel);
+    if (!policy) return true;
+    if (policy.omitDimension) {
+      throw new EmbeddingAdapterError('DIMENSION_MISMATCH', `${policy.label} does not accept a custom dimensions parameter. Set vector dimensions to 0 (auto).`);
+    }
+    if (Array.isArray(policy.allowed) && !policy.allowed.includes(dim)) {
+      throw new EmbeddingAdapterError('DIMENSION_MISMATCH', `${policy.label} supports dimensions: ${policy.allowed.join(', ')}. Requested: ${dim}.`);
+    }
+    if ((policy.min != null && dim < policy.min) || (policy.max != null && dim > policy.max)) {
+      throw new EmbeddingAdapterError('DIMENSION_MISMATCH', `${policy.label} supports dimensions ${policy.min}-${policy.max}. Requested: ${dim}.`);
+    }
+    return true;
+  };
+  const splitEmbeddingInputByTokenBudget = (value = '', maxTokens = 0) => {
+    const source = text(value || '').trim();
+    const limit = Math.max(0, Number(maxTokens || 0) || 0);
+    if (!source || !limit || estimateTokens(source) <= limit) return source ? [source] : [];
+    const out = [];
+    let cursor = 0;
+    while (cursor < source.length) {
+      let low = cursor + 1;
+      let high = source.length;
+      let best = low;
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        if (estimateTokens(source.slice(cursor, mid)) <= limit) {
+          best = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      if (best <= cursor) best = Math.min(source.length, cursor + 1);
+      let cut = best;
+      if (best < source.length) {
+        const floor = Math.max(cursor + 1, cursor + Math.floor((best - cursor) * 0.65));
+        for (let index = best; index >= floor; index -= 1) {
+          const prev = source[index - 1] || '';
+          if (prev === '\n' || /[.!?。！？…;；]/u.test(prev) || /\s/u.test(prev)) { cut = index; break; }
+        }
+      }
+      const piece = source.slice(cursor, cut).trim();
+      if (piece) out.push(piece);
+      cursor = Math.max(cut, cursor + 1);
+    }
+    return out.length ? out : [source];
+  };
+  const combineEmbeddingPartVectors = (parts = []) => {
+    const rows = (Array.isArray(parts) ? parts : []).filter(part => Array.isArray(part?.vector) && part.vector.length);
+    if (!rows.length) return [];
+    if (rows.length === 1) return rows[0].vector.slice();
+    const dim = rows[0].vector.length;
+    if (rows.some(row => row.vector.length !== dim)) throw new EmbeddingAdapterError('DIMENSION_MISMATCH', 'Split embedding parts returned inconsistent dimensions.');
+    const sum = new Array(dim).fill(0);
+    let totalWeight = 0;
+    for (const row of rows) {
+      const weight = Math.max(1, Number(row.weight || 0) || 1);
+      totalWeight += weight;
+      for (let i = 0; i < dim; i += 1) sum[i] += Number(row.vector[i] || 0) * weight;
+    }
+    return normalizeVector(sum.map(value => value / Math.max(1, totalWeight)));
+  };
 
   const PROVIDER_HANDLERS = Object.freeze({
     openai_compat: {
@@ -3880,8 +4118,27 @@
       request: (texts, cfg, purpose, key) => {
         const cleanModel = cfg.embeddingModel.startsWith('models/') ? cfg.embeddingModel : `models/${cfg.embeddingModel}`;
         const url = text(cfg.embeddingEndpoint || '') || joinUrl(cfg.embeddingUrl || defaultUrlForProvider('gemini'), `models/${encodeURIComponent(cleanModel.replace(/^models\//, ''))}:batchEmbedContents`);
-        const taskType = providerTask(cfg, purpose, purpose === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT');
-        return { url, headers: { 'Content-Type': 'application/json', ...(key ? { 'x-goog-api-key': key } : {}) }, body: { requests: texts.map(input => ({ model: cleanModel, content: { parts: [{ text: input }] }, ...(taskType ? { taskType } : {}), ...(cfg.embeddingDimensions > 0 ? { outputDimensionality: cfg.embeddingDimensions } : {}) })) } };
+        const requestedTaskType = providerTask(cfg, purpose, purpose === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT');
+        // Gemini Embedding 2 does not accept taskType. gemini-embedding-001 does;
+        // use the current EmbedContentConfig container instead of deprecated
+        // top-level taskType/outputDimensionality fields.
+        const taskType = isGeminiEmbedding2Model(cleanModel) ? '' : requestedTaskType;
+        const embedContentConfig = {
+          autoTruncate: false,
+          ...(taskType ? { taskType } : {}),
+          ...(cfg.embeddingDimensions > 0 ? { outputDimensionality: cfg.embeddingDimensions } : {})
+        };
+        return {
+          url,
+          headers: { 'Content-Type': 'application/json', ...(key ? { 'x-goog-api-key': key } : {}) },
+          body: {
+            requests: texts.map(input => ({
+              model: cleanModel,
+              content: { parts: [{ text: input }] },
+              embedContentConfig
+            }))
+          }
+        };
       },
       parse: data => Array.isArray(data?.embeddings) ? data.embeddings.map(item => item?.values || item?.embedding || item) : null
     },
@@ -3935,7 +4192,18 @@
     },
     vertex: {
       capabilities: { batch: false, queryDocument: true, dimensions: true, remote: true },
-      request: (texts, cfg, purpose, key) => ({ url: text(cfg.embeddingEndpoint || '') || vertexEmbeddingUrl(cfg), headers: commonAuthHeaders(key), body: { instances: [{ content: texts[0], task_type: providerTask(cfg, purpose, purpose === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT') }], parameters: { autoTruncate: false, ...(cfg.embeddingDimensions > 0 ? { outputDimensionality: cfg.embeddingDimensions } : {}) } } }),
+      request: (texts, cfg, purpose, key) => {
+        const requestedTaskType = providerTask(cfg, purpose, purpose === 'query' ? 'RETRIEVAL_QUERY' : 'RETRIEVAL_DOCUMENT');
+        const taskType = isGeminiEmbedding2Model(cfg.embeddingModel) ? '' : requestedTaskType;
+        return {
+          url: text(cfg.embeddingEndpoint || '') || vertexEmbeddingUrl(cfg),
+          headers: vertexAuthHeaders(key),
+          body: {
+            instances: [{ content: texts[0], ...(taskType ? { task_type: taskType } : {}) }],
+            parameters: { autoTruncate: false, ...(cfg.embeddingDimensions > 0 ? { outputDimensionality: cfg.embeddingDimensions } : {}) }
+          }
+        };
+      },
       parse: data => { const row = data?.predictions?.[0]; const vector = row?.embeddings?.values || row?.embedding?.values || row?.values; return Array.isArray(vector) ? [vector] : null; }
     },
     custom_http: {
@@ -3945,7 +4213,17 @@
         const body = safeTemplateSubstitute(parsedTemplate, { model: cfg.embeddingModel, texts, queryTask: cfg.embeddingQueryTask, documentTask: cfg.embeddingDocumentTask, purpose });
         return { url: text(cfg.embeddingEndpoint || cfg.embeddingUrl), method: cfg.embeddingCustomMethod, headers: commonAuthHeaders(key, safeParseHeaders(cfg.embeddingCustomHeaders)), body };
       },
-      parse: (data, cfg) => safeJsonPath(data, cfg.embeddingCustomResponsePath || 'data[*].embedding')
+      parse: (data, cfg) => {
+        const vectors = safeJsonPath(data, cfg.embeddingCustomResponsePath || 'data[*].embedding');
+        if ((!Array.isArray(vectors) || !vectors.length) && text(cfg.embeddingCustomErrorPath || '').trim()) {
+          let customErrorValue = null;
+          try { customErrorValue = safeJsonPath(data, cfg.embeddingCustomErrorPath); } catch (_) {}
+          const customErrorText = embeddingErrorDetail(customErrorValue)
+            || sanitizeEmbeddingErrorMessage(typeof customErrorValue === 'string' ? customErrorValue : safeStringify(customErrorValue, ''));
+          if (customErrorText) throw new EmbeddingAdapterError('INVALID_RESPONSE', customErrorText);
+        }
+        return vectors;
+      }
     }
   });
 
@@ -4085,7 +4363,7 @@
       const request = handler.request(batchEntries.map(entry => entry.text), cfg, purpose, key, { contextGroups });
       const data = await withEmbeddingRetries(async () => {
         stats.requestCount += 1;
-        return await embeddingFetchJson(request, cfg, options.signal || null);
+        return await embeddingFetchJson(request, cfg, options.signal || null, { purpose, batchIndex: batchIndex + 1, totalBatches: batches.length, inputCount: batchEntries.length, inputCharacters: batchEntries.reduce((sum, entry) => sum + entry.text.length, 0), deadlineAt: Number(options.deadlineAt || 0) || 0 });
       }, cfg, options.signal || null, stats);
       if (generation !== Runtime.embeddingGeneration) throw new EmbeddingAdapterError('ABORTED', 'Embedding result belongs to an obsolete settings generation.');
       if (!Array.isArray(data?.data) || data.data.length !== contextGroups.length) {
@@ -4145,6 +4423,7 @@
       if (provider === 'bedrock' && !isBedrockTitanV2Model(cfg.embeddingModel)) {
         throw new EmbeddingAdapterError('INVALID_MODEL', 'The Bedrock adapter supports Amazon Titan Text Embeddings V2 request and response schema only.');
       }
+      validateProviderEmbeddingDimensions(cfg);
       const requestUrl = provider === 'hash' ? '' : (provider === 'vertex' || provider === 'vertex-embedding' ? (cfg.embeddingEndpoint || vertexEmbeddingUrl(cfg)) : provider === 'custom_http' ? (cfg.embeddingEndpoint || cfg.embeddingUrl) : 'deferred');
       if (provider !== 'hash' && requestUrl !== 'deferred' && !requestUrl) throw new EmbeddingAdapterError('NETWORK_ERROR', 'Embedding endpoint is empty or incomplete.');
       return true;
@@ -4188,9 +4467,27 @@
       }
       const key = await readEmbeddingKey();
       const maxBatch = effectiveProviderBatchSize(provider, cfg, capabilities);
+      const safeInputTokenLimit = providerSafeInputTokenLimit(provider, cfg);
+      const expandedPending = [];
+      let splitInputCount = 0;
+      for (const item of pending) {
+        const parts = safeInputTokenLimit > 0
+          ? splitEmbeddingInputByTokenBudget(item.text, safeInputTokenLimit)
+          : [item.text];
+        if (parts.length > 1) splitInputCount += 1;
+        parts.forEach((partText, partIndex) => expandedPending.push({
+          ...item,
+          text: partText,
+          originalText: item.text,
+          partIndex,
+          partCount: parts.length,
+          partWeight: Math.max(1, estimateTokens(partText))
+        }));
+      }
       const batches = [];
-      for (let i = 0; i < pending.length; i += maxBatch) batches.push(pending.slice(i, i + maxBatch));
+      for (let i = 0; i < expandedPending.length; i += maxBatch) batches.push(expandedPending.slice(i, i + maxBatch));
       let expectedDim = 0;
+      const partVectors = new Map();
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
         if (options.signal?.aborted) throw new EmbeddingAdapterError('ABORTED', 'Embedding request was cancelled.');
         const batch = batches[batchIndex];
@@ -4198,25 +4495,39 @@
         if (!request?.url) throw new EmbeddingAdapterError('NETWORK_ERROR', 'Embedding endpoint is empty.');
         const data = await withEmbeddingRetries(async () => {
           stats.requestCount += 1;
-          return await embeddingFetchJson(request, cfg, options.signal || null);
+          return await embeddingFetchJson(request, cfg, options.signal || null, {
+            purpose,
+            batchIndex: batchIndex + 1,
+            totalBatches: batches.length,
+            inputCount: batch.length,
+            inputCharacters: batch.reduce((sum, item) => sum + item.text.length, 0),
+            deadlineAt: Number(options.deadlineAt || 0) || 0
+          });
         }, cfg, options.signal || null, stats);
         if (generation !== Runtime.embeddingGeneration) throw new EmbeddingAdapterError('ABORTED', 'Embedding result belongs to an obsolete settings generation.');
         const rawVectors = handler.parse(data, cfg, purpose);
         expectedDim = validateRemoteEmbeddingBatch(rawVectors, batch.length, expectedDim);
         const vectors = rawVectors.map(vector => cfg.embeddingNormalize === false ? vector.map(Number) : normalizeVector(vector));
         batch.forEach((item, index) => {
-          uniqueVectors[item.index] = vectors[index];
-          const limit = purpose === 'query' ? QUERY_EMBEDDING_CACHE_MAX : DOCUMENT_EMBEDDING_CACHE_MAX;
-          if (cache.size >= limit) cache.delete(cache.keys().next().value);
-          cache.set(item.key, { vector: vectors[index], dimensions: vectors[index].length, profileId: embeddingProfileId(cfg, vectors[index].length), textHash: stableHash(item.text), purpose, createdAt: Date.now(), lastUsedAt: Date.now(), at: Date.now(), providerUsed: provider, modelUsed: cfg.embeddingModel, dim: vectors[index].length, fallbackUsed: false });
+          if (!partVectors.has(item.index)) partVectors.set(item.index, []);
+          partVectors.get(item.index).push({ partIndex: item.partIndex, vector: vectors[index], weight: item.partWeight });
         });
         stats.batchCount += 1;
-        try { options.onProgress?.({ completedBatches: batchIndex + 1, totalBatches: batches.length, completedTexts: Math.min(pending.length, (batchIndex + 1) * maxBatch), totalTexts: pending.length }); } catch (_) {}
+        try { options.onProgress?.({ completedBatches: batchIndex + 1, totalBatches: batches.length, completedTexts: Math.min(expandedPending.length, (batchIndex + 1) * maxBatch), totalTexts: expandedPending.length }); } catch (_) {}
+      }
+      for (const item of pending) {
+        const parts = (partVectors.get(item.index) || []).slice().sort((a, b) => a.partIndex - b.partIndex);
+        const vector = combineEmbeddingPartVectors(parts);
+        if (!vector.length) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding response did not produce a vector for every input.');
+        uniqueVectors[item.index] = vector;
+        const limit = purpose === 'query' ? QUERY_EMBEDDING_CACHE_MAX : DOCUMENT_EMBEDDING_CACHE_MAX;
+        if (cache.size >= limit) cache.delete(cache.keys().next().value);
+        cache.set(item.key, { vector, dimensions: vector.length, profileId: embeddingProfileId(cfg, vector.length), textHash: stableHash(item.text), purpose, createdAt: Date.now(), lastUsedAt: Date.now(), at: Date.now(), providerUsed: provider, modelUsed: cfg.embeddingModel, dim: vector.length, fallbackUsed: false });
       }
       const vectors = restore.map(index => uniqueVectors[index]);
       const dimensions = vectors[0]?.length || expectedDim || 0;
-      const result = { vectors, model: cfg.embeddingModel, provider, dimensions, profileId: embeddingProfileId(cfg, dimensions), usage: { inputTokens: null }, metadata: stats };
-      recordEmbeddingDiagnostic({ provider, model: cfg.embeddingModel, dimensions, profileId: result.profileId, baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: purpose, inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: stats.batchCount, elapsedMs: Date.now() - startedAt, cacheHits: stats.cacheHits, cacheMisses: stats.cacheMisses, retryCount: stats.retryCount, errorType: '', fallbackUsed: false, staleVectorCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0, pendingReembeddingCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0 });
+      const result = { vectors, model: cfg.embeddingModel, provider, dimensions, profileId: embeddingProfileId(cfg, dimensions), usage: { inputTokens: null }, metadata: { ...stats, expandedInputCount: expandedPending.length, splitInputCount, safeInputTokenLimit } };
+      recordEmbeddingDiagnostic({ provider, model: cfg.embeddingModel, dimensions, profileId: result.profileId, baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: purpose, inputCount: list.length, expandedInputCount: expandedPending.length, splitInputCount, safeInputTokenLimit, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: stats.batchCount, elapsedMs: Date.now() - startedAt, cacheHits: stats.cacheHits, cacheMisses: stats.cacheMisses, retryCount: stats.retryCount, errorType: '', fallbackUsed: false, staleVectorCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0, pendingReembeddingCount: Number(Runtime.lastProgressiveReembed?.pending || 0) || 0 });
       return result;
     };
     return Object.freeze({
@@ -4225,8 +4536,24 @@
       embedTexts: embedResult,
       testConnection: async options => {
         const startedAt = Date.now();
-        const result = await embedResult(['Embedding connection test.'], { ...(options || {}), purpose: 'query' });
-        return { ok: true, provider: result.provider, model: result.model, dimensions: result.dimensions, elapsedMs: Date.now() - startedAt, errorType: '' };
+        const deadlineAt = startedAt + cfg.embeddingTimeoutMs;
+        const result = await embedResult(['Embedding connection test.'], { ...(options || {}), purpose: 'query', deadlineAt });
+        const queryElapsedMs = Date.now() - startedAt;
+        let documentTest = null;
+        if (capabilities.queryDocument === true) {
+          const documentStartedAt = Date.now();
+          const documentInputs = capabilities.batch === false
+            ? ['Flashback document embedding connection test.']
+            : ['Flashback document embedding connection test A.', 'Flashback document embedding connection test B.'];
+          const documentResult = await embedResult(documentInputs, { ...(options || {}), purpose: 'document', deadlineAt });
+          documentTest = {
+            ok: true,
+            dimensions: documentResult.dimensions,
+            elapsedMs: Date.now() - documentStartedAt,
+            batchSize: documentInputs.length
+          };
+        }
+        return { ok: true, provider: result.provider, model: result.model, dimensions: result.dimensions, elapsedMs: queryElapsedMs, totalElapsedMs: Date.now() - startedAt, errorType: '', documentTest };
       },
       resolveDimensions: result => Number(result?.dimensions || cfg.embeddingDimensions || 0) || 0,
       normalizeResponse: (data, purpose = 'document') => handler?.parse?.(data, cfg, purpose) || data,
@@ -4254,6 +4581,7 @@
     const cfg = normalizeSettings(settings || await loadSettings());
     const list = (texts || []).map(item => compact(item, 20000));
     if (!list.length) return tagEmbeddingVectorsExtended([], null, false);
+    const startedAt = Date.now();
     Runtime.lastEmbedUsedFallback = false;
     Runtime.lastEmbedError = '';
     try {
@@ -4261,7 +4589,7 @@
       return tagEmbeddingVectorsExtended(result.vectors, result, false);
     } catch (rawError) {
       const error = classifyEmbeddingError(rawError, { provider: cfg.embeddingProvider });
-      recordEmbeddingDiagnostic({ provider: normalizeProvider(cfg.embeddingProvider), model: cfg.embeddingModel, dimensions: cfg.embeddingDimensions || 0, profileId: embeddingProfileId(cfg, cfg.embeddingDimensions || 0), baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: options.purpose || options.taskType || 'document', inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: 0, elapsedMs: 0, cacheHits: 0, cacheMisses: list.length, retryCount: Number(error.retryCount || 0) || 0, errorType: error.type, fallbackUsed: cfg.fallbackHashEmbedding === true });
+      recordEmbeddingDiagnostic({ provider: normalizeProvider(cfg.embeddingProvider), model: cfg.embeddingModel, dimensions: cfg.embeddingDimensions || 0, profileId: embeddingProfileId(cfg, cfg.embeddingDimensions || 0), baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: options.purpose || options.taskType || 'document', inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: 0, elapsedMs: Math.max(0, Date.now() - startedAt), cacheHits: 0, cacheMisses: list.length, retryCount: Number(error.retryCount || 0) || 0, errorType: error.type, fallbackUsed: cfg.fallbackHashEmbedding === true });
       if (!cfg.fallbackHashEmbedding || error.type === 'ABORTED') throw error;
       warn('embedding endpoint failed; using hash fallback for all texts (dimension drift guard)', error);
       Runtime.lastEmbedUsedFallback = true;
@@ -14893,6 +15221,259 @@
     return result;
   };
 
+  const finalizedCaptureCommitSettings = (settings = Runtime.settings || DEFAULTS) => normalizeSettings({
+    ...settings,
+    embeddingProvider: 'hash',
+    embeddingUrl: '',
+    embeddingEndpoint: '',
+    embeddingModel: `hash-${settings.hashDimensions || DEFAULTS.hashDimensions}`,
+    embeddingDimensions: 0,
+    embeddingMaxRetries: 0,
+    embeddingFallbackProvider: 'hash',
+    fallbackHashEmbedding: true,
+    embeddingEnabled: true
+  });
+
+  const liveCaptureRemoteUpgradeSettings = (settings = Runtime.settings || DEFAULTS) => normalizeSettings({
+    ...settings,
+    // The turn is already durable in hash form. Background remote embedding may use
+    // the full user-configured timeout without blocking chat/capture completion.
+    embeddingTimeoutMs: Number(settings.embeddingTimeoutMs || DEFAULTS.embeddingTimeoutMs),
+    embeddingMaxRetries: LIVE_CAPTURE_REMOTE_MAX_RETRIES,
+    // Never spend CPU rebuilding a hash vector here. On any remote failure the
+    // previously committed hash record remains untouched and recallable.
+    embeddingFallbackProvider: '',
+    fallbackHashEmbedding: false
+  });
+
+  const reembedCapturedTurnRecords = async (scope, sourceHash = '', pairIndex = 0, settingsOverride = null) => {
+    const settings = liveCaptureRemoteUpgradeSettings(settingsOverride || await loadSettings(true));
+    const provider = normalizeProvider(settings.embeddingProvider);
+    const model = text(settings.embeddingModel || '').trim();
+    if (!scope?.scopeKey || !settings.embeddingEnabled || provider === 'hash') {
+      return {
+        scopeKey: scope?.scopeKey || '',
+        pairIndex: Math.max(0, Number(pairIndex || 0) || 0),
+        provider,
+        model,
+        reembedded: 0,
+        preservedHash: 0,
+        targetRecords: 0,
+        storedTotal: null,
+        skipped: true,
+        reason: provider === 'hash' ? 'hash_provider' : 'embedding_disabled'
+      };
+    }
+    const loaded = await loadScopeRecords(scope.scopeKey);
+    assertCompleteScopeLoad(loaded, 'captured turn remote re-embedding');
+    const storedTotal = loaded.records.length;
+    const wantedSourceHash = text(sourceHash || '').trim();
+    const wantedPairIndex = Math.max(0, Number(pairIndex || 0) || 0);
+    const targets = loaded.records
+      .map((record, index) => ({ record, index }))
+      .filter(({ record }) => isResponseMemoryRecord(record) && !record.autoEpisode && record.sourceType !== 'episode_index')
+      .filter(({ record }) => wantedSourceHash
+        ? text(record.sourceHash || '').trim() === wantedSourceHash
+        : (wantedPairIndex > 0 && finiteTurnIndex(record) === wantedPairIndex));
+    if (!targets.length) {
+      return {
+        scopeKey: scope.scopeKey,
+        pairIndex: wantedPairIndex,
+        provider,
+        model,
+        reembedded: 0,
+        preservedHash: 0,
+        targetRecords: 0,
+        storedTotal,
+        skipped: true,
+        reason: 'captured_turn_not_found'
+      };
+    }
+
+    const remoteStartedAt = Date.now();
+    // One user-configured timeout is the wall-clock budget for the whole live
+    // hash→remote upgrade, including preprocessing, every batch, fetch, and JSON parse.
+    // Later batches inherit the same absolute deadline instead of receiving a fresh
+    // timeout window, so a 30s setting can never silently become 60s+.
+    const remoteDeadlineAt = remoteStartedAt + settings.embeddingTimeoutMs;
+    let vectors = null;
+    try {
+      vectors = await embedTexts(targets.map(item => item.record.text), settings, {
+        purpose: 'document',
+        contextGroupIds: targets.map(item => text(item.record.sourceHash || item.record.sourceId || `record:${item.index}`)),
+        concurrency: 1,
+        deadlineAt: remoteDeadlineAt
+      });
+    } catch (rawError) {
+      const error = classifyEmbeddingError(rawError, { provider });
+      const errorType = text(error?.type || 'UNKNOWN').trim() || 'UNKNOWN';
+      return {
+        scopeKey: scope.scopeKey,
+        pairIndex: wantedPairIndex,
+        provider,
+        model,
+        reembedded: 0,
+        preservedHash: targets.length,
+        targetRecords: targets.length,
+        storedTotal,
+        elapsedMs: Math.max(0, Date.now() - remoteStartedAt),
+        timeoutMs: settings.embeddingTimeoutMs,
+        retryCount: Number(error?.retryCount || 0) || 0,
+        errorType,
+        error: sanitizeEmbeddingErrorMessage(error?.message || errorType),
+        skipped: true,
+        reason: errorType === 'TIMEOUT'
+          ? 'remote_timeout_hash_preserved'
+          : 'remote_provider_error_hash_preserved'
+      };
+    }
+
+    // This should be unreachable because the live-upgrade settings disable remote
+    // hash fallback, but keep the guard for compatibility with custom adapters.
+    if (vectors?.flashbackFallbackUsed === true) {
+      return {
+        scopeKey: scope.scopeKey,
+        pairIndex: wantedPairIndex,
+        provider,
+        model,
+        reembedded: 0,
+        preservedHash: targets.length,
+        targetRecords: targets.length,
+        storedTotal,
+        elapsedMs: Math.max(0, Date.now() - remoteStartedAt),
+        timeoutMs: settings.embeddingTimeoutMs,
+        retryCount: 0,
+        errorType: text(Runtime.lastEmbeddingDiagnostic?.errorType || 'REMOTE_FALLBACK').trim() || 'REMOTE_FALLBACK',
+        error: Runtime.lastEmbedError || 'remote adapter returned a fallback vector',
+        skipped: true,
+        reason: 'remote_provider_error_hash_preserved'
+      };
+    }
+
+    const providerUsed = vectors.flashbackEmbeddingProvider || provider;
+    const modelUsed = vectors.flashbackEmbeddingModel || settings.embeddingModel;
+    const updates = new Map();
+    targets.forEach((item, index) => {
+      const vector = vectors[index];
+      if (!Array.isArray(vector) || !vector.length) return;
+      updates.set(text(item.record.hash || item.record.id || ''), {
+        vector,
+        provider: providerUsed,
+        model: modelUsed,
+        embeddingProvider: providerUsed,
+        embeddingModel: modelUsed,
+        embeddingDimensions: vector.length,
+        embeddingProfileId: vectors.flashbackEmbeddingProfileId || embeddingProfileId(settings, vector.length, providerUsed, modelUsed)
+      });
+    });
+    if (!updates.size) {
+      return {
+        scopeKey: scope.scopeKey,
+        pairIndex: wantedPairIndex,
+        provider: providerUsed,
+        model: modelUsed,
+        reembedded: 0,
+        preservedHash: targets.length,
+        targetRecords: targets.length,
+        storedTotal,
+        elapsedMs: Math.max(0, Date.now() - remoteStartedAt),
+        timeoutMs: settings.embeddingTimeoutMs,
+        retryCount: 0,
+        errorType: 'EMPTY_VECTOR',
+        error: 'Remote embedding returned no usable vectors.',
+        skipped: true,
+        reason: 'remote_vectors_empty_hash_preserved'
+      };
+    }
+    const saved = await withScopeWriteLock(scope.scopeKey, async () => {
+      const latest = await loadScopeRecords(scope.scopeKey);
+      assertCompleteScopeLoad(latest, 'captured turn remote re-embedding save');
+      let changed = 0;
+      const next = latest.records.map(record => {
+        const key = text(record.hash || record.id || '');
+        const update = updates.get(key);
+        if (!update) return record;
+        changed += 1;
+        return { ...record, ...update, dim: update.vector.length, updatedAt: nowIso() };
+      });
+      if (!changed) return { changed: 0, records: latest.records };
+      const result = await saveScopeRecords(scope, next, settings, scope);
+      return { changed, records: result.records };
+    });
+    if (saved.changed > 0) scheduleEpisodeIndexRebuild(scope, settings, { reason: 'captured_turn_remote_reembed' });
+    const preservedHash = Math.max(0, targets.length - Number(saved.changed || 0));
+    return {
+      scopeKey: scope.scopeKey,
+      pairIndex: wantedPairIndex,
+      provider: providerUsed,
+      model: modelUsed,
+      dimensions: vectors[0]?.length || 0,
+      reembedded: saved.changed || 0,
+      preservedHash,
+      targetRecords: targets.length,
+      storedTotal: saved.records?.length ?? storedTotal,
+      elapsedMs: Math.max(0, Date.now() - remoteStartedAt),
+      timeoutMs: settings.embeddingTimeoutMs,
+      retryCount: 0,
+      errorType: '',
+      skipped: false,
+      reason: preservedHash > 0 ? 'captured_turn_remote_reembed_partial' : 'captured_turn_remote_reembed_complete'
+    };
+  };
+
+  const scheduleCapturedTurnRemoteReembed = (scope, sourceHash = '', pairIndex = 0) => {
+    const scopeKey = text(scope?.scopeKey || '');
+    if (!scopeKey || Runtime.unloaded) return false;
+    const previous = Runtime.capturedTurnReembedQueues.get(scopeKey) || Promise.resolve();
+    const task = previous.catch(() => null).then(async () => {
+      if (Runtime.unloaded) return { skipped: true, reason: 'plugin_unloaded', scopeKey };
+      const freshSettings = await loadSettings(true);
+      if (!freshSettings.embeddingEnabled || normalizeProvider(freshSettings.embeddingProvider) === 'hash') {
+        return { skipped: true, reason: 'remote_upgrade_not_required', scopeKey };
+      }
+      const result = await reembedCapturedTurnRecords(scope, sourceHash, pairIndex, freshSettings);
+      if (result.reembedded > 0 && !result.preservedHash) {
+        opLog('captured_turn_remote_reembedded', { scopeKey, pairIndex, sourceHash, result }, 'info');
+        pushActivityLog('capture_remote_embedding_upgraded', '저장된 턴의 원격 임베딩을 갱신했습니다.', { scopeKey, pairIndex, result }, 'success');
+      } else if (result.reembedded > 0) {
+        opLog('captured_turn_remote_reembed_partial', { scopeKey, pairIndex, sourceHash, result }, 'warn');
+        pushActivityLog('capture_remote_embedding_partial', '저장된 턴의 일부 원격 임베딩만 갱신되어 나머지 로컬 벡터를 유지합니다.', { scopeKey, pairIndex, result }, 'warn');
+      } else if (/hash_preserved$/.test(text(result.reason || ''))) {
+        const errorType = text(result.errorType || '').toUpperCase();
+        const message = errorType === 'TIMEOUT'
+          ? '원격 임베딩 응답 제한시간을 초과해 기존 로컬 벡터를 유지합니다.'
+          : errorType === 'RATE_LIMIT'
+            ? '원격 임베딩 요청 제한으로 기존 로컬 벡터를 유지합니다.'
+            : '원격 임베딩 갱신에 실패해 기존 로컬 벡터를 유지합니다.';
+        opLog('captured_turn_remote_reembed_deferred', { scopeKey, pairIndex, sourceHash, result }, 'warn');
+        pushActivityLog('capture_remote_embedding_deferred', message, { scopeKey, pairIndex, result }, 'warn');
+      }
+      return result;
+    }).catch(error => {
+      const classified = classifyEmbeddingError(error, { provider: Runtime.settings?.embeddingProvider || '' });
+      const result = {
+        scopeKey,
+        pairIndex,
+        reembedded: 0,
+        preservedHash: null,
+        targetRecords: null,
+        storedTotal: null,
+        skipped: true,
+        reason: 'remote_upgrade_internal_error_hash_preserved',
+        errorType: text(classified?.type || 'UNKNOWN').trim() || 'UNKNOWN',
+        error: formatErrorMessage(classified, 500)
+      };
+      opLog('captured_turn_remote_reembed_failed', { scopeKey, pairIndex, sourceHash, result }, 'warn');
+      pushActivityLog('capture_remote_embedding_deferred', '원격 임베딩 후속 처리 중 오류가 발생해 기존 로컬 벡터를 유지합니다.', { scopeKey, pairIndex, result }, 'warn');
+      return result;
+    });
+    Runtime.capturedTurnReembedQueues.set(scopeKey, task);
+    task.finally(() => {
+      if (Runtime.capturedTurnReembedQueues.get(scopeKey) === task) Runtime.capturedTurnReembedQueues.delete(scopeKey);
+    });
+    return true;
+  };
+
   const saveFinalizedChatCapture = async (pending, candidate, snapshot, settings) => {
     const pendingId = text(pending?.pendingId || '');
     if (!pendingId || Runtime.finalizedCaptureInFlight.has(pendingId)) return false;
@@ -14948,19 +15529,27 @@
         },
         text: [`User:\n${latestUser}`, `Assistant:\n${assistant}`].join('\n\n---\n\n')
       };
-      const result = await ingestSources([source], settings, scope, { replaceTurnPair: true });
+      // Durability first: commit the canonical U+A text with a local hash vector.
+      // A remote provider is an upgrade path, never a prerequisite for memory save.
+      const captureSettings = finalizedCaptureCommitSettings(settings);
+      const result = await ingestSources([source], captureSettings, scope, { replaceTurnPair: true });
       removePendingTurnById(pendingId);
       upsertChatMonitorAssistant(scope, assistantPosition, assistant, { pairIndex, userPosition: userMessagePosition, userText: latestUser });
-      Runtime.lastCapture = { at: Date.now(), scopeKey: scope.scopeKey, turnHash, assistantChars: assistant.length, finalized: true, resolverMismatch, ...result };
-      opLog('finalized_capture_saved', { hook: 'liveChatMonitor', pending, scopeKey: scope.scopeKey, turnHash, assistantChars: assistant.length, result });
-      pushActivityLog('memory_captured_and_vectorized', '메모리를 캡쳐하고 벡터화했습니다.', {
+      const remoteUpgradeQueued = settings.embeddingEnabled !== false && normalizeProvider(settings.embeddingProvider) !== 'hash'
+        ? scheduleCapturedTurnRemoteReembed(scope, source.sourceHash, pairIndex)
+        : false;
+      Runtime.lastCapture = { at: Date.now(), scopeKey: scope.scopeKey, turnHash, assistantChars: assistant.length, finalized: true, resolverMismatch, captureVectorMode: 'hash_first', remoteUpgradeQueued, ...result };
+      opLog('finalized_capture_saved', { hook: 'liveChatMonitor', pending, scopeKey: scope.scopeKey, turnHash, assistantChars: assistant.length, result, mode: 'hash_first', remoteUpgradeQueued });
+      pushActivityLog('memory_captured_and_vectorized', remoteUpgradeQueued ? '메모리를 우선 저장하고 원격 벡터 갱신을 예약했습니다.' : '메모리를 캡쳐하고 벡터화했습니다.', {
         scopeKey: scope.scopeKey,
         pairIndex,
         assistantChars: assistant.length,
         chunks: result.chunks,
         inserted: result.inserted,
         updated: result.updated,
-        deduped: result.deduped
+        deduped: result.deduped,
+        mode: 'hash_first',
+        remoteUpgradeQueued
       }, 'success');
       log('captured finalized chat response', Runtime.lastCapture);
       return true;
@@ -15027,7 +15616,8 @@
             const stableFor = Date.now() - Number(state.stableSince || Date.now());
             const requestQuietFor = Date.now() - requestAt;
             if (stableFor >= FINALIZED_CAPTURE_STABLE_MS && requestQuietFor >= FINALIZED_CAPTURE_STABLE_MS) {
-              const saved = await saveFinalizedChatCapture(current, candidate, snapshot, settings);
+              const liveSettings = await loadSettings(true).catch(() => settings);
+              const saved = await saveFinalizedChatCapture(current, candidate, snapshot, liveSettings);
               if (saved) {
                 stopFinalizedCaptureMonitor(pendingId);
                 return;
@@ -17286,7 +17876,7 @@ ${cleanedText}`, 80),
   const buildProviderTab = (settings, stats = {}) => {
     const providerLabels = { bedrock: 'bedrock (Titan V2)', voyage_context: 'voyage_context (Context 4)' };
     const providerOptions = PROVIDER_CHOICES.map(value => `<option value="${value}" ${settings.embeddingProvider === value ? 'selected' : ''}>${providerLabels[value] || value}</option>`).join('');
-    const recommendedModels = ['text-embedding-3-small', 'text-embedding-3-large', 'voyage-4-lite', 'voyage-4', 'voyage-context-4', 'gemini-embedding-001', 'embed-v4.0', 'jina-embeddings-v3', 'mistral-embed', 'amazon.titan-embed-text-v2:0', 'text-embedding-v4', 'nomic-embed-text', 'bge-m3', 'multilingual-e5-large'].map(model => `<option value="${escapeHtml(model)}"></option>`).join('');
+    const recommendedModels = ['text-embedding-3-small', 'text-embedding-3-large', 'voyage-4-lite', 'voyage-4', 'voyage-context-4', 'gemini-embedding-001', 'gemini-embedding-2', 'embed-v4.0', 'jina-embeddings-v3', 'mistral-embed', 'codestral-embed', 'amazon.titan-embed-text-v2:0', 'text-embedding-v4', 'qwen3.7-text-embedding', 'nomic-embed-text', 'bge-m3', 'multilingual-e5-large'].map(model => `<option value="${escapeHtml(model)}"></option>`).join('');
     return `<section class="panel active" data-panel="provider">
       <div class="card">
         <div class="card-title">임베딩 프로바이더</div>
@@ -18648,6 +19238,16 @@ ${cleanedText}`, 80),
       if (url && (!url.value.trim() || knownUrls.has(url.value.trim()))) url.value = defaultUrlForProvider(provider);
       if (endpoint && knownUrls.has(endpoint.value.trim())) endpoint.value = '';
       if (model && (!model.value.trim() || knownModels.has(model.value.trim()) || model.value === 'voyage-3-lite')) model.value = defaultModelForProvider(provider);
+      const dimensions = getGuiNode('embeddingDimensions');
+      const nextProvider = normalizeProvider(provider);
+      const previousProvider = normalizeProvider(Runtime.settings?.embeddingProvider || '');
+      if (dimensions && ['gemini', 'gemini-embedding'].includes(nextProvider) && (!dimensions.value.trim() || Number(dimensions.value) === 0)) {
+        dimensions.value = String(GEMINI_SAFE_OUTPUT_DIMENSIONS);
+      } else if (dimensions && !['gemini', 'gemini-embedding'].includes(nextProvider) && ['gemini', 'gemini-embedding'].includes(previousProvider) && Number(dimensions.value) === GEMINI_SAFE_OUTPUT_DIMENSIONS) {
+        // Undo the Gemini auto-safe default when moving to another provider.
+        // Explicit non-Gemini dimensions remain untouched in all other cases.
+        dimensions.value = '0';
+      }
     });
     getGuiNode('testEmbedBtn')?.addEventListener('click', async () => {
       setEmbeddingTestStatus('testing', '임베딩 호출 중...');
@@ -18660,9 +19260,11 @@ ${cleanedText}`, 80),
           : (Runtime.sessionEmbeddingKey
             ? await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey)
             : await inspectEmbeddingKeyPersistence());
-        const result = await createEmbeddingProviderAdapter(settings).testConnection();
-        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider: result.provider, model: result.model, dim: result.dimensions, elapsedMs: result.elapsedMs, embeddingKeyPersistence: keyPersistence };
-        setEmbeddingTestStatus('success', `연결 성공 · ${result.provider} / ${result.model} · ${formatNumber(result.dimensions)}차원 · ${formatNumber(result.elapsedMs)}ms`);
+        const testSettings = normalizeSettings({ ...settings, embeddingMaxRetries: 0 });
+        const result = await createEmbeddingProviderAdapter(testSettings).testConnection();
+        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider: result.provider, model: result.model, dim: result.dimensions, elapsedMs: result.elapsedMs, documentTest: result.documentTest || null, embeddingKeyPersistence: keyPersistence };
+        const documentSuffix = result.documentTest?.ok ? ` · 문서 배치 ${formatNumber(result.documentTest.elapsedMs)}ms` : '';
+        setEmbeddingTestStatus('success', `연결 성공 · ${result.provider} / ${result.model} · ${formatNumber(result.dimensions)}차원 · ${formatNumber(result.elapsedMs)}ms${documentSuffix}`);
         scheduleTimer(() => {
           progressivelyReembedRecords(null, settings).then(progress => {
             pushActivityLog('progressive_reembed', '임베딩 프로필 점진 갱신을 실행했습니다.', progress);
@@ -18915,6 +19517,11 @@ ${cleanedText}`, 80),
         last: Runtime.lastEmbeddingDiagnostic,
         recent: Runtime.embeddingDiagnostics.slice(-20),
         activeRequests: Runtime.embeddingControllers.size,
+        activeRequestDetails: Array.from(Runtime.embeddingActiveRequests.values()).map(item => ({
+          ...item,
+          ageMs: Math.max(0, Date.now() - Number(item.startedAt || Date.now()))
+        })),
+        capturedTurnUpgradeQueues: Runtime.capturedTurnReembedQueues.size,
         generation: Runtime.embeddingGeneration,
         progressiveReembed: Runtime.lastProgressiveReembed
       },
@@ -19024,6 +19631,17 @@ ${cleanedText}`, 80),
   publicApi._test.providerBatchLimit = providerBatchLimit;
   publicApi._test.effectiveProviderBatchSize = effectiveProviderBatchSize;
   publicApi._test.isBedrockTitanV2Model = isBedrockTitanV2Model;
+  publicApi._test.isGeminiEmbedding2Model = isGeminiEmbedding2Model;
+  publicApi._test.isGeminiEmbedding001Model = isGeminiEmbedding001Model;
+  publicApi._test.vertexAuthHeaders = vertexAuthHeaders;
+  publicApi._test.effectiveEmbeddingPrefix = effectiveEmbeddingPrefix;
+  publicApi._test.providerDimensionPolicy = providerDimensionPolicy;
+  publicApi._test.validateProviderEmbeddingDimensions = validateProviderEmbeddingDimensions;
+  publicApi._test.openAiLikeEmbeddingUrl = openAiLikeEmbeddingUrl;
+  publicApi._test.providerSafeInputTokenLimit = providerSafeInputTokenLimit;
+  publicApi._test.splitEmbeddingInputByTokenBudget = splitEmbeddingInputByTokenBudget;
+  publicApi._test.combineEmbeddingPartVectors = combineEmbeddingPartVectors;
+  publicApi._test.finalizedCaptureCommitSettings = finalizedCaptureCommitSettings;
   publicApi._test.embeddingProfileDescriptor = embeddingProfileDescriptor;
   publicApi._test.embeddingProfileId = embeddingProfileId;
   publicApi._test.recordEmbeddingProfileId = recordEmbeddingProfileId;
@@ -19035,6 +19653,9 @@ ${cleanedText}`, 80),
   publicApi._test.abortEmbeddingJobs = abortEmbeddingJobs;
   publicApi._test.sanitizeEmbeddingSettingsForDiagnostics = sanitizeEmbeddingSettingsForDiagnostics;
   publicApi._test.buildRecordsFromSources = buildRecordsFromSources;
+  publicApi._test.operationLogResultSummary = operationLogResultSummary;
+  publicApi._test.liveCaptureRemoteUpgradeSettings = liveCaptureRemoteUpgradeSettings;
+  publicApi._test.reembedCapturedTurnRecords = reembedCapturedTurnRecords;
   globalThis.__FlashbackMemory = publicApi;
   globalThis.__VectorRagMemory = publicApi;
 
@@ -19124,6 +19745,8 @@ ${cleanedText}`, 80),
         Runtime.chatMonitorByScope.clear();
         Runtime.finalizedCaptureMonitors.clear();
         Runtime.finalizedCaptureInFlight.clear();
+        Runtime.capturedTurnReembedQueues.clear();
+        Runtime.embeddingActiveRequests.clear();
         Runtime.requestDecisionQueue = [];
         Runtime.lastRequestDecision = null;
         Runtime.pendingCaptureBarrier = null;
